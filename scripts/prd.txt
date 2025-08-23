@@ -1,0 +1,70 @@
+Overview
+ This document outlines the finalization and productization of the Ambient Email Agent. The agent is currently functional but embedded within a larger educational repository and contains hard-coded dummy user data.
+
+  This project solves the problem of making the agent a reusable, standalone application. It is for developers who want a robust, personalizable AI email assistant as a starting point for their own use or further
+  development. The value is in transforming a successful prototype into a clean, distributable, and generic foundation that can learn about any user from a "blank slate."
+
+  Core Features
+  1. Persona Generalization
+   - What it does: Removes all hard-coded, user-specific information (e.g., names like "Lance") from the agent's default configuration, prompts, and documentation.
+   - Why it's important: This ensures the agent is truly personalizable. A new user's experience will not be contaminated with irrelevant, pre-existing data. It allows the agent to learn about the user exclusively through
+     interaction.
+   - How it works: By identifying all files containing dummy data (primarily prompts.py and .ipynb notebooks) and replacing specific examples with generic, neutral language.
+
+  2. Repository Isolation
+   - What it does: Creates a new, clean repository containing only the essential code, tests, and documentation required for the agent to function.
+   - Why it's important: It provides a focused, professional starting point for developers, free from the clutter of the original learning repository. This makes the project easier to understand, maintain, and build upon.
+   - How it works: By creating a new directory and executing a sequence of commands to copy only the necessary assets (src/email_assistant, scripts, tests, notebooks, config files, etc.) into it.
+
+  User Experience
+   - User Persona: The primary user is a Developer who wants to adopt, run, and potentially extend this email agent for their own use. They are technically proficient and comfortable with Python, Git, and command-line
+     tools.
+   - Key User Flow:
+       1. The Developer receives the new, clean repository as a directory.
+       2. They initialize it as a Git repository and perform the initial commit.
+       3. They configure the agent for their own use by editing .env.example with their API keys and email address, saving it as .env.
+       4. They run the standard environment setup command (uv sync or pip install).
+       5. They can immediately run the agent, tests, and notebooks. The agent will begin learning about them from a true "blank slate."
+
+  Technical Architecture
+   - System Components:
+       - email_assistant_hitl_memory_gmail.py: The primary LangGraph graph definition, including the triage_router and agent composition.
+       - tools/reminders.py: Contains the SqliteReminderStore for persistent, standalone reminder storage in a local .local/reminders.db file.
+       - reminder_worker.py: A standalone script for polling the reminder database and sending notifications, with CLI options for administration (--list, --cancel).
+   - Data Models:
+       - schemas.py: Defines the State TypedDict for the LangGraph agent.
+       - reminders.py: Defines the Reminder dataclass for database records.
+   - APIs and Integrations:
+       - sqlite3: Used for local database storage.
+       - google-api-python-client: Used by the agent's tools for Gmail integration (sending emails, managing labels, etc.).
+   - Infrastructure Requirements: A local Unix-like environment (e.g., Linux, macOS, or WSL on Windows) with Python >=3.11.
+
+  Development Roadmap
+  Phase 1: Generalization (Content Scrubbing)
+   - Task 1.1: Identify and replace hard-coded user details in src/email_assistant/prompts.py.
+   - Task 1.2: Identify and replace user-specific examples in notebooks/agent.ipynb while preserving the demonstration of the reminder feature.
+   - Task 1.3: Identify and replace user-specific examples in notebooks/memory.ipynb while preserving the educational explanation of memory concepts.
+
+  Phase 2: Isolation (Repository Creation)
+   - Task 2.1: Create a new root directory for the project (e.g., standalone-email-agent).
+   - Task 2.2: Copy the scrubbed src, scripts, tests, and notebooks directories into the new root.
+   - Task 2.3: Copy the key configuration and documentation files (.gitignore, .env.example, pyproject.toml, uv.lock, AGENTS.md, README_LOCAL.md) into the new root.
+   - Task 2.4: Initialize the new root directory as a Git repository and stage all copied files for the initial commit.
+
+  Future Enhancements (Out of Scope for this Task)
+   - Implement Few-Shot Learning to improve the reliability of the triage classifier.
+   - Add a Makefile to simplify setup, testing, and running commands.
+   - Containerize the agent and worker with Docker for easier deployment.
+
+  Logical Dependency Chain
+  The development order is critical and must be sequential.
+   1. Generalization First: The content of all files must be scrubbed before they are copied. This ensures the new repository is born clean and never contains the dummy data.
+   2. Isolation Second: The file and directory copying can only happen after the generalization/scrubbing is complete.
+   3. Git Init Last: The repository can only be initialized after all the clean files have been copied into the new directory.
+
+  Risks and Mitigations
+   - Risk: Incomplete scrubbing leaves behind some dummy data.
+       - Mitigation: The agent performing the task must do a thorough search for the specific names and details to be removed and confirm their removal before proceeding to the next phase.
+   - Risk: Forgetting to copy a critical file to the new repository, resulting in a broken state.
+       - Mitigation: The list of files and directories to be copied is explicitly defined in the roadmap. A final validation step of running the tests (pytest) inside the new repository will be required to confirm all
+         dependencies were copied correctly.

@@ -1,0 +1,7 @@
+{
+    "thread_id": "thread_create_1",
+    "subject": "Project Deadline Approaching",
+    "from": "Alice <alice@example.com>",
+    "to": "Your Name <jr_ga@asabeko>",
+    "body": "Hi, just a friendly reminder that the project deadline is this Friday. Please make sure your components are submitted. Thanks, Alice"
+}

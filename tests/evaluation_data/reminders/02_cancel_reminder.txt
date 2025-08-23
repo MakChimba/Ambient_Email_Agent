@@ -1,0 +1,7 @@
+{
+    "thread_id": "thread_create_1",
+    "subject": "Re: Project Deadline Approaching",
+    "from": "me@example.com",
+    "to": "Alice <alice@example.com>",
+    "body": "Thanks, Alice. I've just submitted my part.\n\n--- Email Message ---\nFrom: Alice <alice@example.com>\n..."
+}

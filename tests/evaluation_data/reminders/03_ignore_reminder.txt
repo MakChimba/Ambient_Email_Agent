@@ -1,0 +1,7 @@
+{
+    "thread_id": "thread_ignore_1",
+    "subject": "Claim your exclusive prize now!",
+    "from": "Spam King <spam@example.com>",
+    "to": "Your Name <jr_ga@asabeko>",
+    "body": "You have been selected to win a free vacation! Click here!"
+}
