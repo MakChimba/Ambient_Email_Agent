@@ -34,6 +34,11 @@ def main(argv: list[str]) -> int:
     # Ensure plugin isn't disabled
     os.environ.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)
 
+    # Prefer prod-target Gmail agent and deterministic eval mode in CI-like runs
+    os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
+    os.environ.setdefault("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "1")
+    os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "1")
+
     # Friendly status
     project = os.getenv("LANGSMITH_PROJECT", "ambient-email-agent")
     tracing = os.getenv("LANGSMITH_TRACING", "false")
@@ -46,7 +51,10 @@ def main(argv: list[str]) -> int:
     default_args = [
         "-v",
         "tests/test_response.py",
-        "--agent-module=email_assistant",
+        "--agent-module=email_assistant_hitl_memory_gmail",
+        # Focus on tool-calls test by default; criteria eval depends on live LLM
+        "-k",
+        "tool_calls",
     ]
 
     # Use provided args if any, else defaults
@@ -68,4 +76,3 @@ def main(argv: list[str]) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))
-

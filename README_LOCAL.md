@@ -21,7 +21,7 @@ tmux lets you run the worker in a session you can detach from and leave running.
   ```
 - Detach with Ctrl+b then d. Reattach later:
   ```bash
-  tmux attach -t reminders
+    tmux attach -t reminders
   ```
 
 ### 2. Using cron (automated execution)
@@ -42,3 +42,35 @@ Notes
 - Ensure `.venv` exists and dependencies are installed before enabling the cron job.
 - Logs are appended to `_artifacts/reminders.log` for inspection.
 
+## Test & Evaluation Modes
+
+This repo supports both offline-friendly tests and live model evaluation.
+
+### Defaults
+
+- The default agent for test runs is the Gmail HITL+memory agent: `email_assistant_hitl_memory_gmail`.
+- For stable CI-style runs, the following env toggles are commonly set:
+  - `HITL_AUTO_ACCEPT=1`
+  - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
+  - `EMAIL_ASSISTANT_EVAL_MODE=1` (synthesize tool calls without a live LLM)
+
+### Notebooks
+
+- Notebook tests set `NB_TEST_MODE=1` to skip long/online cells. Run notebooks interactively without this env to exercise full behavior.
+
+### Running Tests
+
+- Tool-call smoke tests (stable, offline-friendly):
+  - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
+  - or `python scripts/run_tests_langsmith.py` (records to LangSmith if configured)
+
+- Full tests with LLM-as-judge (live model):
+  1. Install `langchain-google-genai` and set `GOOGLE_API_KEY`.
+  2. Unset `EMAIL_ASSISTANT_EVAL_MODE` (or set to `0`).
+  3. Run:
+     - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail`
+     - or `python scripts/run_tests_langsmith.py tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail`
+
+Notes
+- Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery.
+- Live model runs incur real LLM cost and may retry on transient provider errors.
