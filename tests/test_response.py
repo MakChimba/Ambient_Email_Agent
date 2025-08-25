@@ -32,49 +32,52 @@ from email_assistant.eval.prompts import RESPONSE_CRITERIA_SYSTEM_PROMPT
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=True)
 
-# Force reload the email_dataset module to ensure we get the latest version
-if "email_assistant.eval.email_dataset" in sys.modules:
-    importlib.reload(sys.modules["email_assistant.eval.email_dataset"])
-# Dynamically load the correct dataset based on the agent module being tested.
-# This allows us to use a different dataset for the Gmail agent.
-agent_module_arg = ""
-try:
-    # Get the --agent-module flag passed by the test runner
-    agent_module_index = sys.argv.index("--agent-module") + 1
-    if agent_module_index < len(sys.argv):
-        agent_module_arg = sys.argv[agent_module_index]
-except ValueError:
-    # Default to the standard agent if the flag isn't passed
-    agent_module_arg = "email_assistant"
 
-if "gmail" in agent_module_arg:
-    print(f"\nINFO: Loading Gmail-specific dataset for module: {agent_module_arg}")
-    # Ensure we pick up any recent edits to the dataset module
-    if "email_assistant.eval.email_gmail_dataset" in sys.modules:
-        importlib.reload(sys.modules["email_assistant.eval.email_gmail_dataset"])
-    from email_assistant.eval.email_gmail_dataset import (
-        email_inputs,
-        email_names,
-        response_criteria_list,
-        triage_outputs_list,
-        expected_tool_calls,
-    )
-    # Map expected tool names to Gmail tool names
-    _tool_map = {
-        "write_email": "send_email_tool",
-        "schedule_meeting": "schedule_meeting_tool",
-        "check_calendar_availability": "check_calendar_tool",
-        "done": "done",
-    }
-    expected_tool_calls = [
-        [_tool_map.get(call.lower(), call.lower()) for call in calls]
-        for calls in expected_tool_calls
-    ]
-    # Auto-accept HITL prompts in tests
-    os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
-else:
-    print(f"\nINFO: Loading standard dataset for module: {agent_module_arg}")
-    from email_assistant.eval.email_dataset import (
+def load_dataset(agent_module_name: str):
+    """Load the appropriate dataset for the given agent module."""
+
+    # Force reload the base dataset module to ensure we get the latest version
+    if "email_assistant.eval.email_dataset" in sys.modules:
+        importlib.reload(sys.modules["email_assistant.eval.email_dataset"])
+
+    if "gmail" in agent_module_name:
+        print(f"\nINFO: Loading Gmail-specific dataset for module: {agent_module_name}")
+        if "email_assistant.eval.email_gmail_dataset" in sys.modules:
+            importlib.reload(sys.modules["email_assistant.eval.email_gmail_dataset"])
+        from email_assistant.eval.email_gmail_dataset import (
+            email_inputs,
+            email_names,
+            response_criteria_list,
+            triage_outputs_list,
+            expected_tool_calls,
+        )
+
+        # Map expected tool names to Gmail tool names
+        _tool_map = {
+            "write_email": "send_email_tool",
+            "schedule_meeting": "schedule_meeting_tool",
+            "check_calendar_availability": "check_calendar_tool",
+            "done": "done",
+        }
+        expected_tool_calls = [
+            [_tool_map.get(call.lower(), call.lower()) for call in calls]
+            for calls in expected_tool_calls
+        ]
+        os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
+        os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "1")
+        os.environ.setdefault("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "1")
+        # Assume GOOGLE_API_KEY is provided via environment variables
+    else:
+        print(f"\nINFO: Loading standard dataset for module: {agent_module_name}")
+        from email_assistant.eval.email_dataset import (
+            email_inputs,
+            email_names,
+            response_criteria_list,
+            triage_outputs_list,
+            expected_tool_calls,
+        )
+
+    return (
         email_inputs,
         email_names,
         response_criteria_list,
@@ -179,30 +182,45 @@ def is_module_compatible(required_modules: List[str]) -> bool:
     """
     return AGENT_MODULE in required_modules
 
-def create_response_test_cases():
+def create_response_test_cases(dataset: Tuple[List, List, List, List, List]):
     """Create test cases for parametrized criteria evaluation with LangSmith.
     Only includes emails that require a response (triage_output == "respond").
-    These are more relevant / interesting for testing tool calling / response quality. 
+    These are more relevant / interesting for testing tool calling / response quality.
     """
-    
-    # Create tuples of (email_input, email_name, criteria) for parametrization
-    # Only include emails that require a response (triage_output == "respond")
+
+    (
+        email_inputs,
+        email_names,
+        response_criteria_list,
+        triage_outputs_list,
+        expected_tool_calls,
+    ) = dataset
+
     test_cases = []
-    for i, (email_input, email_name, criteria, triage_output, expected_calls) in enumerate(zip(
+    for email_input, email_name, criteria, triage_output, expected_calls in zip(
         email_inputs, email_names, response_criteria_list, triage_outputs_list, expected_tool_calls
-    )):
+    ):
         if triage_output == "respond":
-            # No need to include triage_output since we're filtering for "respond" only
-            # Each test case is (email_input, email_name, criteria, expected_calls)
             test_cases.append((email_input, email_name, criteria, expected_calls))
-    
+
     print(f"Created {len(test_cases)} test cases for emails requiring responses")
     return test_cases
 
+
+def pytest_generate_tests(metafunc):
+    """Parametrize tests dynamically based on the selected agent module."""
+
+    required = {"email_input", "email_name", "criteria", "expected_calls"}
+    if required.issubset(set(metafunc.fixturenames)):
+        agent_module_name = metafunc.config.getoption("--agent-module")
+        dataset = load_dataset(agent_module_name)
+        test_cases = create_response_test_cases(dataset)
+        metafunc.parametrize(
+            "email_input,email_name,criteria,expected_calls",
+            test_cases,
+        )
+
 # Reference output key
-@pytest.mark.langsmith(output_keys=["expected_calls"])
-# Variable names and a list of tuples with the test cases
-@pytest.mark.parametrize("email_input,email_name,criteria,expected_calls",create_response_test_cases())
 def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_calls, gmail_service):
     """Test if email processing contains expected tool calls."""
     # Log minimal inputs for LangSmith (safe noop if plugin disabled)
@@ -251,10 +269,7 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
     assert len(missing_calls) == 0
             
 # Reference output key
-@pytest.mark.langsmith(output_keys=["criteria"])
-# Variable names and a list of tuples with the test cases
 # Each test case is (email_input, email_name, criteria, expected_calls)
-@pytest.mark.parametrize("email_input,email_name,criteria,expected_calls",create_response_test_cases())
 def test_response_criteria_evaluation(email_input, email_name, criteria, expected_calls, gmail_service):
     """Test if a response meets the specified criteria.
     Only runs on emails that require a response.
