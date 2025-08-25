@@ -18,7 +18,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--agent-module",
         action="store",
-        default="email_assistant",
+        default="email_assistant_hitl_memory_gmail",
         help="Specify which email assistant module to test",
     )
 

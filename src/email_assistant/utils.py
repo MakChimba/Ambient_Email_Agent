@@ -70,13 +70,13 @@ def format_for_display(tool_call):
     display = ""
     
     # Add tool call information
-    if tool_call["name"] == "write_email":
+    if tool_call["name"] == "write_email" or tool_call["name"] == "send_email_tool":
         display += f"""# Email Draft
 
-**To**: {tool_call["args"].get("to")}
-**Subject**: {tool_call["args"].get("subject")}
+**To**: {tool_call["args"].get("to") or ''}
+**Subject**: {tool_call["args"].get("subject") or ''}
 
-{tool_call["args"].get("content")}
+{tool_call["args"].get("content") or tool_call["args"].get("response_text")}
 """
     elif tool_call["name"] == "schedule_meeting":
         display += f"""# Calendar Invite
@@ -258,8 +258,107 @@ def extract_tool_calls(messages: List[Any]) -> List[str]:
     return tool_call_names
 
 def format_messages_string(messages: List[Any]) -> str:
-    """Format messages into a single string for analysis."""
-    return '\n'.join(message.pretty_repr() for message in messages)
+    """Format a conversation to a readable string, normalizing tool names.
+
+    - Maps Gmail tool names to canonical dataset names for evaluation:
+      send_email_tool -> write_email, check_calendar_tool -> check_calendar_availability,
+      schedule_meeting_tool -> schedule_meeting. Done/Question unchanged.
+    - Includes tool arguments succinctly and tool results content.
+    - Falls back gracefully for unknown message shapes.
+    """
+
+    def normalize_tool_name(name: str) -> str:
+        mapping = {
+            "send_email_tool": "write_email",
+            "check_calendar_tool": "check_calendar_availability",
+            "schedule_meeting_tool": "schedule_meeting",
+        }
+        return mapping.get(name, name)
+
+    lines: List[str] = []
+    # Try to capture context (subject/from) from earlier messages for normalization
+    context_subject = ""
+    context_from = ""
+    for m in messages:
+        try:
+            text = extract_message_content(m)
+        except Exception:
+            text = ""
+        if not isinstance(text, str) or not text:
+            continue
+        if "**Subject**:" in text and "**From**:" in text:
+            # naive extraction from markdown block produced by format_gmail_markdown
+            try:
+                # Find lines
+                for line in text.splitlines():
+                    if line.strip().startswith("**Subject**:") and not context_subject:
+                        context_subject = line.split(":", 1)[1].strip()
+                    if line.strip().startswith("**From**:") and not context_from:
+                        context_from = line.split(":", 1)[1].strip()
+            except Exception:
+                pass
+
+    for m in messages:
+        # Tool call messages (AI)
+        tool_calls = None
+        if isinstance(m, dict):
+            tool_calls = m.get("tool_calls")
+            role = m.get("role") or "assistant"
+            content = m.get("content", "")
+        else:
+            tool_calls = getattr(m, "tool_calls", None)
+            role = getattr(m, "type", None) or getattr(m, "role", None) or "assistant"
+            content = extract_message_content(m)
+
+        if tool_calls:
+            for tc in tool_calls:
+                name_raw = tc.get("name", "")
+                name = normalize_tool_name(name_raw)
+                args = tc.get("args", {})
+                # Normalize args for write_email-style display
+                norm_args = args
+                if name == "write_email":
+                    content = args.get("content") or args.get("response_text")
+                    subject = args.get("subject") or (f"Re: {context_subject}" if context_subject else None)
+                    to_addr = args.get("to") or context_from or None
+                    norm_args = {k: v for k, v in {
+                        "to": to_addr,
+                        "subject": subject,
+                        "content": content,
+                    }.items() if v}
+                try:
+                    args_slim = json.dumps(norm_args, ensure_ascii=False)
+                except Exception:
+                    args_slim = str(norm_args)
+                lines.append(f"assistant: tool_call -> {name} {args_slim}")
+            continue
+
+        # Tool result messages
+        if isinstance(m, dict) and role == "tool":
+            tool_call_id = m.get("tool_call_id", "")
+            tool_result = m.get("content", "")
+            tool_result = str(tool_result)
+            # Trim overly long tool results for readability
+            if len(tool_result) > 1000:
+                tool_result = tool_result[:1000] + "…"
+            lines.append(f"tool[{tool_call_id}]: {tool_result}")
+            continue
+
+        # Regular assistant/user text
+        if role in ("ai", "assistant"):
+            text = content or ""
+            lines.append(f"assistant: {text}")
+        elif role in ("human", "user"):
+            text = content or ""
+            lines.append(f"user: {text}")
+        else:
+            # Fallback to pretty repr if available
+            try:
+                lines.append(m.pretty_repr())  # type: ignore[attr-defined]
+            except Exception:
+                lines.append(str(m))
+
+    return "\n".join(lines)
 
 def show_graph(graph, xray=False):
     """Display a LangGraph mermaid diagram with fallback rendering.
