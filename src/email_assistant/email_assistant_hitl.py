@@ -350,11 +350,10 @@ def should_continue(state: State) -> Literal["interrupt_handler", "__end__"]:
     messages = state["messages"]
     last_message = messages[-1]
     if last_message.tool_calls:
-        for tool_call in last_message.tool_calls: 
-            if tool_call["name"] == "Done":
-                return END
-            else:
-                return "interrupt_handler"
+        names = [tc.get("name") for tc in last_message.tool_calls]
+        if "Done" in names:
+            return END
+        return "interrupt_handler"
 
 # Build workflow
 agent_builder = StateGraph(State)

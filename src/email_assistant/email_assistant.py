@@ -225,11 +225,10 @@ def should_continue(state: State) -> Literal["Action", "__end__"]:
     messages = state["messages"]
     last_message = messages[-1]
     if getattr(last_message, "tool_calls", None):
-        for tool_call in last_message.tool_calls: 
-            if tool_call["name"] == "Done":
-                return END
-            else:
-                return "Action"
+        names = [tc.get("name") for tc in last_message.tool_calls]
+        if "Done" in names:
+            return END
+        return "Action"
     # No tool call produced; terminate gracefully
     return END
 
