@@ -8,15 +8,35 @@ import pytest
 
 NOTEBOOKS_DIR = Path(__file__).parent.parent / "notebooks"
 
+# Ensure notebooks run in non-interactive test mode
+os.environ.setdefault("NB_TEST_MODE", "1")
+
 # Skip notebooks that require specific setup or take too long to execute in automated tests
-SKIP_NOTEBOOKS = []
+# These rely on external services (LangSmith datasets, full agent runs) or long loops
+SKIP_NOTEBOOKS = [
+    # Notebooks intended for interactive walkthroughs or that run long live flows
+    "agent.ipynb",
+    "langgraph_101.ipynb",
+    "hitl.ipynb",
+    "memory.ipynb",
+]
 
 def get_notebooks():
-    """Get all notebook paths except those in the skip list."""
+    """Get all notebook paths except those in the skip list and checkpoints."""
     notebooks = []
     for nb_path in NOTEBOOKS_DIR.glob("**/*.ipynb"):
-        if nb_path.name not in SKIP_NOTEBOOKS and not nb_path.name.startswith("."):
-            notebooks.append(nb_path)
+        # Skip auto-saved checkpoint notebooks and hidden files
+        nb_str = str(nb_path)
+        if (
+            ".ipynb_checkpoints" in nb_path.parts
+            or "/.ipynb_checkpoints/" in nb_str
+            or nb_path.name.endswith("-checkpoint.ipynb")
+            or nb_path.name.startswith(".")
+        ):
+            continue
+        if nb_path.name in SKIP_NOTEBOOKS:
+            continue
+        notebooks.append(nb_path)
     return notebooks
 
 @pytest.mark.parametrize("notebook_path", get_notebooks())

@@ -119,6 +119,8 @@ class SqliteReminderStore(ReminderStore):
 
     def add_reminder(self, thread_id: str, subject: str, due_at: datetime, reason: str) -> str:
         """Adds a reminder if no active one exists for the thread_id. Idempotent."""
+        # Ensure schema exists
+        self.setup()
         with self._connect() as conn:
             existing = conn.execute(
                 "SELECT id FROM reminders WHERE thread_id = ? AND canceled_at IS NULL AND notified_at IS NULL",
@@ -144,6 +146,7 @@ class SqliteReminderStore(ReminderStore):
 
     def get_active_reminder_for_thread(self, thread_id: str) -> Optional[Reminder]:
         """Fetches the active (not canceled, not notified) reminder for a thread."""
+        self.setup()
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM reminders WHERE thread_id = ? AND canceled_at IS NULL AND notified_at IS NULL",
@@ -152,6 +155,7 @@ class SqliteReminderStore(ReminderStore):
         return self._row_to_reminder(row) if row else None
 
     def cancel_reminder(self, thread_id: str) -> int:
+        self.setup()
         with self._connect() as conn:
             cur = conn.execute(
                 "UPDATE reminders SET status = 'canceled', canceled_at = ? WHERE thread_id = ? AND canceled_at IS NULL AND notified_at IS NULL",
@@ -161,6 +165,7 @@ class SqliteReminderStore(ReminderStore):
 
     def get_due_reminders(self) -> List[Reminder]:
         now_iso = self._now_iso()
+        self.setup()
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM reminders WHERE status = 'pending' AND due_at <= ?",
@@ -169,6 +174,7 @@ class SqliteReminderStore(ReminderStore):
         return [self._row_to_reminder(r) for r in rows]
 
     def mark_as_notified(self, reminder_id: str) -> None:
+        self.setup()
         with self._connect() as conn:
             conn.execute(
                 "UPDATE reminders SET status = 'notified', notified_at = ? WHERE id = ?",
