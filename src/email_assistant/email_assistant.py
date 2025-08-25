@@ -63,7 +63,7 @@ def _fallback_tool_plan(email_input: dict):
             "attendees": [author, to],
             "subject": subject,
             "duration_minutes": 45,
-            "preferred_day": __import__('datetime').datetime.now(),
+            "preferred_day": __import__('datetime').datetime.now().isoformat(),
             "start_time": 1400,
         })
         add("write_email", {
@@ -78,7 +78,7 @@ def _fallback_tool_plan(email_input: dict):
             "attendees": [author, to],
             "subject": subject,
             "duration_minutes": 60,
-            "preferred_day": __import__('datetime').datetime.now(),
+            "preferred_day": __import__('datetime').datetime.now().isoformat(),
             "start_time": 1100,
         })
         add("write_email", {
