@@ -111,7 +111,7 @@ After ingestion, you can access your all interrupted threads in Agent Inbox (htt
 3. Connect it to your fork of the [this repo](https://github.com/langchain-ai/agents-from-scratch) and desired branch
 4. Give it a name like `Yourname-Email-Assistant`
 5. Add the following environment variables:
-   * `OPENAI_API_KEY`
+   * `GOOGLE_API_KEY`
    * `GMAIL_SECRET` - This is the full dictionary in `.secrets/secrets.json`
    * `GMAIL_TOKEN` - This is the full dictionary in `.secrets/token.json`
 6. Click Submit 
