@@ -764,6 +764,19 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
     """Route to tool handler, or end if Done tool called"""
     if state["messages"][-1].tool_calls:
         if any(tc["name"] == "Done" for tc in state["messages"][-1].tool_calls):
+            # Special case: system/no-reply notifications should not draft emails.
+            # If the sender is a no-reply address or the email content says "do not reply",
+            # allow Done to terminate even if no send_email_tool was used.
+            try:
+                email_input = state.get("email_input", {})
+                author, to, subject, email_thread, _email_id = parse_gmail(email_input)
+                author_l = (author or "").lower()
+                thread_l = (email_thread or "").lower()
+                is_no_reply = ("no-reply" in author_l) or ("do not reply" in thread_l) or ("please do not reply" in thread_l)
+                if is_no_reply:
+                    return "mark_as_read_node"
+            except Exception:
+                pass
             # If Done was called before drafting the reply, loop back to llm_call
             all_tool_names: list[str] = []
             for m in state.get("messages", []):

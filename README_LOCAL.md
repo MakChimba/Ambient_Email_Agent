@@ -64,13 +64,28 @@ This repo supports both offline-friendly tests and live model evaluation.
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
   - or `python scripts/run_tests_langsmith.py` (records to LangSmith if configured)
 
-- Full tests with LLM-as-judge (live model):
-  1. Install `langchain-google-genai` and set `GOOGLE_API_KEY`.
-  2. Unset `EMAIL_ASSISTANT_EVAL_MODE` (or set to `0`).
-  3. Run:
-     - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail`
-     - or `python scripts/run_tests_langsmith.py tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail`
-
 Notes
 - Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery.
-- Live model runs incur real LLM cost and may retry on transient provider errors.
+- Qualitative response grading is performed in LangStudio/LangSmith via the UI judge; there is no local LLM-as-judge test.
+
+### Quality Evaluation (UI Judge)
+
+- Use the LangStudio/LangSmith UI judge to score correctness and tool-policy compliance.
+- Each run includes a clear history with tool calls; the assistant’s final reply appears in the Output column.
+- Recommended rubric (example):
+  - Scheduling: `check_calendar_tool → schedule_meeting_tool → send_email_tool → Done`.
+  - 90-minute availability: `check_calendar_tool → send_email_tool → Done` (no scheduling).
+  - Default respond-only: `send_email_tool → Done`.
+  - `send_email_tool` must include `email_id` and `email_address`; `schedule_meeting_tool` should include attendees (incl. organizer), organizer_email, and valid start/end times.
+
+### Special Cases and Behavior
+
+- No‑reply/system notifications (e.g., sender contains `no-reply`, or body includes “do not reply”) may end with `Done` without drafting an email. This prevents loops and aligns with the “do not reply” instruction.
+- Auto‑HITL mode (`HITL_AUTO_ACCEPT=1`):
+  - Tool prompts that ask a Question will receive a minimal synthetic response so the flow can continue in demos/tests.
+  - Deterministic fallbacks for premature `Done` are enabled only in auto/test modes to avoid loops; live HITL behavior is unchanged.
+
+### Troubleshooting
+
+- Transient 5xx from model providers: retry the run. Tests do not require live LLMs; the UI judge is separate from local pytest.
+- Recursion limit errors: in Studio, increase the `recursion_limit` in the request/config to `100` for long tool sequences.

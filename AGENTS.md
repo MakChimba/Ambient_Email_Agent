@@ -37,6 +37,8 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - HITL auto-accept: Both memory agents support `HITL_AUTO_ACCEPT=1` to accept interrupt actions automatically (useful for demos/tests). Unset the env var to use Agent Inbox interactively.
 - Gmail agent safety: Tool invocation wrapped with try/except, fallback to `Done` when the model fails to emit a call, and safer classification handling. Tests mock `mark_as_read` to avoid auth in CI.
 - Gmail completion toggle: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` optionally skips the final Gmail `mark_as_read` call for demos without credentials (default is disabled).
+ - No‑reply/system notifications: If the email comes from a no‑reply address or explicitly says “do not reply,” the agent may finalize with `Done` without drafting an email, preventing loops and matching expected policy.
+ - Auto‑HITL Question handling: In auto‑accept demos/tests, `Question` prompts receive a minimal synthetic response so flows proceed without manual input. In live HITL, true interrupts are preserved.
 
 ### Defaults and Test Modes
 
@@ -69,6 +71,9 @@ Environment summary for CI-like runs:
   - `GOOGLE_API_KEY=...`
   - `GEMINI_MODEL=gemini-2.5-pro`
   - Optional: `HITL_AUTO_ACCEPT=1` (auto-accept HITL)
+ - Tips:
+   - For long tool sequences, set `recursion_limit` to `100` in the request config to avoid premature termination.
+   - No‑reply/system notifications can end with `Done` (no drafted email) by design.
 
 ## Agent Inbox (HITL) Resume Payloads
 
@@ -95,30 +100,9 @@ Runs the production-target Gmail agent with stable, offline-friendly settings.
 - Plain pytest:
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
 
-### Full tests with LLM-as-judge (live model)
+### Quality Evaluation
 
-These evaluate response quality against criteria using Gemini as a judge. Expect real LLM usage and potential latency.
-
-Prereqs:
-- Install `langchain-google-genai`.
-- Set `GOOGLE_API_KEY`.
-- Optional: set `GEMINI_MODEL` or `EVAL_MODEL` (default `gemini-2.5-pro`).
-
-Recommended env for live runs:
-- `HITL_AUTO_ACCEPT=1`
-- `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
-- Unset `EMAIL_ASSISTANT_EVAL_MODE` (or set to `0`) to allow the model to plan/tool-call naturally.
-
-Commands:
-- With LangSmith runner (override defaults):
-  - `python scripts/run_tests_langsmith.py tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail`
-    - This removes the `-k tool_calls` filter so both tool-call and LLM-as-judge tests run.
-- With pytest directly:
-  - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail`
-
-Notes:
-- The Gmail tools are wrapped to work without real credentials during tests; tool functions return mock outputs on auth failures. Tests assert presence of expected tool calls, not actual delivery.
-- LLM-as-judge relies on a healthy model endpoint. Occasional 5xx responses from providers may cause retries; re-run if transient errors surface.
+We rely on the LangStudio/LangSmith UI judge to evaluate reply quality and tool usage policy compliance. Local pytest focuses on tool-call presence and order only; there is no LLM-as-judge test in the repository.
 
 ## S-Class: Reminders & Follow-ups
 

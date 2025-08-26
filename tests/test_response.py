@@ -14,11 +14,6 @@ import sys
 import os
 import pytest
 from typing import Dict, List, Any, Tuple
-from pydantic import BaseModel, Field
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-except Exception:
-    ChatGoogleGenerativeAI = None  # type: ignore
 
 from langsmith import testing as t
 from langchain_core.runnables import RunnableLambda
@@ -28,8 +23,6 @@ from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
 
 from email_assistant.utils import extract_tool_calls, format_messages_string
-import time
-from email_assistant.eval.prompts import RESPONSE_CRITERIA_SYSTEM_PROMPT
 
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=True)
@@ -88,46 +81,7 @@ def load_dataset(agent_module_name: str):
         expected_tool_calls,
     )
     
-class CriteriaGrade(BaseModel):
-    """Score the response against specific criteria."""
-    grade: bool = Field(description="Does the response meet the provided criteria?")
-    justification: str = Field(description="The justification for the grade and score, including specific examples from the response.")
-
-# Create a global LLM for evaluation to avoid recreating it for each test.
-# Gemini-only default; allow override via EVAL_MODEL or GEMINI_MODEL.
-try:
-    model_name = os.getenv("EVAL_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
-    # Normalize potential provider or models/ prefixes (e.g., google_genai:gemini-2.5-pro)
-    if ":" in model_name:
-        model_name = model_name.split(":", 1)[1]
-    if model_name.startswith("models/"):
-        model_name = model_name.split("/", 1)[1]
-    if ChatGoogleGenerativeAI is None:
-        raise ImportError("langchain-google-genai is not installed")
-    # Fast, live judge with no fallbacks; keep deterministic settings
-    safety = {
-        "HARASSMENT": "BLOCK_NONE",
-        "HATE_SPEECH": "BLOCK_NONE",
-        "SEXUAL": "BLOCK_NONE",
-        "DANGEROUS_CONTENT": "BLOCK_NONE",
-    }
-    criteria_eval_llm = ChatGoogleGenerativeAI(
-        model=model_name,
-        temperature=0,
-        max_retries=4,
-        safety_settings=safety,
-        max_output_tokens=5000,
-    )
-    # Enforce JSON-mode to reduce parsing failures
-    criteria_eval_llm = criteria_eval_llm.bind(generation_config={"response_mime_type": "application/json"})
-    # Prefer structured output directly (single call)
-    criteria_eval_structured_llm = (
-        criteria_eval_llm.with_structured_output(CriteriaGrade)
-        .with_config({"run_name": "LLM as Judge"})
-    )
-except Exception:
-    criteria_eval_llm = None
-    criteria_eval_structured_llm = None
+# Removed: local LLM-as-Judge setup. Use LangStudio/LangSmith UI judge for qualitative evaluation.
 
 # Global variables for module name and imported module
 AGENT_MODULE = None
@@ -183,81 +137,10 @@ def extract_values(state: Any) -> Dict[str, Any]:
         return state
 
 
-def _condense_transcript(txt: str, max_chars: int = 8000) -> str:
-    """Keep the end of the transcript and prioritize tool call lines."""
-    if len(txt) <= max_chars:
-        return txt
-    lines = txt.splitlines()
-    # Keep last 250 lines, but ensure we include assistant tool_call lines if present
-    tail = lines[-250:]
-    tool_lines = [ln for ln in lines if "assistant: tool_call ->" in ln]
-    merged = tool_lines[-200:] + ["..."] + tail
-    s = "\n".join(merged)
-    return s[-max_chars:]
+# Helper previously used by judge evaluation removed.
 
 
-def robust_criteria_eval(criteria: str, all_messages_str: str, values: Dict[str, Any]) -> CriteriaGrade:
-    """Call the structured judge with retries and fallbacks to reduce nulls.
-
-    Returns a CriteriaGrade object in all cases.
-    """
-    if criteria_eval_structured_llm is None:
-        # Should not happen (test skips), but safeguard
-        return CriteriaGrade(grade=False, justification="Judge unavailable.")
-
-    prompts = [
-        (
-            RESPONSE_CRITERIA_SYSTEM_PROMPT,
-            f"\n\n Response criteria: {criteria} \n\n Assistant's response: \n\n {all_messages_str} \n\n Evaluate whether the assistant's response meets the criteria and provide justification for your evaluation.",
-        ),
-        (
-            RESPONSE_CRITERIA_SYSTEM_PROMPT,
-            f"\n\n Response criteria: {criteria} \n\n Assistant's response (condensed): \n\n {_condense_transcript(all_messages_str)} \n\n Evaluate whether the assistant's response meets the criteria and provide justification for your evaluation.",
-        ),
-    ]
-
-    # Attempt up to 2 passes with short sleep; create separate runs so at least one succeeds
-    for i, (sys_, usr_) in enumerate(prompts):
-        try:
-            result = criteria_eval_structured_llm.invoke([
-                {"role": "system", "content": sys_},
-                {"role": "user", "content": usr_},
-            ])
-            if result and hasattr(result, "grade") and hasattr(result, "justification"):
-                justification = str(getattr(result, "justification", "")).lower().strip()
-                # Treat sentinel/null-like outputs as a miss and continue to retry/fallback
-                if justification.startswith("judge returned null") or justification in ("null", ""):
-                    raise ValueError("Null judge output")
-                return result
-        except Exception:
-            pass
-        time.sleep(0.5)
-
-    # Fallback: simple heuristic using tool calls & keywords
-    tools = set(extract_tool_calls(values.get("messages", [])))
-    crit = (criteria or "").lower()
-    transcript = all_messages_str.lower()
-
-    # Heuristic rules
-    ok = True
-    if "check calendar" in crit and not any("check_calendar" in t for t in tools):
-        ok = False
-    if "schedule meeting" in crit and not any("schedule_meeting" in t for t in tools):
-        ok = False
-    if "write_email" in crit and not any("send_email_tool" in t or "write_email" in t for t in tools):
-        ok = False
-    if "90-minute" in crit and "90" not in transcript:
-        ok = False
-    if "swimming" in crit and "swim" not in transcript and "class" not in transcript:
-        ok = False
-
-    return CriteriaGrade(
-        grade=ok,
-        justification=(
-            "Fallback heuristic applied. Tools used: "
-            + ", ".join(sorted(tools))
-        ),
-    )
+# Heuristic/structured judge removed from local tests.
 
 def run_initial_stream(email_assistant: Any, email_input: Dict, thread_config: Dict) -> List[Dict]:
     """Run the initial stream and return collected messages."""
@@ -369,60 +252,5 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
             
 # Reference output key
 # Each test case is (email_input, email_name, criteria, expected_calls)
-def test_response_criteria_evaluation(email_input, email_name, criteria, expected_calls, gmail_service):
-    """Test if a response meets the specified criteria.
-    Only runs on emails that require a response.
-    """
-    # Log minimal inputs for LangSmith (safe noop if plugin disabled)
-    try:
-        t.log_inputs({"module": AGENT_MODULE, "test": "test_response_criteria_evaluation"})
-    except Exception:
-        pass
-    
-    print(f"Processing {email_name}...")
-    
-    # Set up the assistant
-    email_assistant, thread_config, _ = setup_assistant()
-    
-    # Run the agent        
-    if AGENT_MODULE in ["email_assistant", "email_assistant_hitl_memory_gmail"]:
-        # Workflow agent takes email_input directly
-        result = email_assistant.invoke({"email_input": email_input}, config=thread_config)
-    else:
-        raise ValueError(f"Unsupported agent module: {AGENT_MODULE}. Only 'email_assistant' is supported in automated testing.")
-        
-    # Get the final state
-    state = email_assistant.get_state(thread_config)
-    values = extract_values(state)
-    
-    # Generate message output string for evaluation
-    all_messages_str = format_messages_string(values['messages'])
-    
-    if criteria_eval_structured_llm is None:
-        pytest.fail("Evaluation model unavailable; cannot run LLM-as-Judge.")
-
-    # Evaluate against criteria with a single live call (no fallbacks)
-    eval_result = None
-    try:
-        eval_result = criteria_eval_structured_llm.invoke([
-            {"role": "system", "content": RESPONSE_CRITERIA_SYSTEM_PROMPT},
-            {"role": "user", "content": f"\n\n Response criteria: {criteria} \n\n Assistant's response: \n\n {all_messages_str} \n\n Evaluate whether the assistant's response meets the criteria and provide justification for your evaluation."},
-        ])
-    except Exception as e:
-        pytest.fail(f"Evaluation model invocation failed; cannot grade. Error: {e!r}")
-
-    # Require a structured result
-    if (eval_result is None) or (not hasattr(eval_result, "grade")) or (not hasattr(eval_result, "justification")):
-        pytest.fail("No structured evaluation result returned by judge.")
-
-    # Log feedback response only when eval_result is present
-    try:
-        t.log_outputs({
-            "justification": eval_result.justification,
-            "response": all_messages_str,
-        })
-    except Exception:
-        pass
-
-    assert eval_result.grade
+# Qualitative judge-based test removed. Use the LangStudio UI judge instead.
  
