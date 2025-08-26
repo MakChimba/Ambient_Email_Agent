@@ -21,6 +21,7 @@ except Exception:
     ChatGoogleGenerativeAI = None  # type: ignore
 
 from langsmith import testing as t
+from langchain_core.runnables import RunnableLambda
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -104,11 +105,25 @@ try:
     if ChatGoogleGenerativeAI is None:
         raise ImportError("langchain-google-genai is not installed")
     # Encourage deterministic, short, JSON-friendly outputs
-    criteria_eval_llm = ChatGoogleGenerativeAI(model=model_name, temperature=0, max_retries=3)
-    criteria_eval_structured_llm = (
-        criteria_eval_llm.with_structured_output(CriteriaGrade)
-        .with_config({"run_name": "LLM as Judge"})
+    safety = {
+        "HARASSMENT": "BLOCK_NONE",
+        "HATE_SPEECH": "BLOCK_NONE",
+        "SEXUAL": "BLOCK_NONE",
+        "DANGEROUS_CONTENT": "BLOCK_NONE",
+    }
+    criteria_eval_llm = ChatGoogleGenerativeAI(
+        model=model_name,
+        temperature=0,
+        max_retries=3,
+        safety_settings=safety,
+        max_output_tokens=256,
     )
+    # Force JSON MIME to reduce null/empty responses
+    criteria_eval_llm = criteria_eval_llm.bind(generation_config={"response_mime_type": "application/json"})
+    # Wrap structured output to coerce/guard against nulls
+    _judge = criteria_eval_llm.with_structured_output(CriteriaGrade)
+    _judge = _judge | RunnableLambda(lambda x: x or CriteriaGrade(grade=False, justification="Judge returned null."))
+    criteria_eval_structured_llm = _judge.with_config({"run_name": "LLM as Judge"})
 except Exception:
     criteria_eval_llm = None
     criteria_eval_structured_llm = None
@@ -208,6 +223,10 @@ def robust_criteria_eval(criteria: str, all_messages_str: str, values: Dict[str,
                 {"role": "user", "content": usr_},
             ])
             if result and hasattr(result, "grade") and hasattr(result, "justification"):
+                justification = str(getattr(result, "justification", "")).lower().strip()
+                # Treat sentinel/null-like outputs as a miss and continue to retry/fallback
+                if justification.startswith("judge returned null") or justification in ("null", ""):
+                    raise ValueError("Null judge output")
                 return result
         except Exception:
             pass
