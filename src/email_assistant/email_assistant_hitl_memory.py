@@ -25,13 +25,20 @@ def _maybe_interrupt(requests):
         return [{"type": "accept", "args": {}}]
     return interrupt(requests)
 
+# Role-specific model selection (override via env)
+DEFAULT_MODEL = (
+    os.getenv("EMAIL_ASSISTANT_MODEL")
+    or os.getenv("GEMINI_MODEL")
+    or "gemini-2.5-pro"
+)
+ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
+TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
+
 # Initialize the LLM for use with router / structured output
-llm = get_llm()
-llm_router = llm.with_structured_output(RouterSchema) 
+llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
 
 # Initialize the LLM, allowing any tool call (Gemini rejects 'required' as a function name)
-llm = get_llm()
-llm_with_tools = llm.bind_tools(tools, tool_choice="any")
+llm_with_tools = get_llm(temperature=0.0, model=TOOL_MODEL_NAME).bind_tools(tools, tool_choice="any")
 
 def get_memory(store, namespace, default_content=None):
     """Get memory from the store or initialize with default if it doesn't exist.
@@ -85,7 +92,8 @@ def update_memory(store, namespace, messages):
     # Try structured update via LLM
     new_profile = None
     try:
-        llm = get_llm().with_structured_output(UserPreferences)
+        memory_model = os.getenv("EMAIL_ASSISTANT_MEMORY_MODEL") or DEFAULT_MODEL
+        llm = get_llm(model=memory_model).with_structured_output(UserPreferences)
         result = llm.invoke(
             [
                 {

@@ -96,7 +96,7 @@ class CriteriaGrade(BaseModel):
 # Create a global LLM for evaluation to avoid recreating it for each test.
 # Gemini-only default; allow override via EVAL_MODEL or GEMINI_MODEL.
 try:
-    model_name = os.getenv("EVAL_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-pro"
+    model_name = os.getenv("EVAL_MODEL") or os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
     # Normalize potential provider or models/ prefixes (e.g., google_genai:gemini-2.5-pro)
     if ":" in model_name:
         model_name = model_name.split(":", 1)[1]
@@ -104,7 +104,7 @@ try:
         model_name = model_name.split("/", 1)[1]
     if ChatGoogleGenerativeAI is None:
         raise ImportError("langchain-google-genai is not installed")
-    # Encourage deterministic, short, JSON-friendly outputs
+    # Fast, live judge with no fallbacks; keep deterministic settings
     safety = {
         "HARASSMENT": "BLOCK_NONE",
         "HATE_SPEECH": "BLOCK_NONE",
@@ -114,16 +114,17 @@ try:
     criteria_eval_llm = ChatGoogleGenerativeAI(
         model=model_name,
         temperature=0,
-        max_retries=3,
+        max_retries=4,
         safety_settings=safety,
-        max_output_tokens=256,
+        max_output_tokens=5000,
     )
-    # Force JSON MIME to reduce null/empty responses
+    # Enforce JSON-mode to reduce parsing failures
     criteria_eval_llm = criteria_eval_llm.bind(generation_config={"response_mime_type": "application/json"})
-    # Wrap structured output to coerce/guard against nulls
-    _judge = criteria_eval_llm.with_structured_output(CriteriaGrade)
-    _judge = _judge | RunnableLambda(lambda x: x or CriteriaGrade(grade=False, justification="Judge returned null."))
-    criteria_eval_structured_llm = _judge.with_config({"run_name": "LLM as Judge"})
+    # Prefer structured output directly (single call)
+    criteria_eval_structured_llm = (
+        criteria_eval_llm.with_structured_output(CriteriaGrade)
+        .with_config({"run_name": "LLM as Judge"})
+    )
 except Exception:
     criteria_eval_llm = None
     criteria_eval_structured_llm = None
@@ -372,8 +373,6 @@ def test_response_criteria_evaluation(email_input, email_name, criteria, expecte
     """Test if a response meets the specified criteria.
     Only runs on emails that require a response.
     """
-    if criteria_eval_structured_llm is None:
-        pytest.skip("Evaluation model unavailable; skipping criteria evaluation test.")
     # Log minimal inputs for LangSmith (safe noop if plugin disabled)
     try:
         t.log_inputs({"module": AGENT_MODULE, "test": "test_response_criteria_evaluation"})
@@ -399,8 +398,22 @@ def test_response_criteria_evaluation(email_input, email_name, criteria, expecte
     # Generate message output string for evaluation
     all_messages_str = format_messages_string(values['messages'])
     
-    # Evaluate against criteria robustly
-    eval_result = robust_criteria_eval(criteria, all_messages_str, values)
+    if criteria_eval_structured_llm is None:
+        pytest.fail("Evaluation model unavailable; cannot run LLM-as-Judge.")
+
+    # Evaluate against criteria with a single live call (no fallbacks)
+    eval_result = None
+    try:
+        eval_result = criteria_eval_structured_llm.invoke([
+            {"role": "system", "content": RESPONSE_CRITERIA_SYSTEM_PROMPT},
+            {"role": "user", "content": f"\n\n Response criteria: {criteria} \n\n Assistant's response: \n\n {all_messages_str} \n\n Evaluate whether the assistant's response meets the criteria and provide justification for your evaluation."},
+        ])
+    except Exception as e:
+        pytest.fail(f"Evaluation model invocation failed; cannot grade. Error: {e!r}")
+
+    # Require a structured result
+    if (eval_result is None) or (not hasattr(eval_result, "grade")) or (not hasattr(eval_result, "justification")):
+        pytest.fail("No structured evaluation result returned by judge.")
 
     # Log feedback response only when eval_result is present
     try:
@@ -410,7 +423,6 @@ def test_response_criteria_evaluation(email_input, email_name, criteria, expecte
         })
     except Exception:
         pass
-        
-    # Assert only when eval_result is present
+
     assert eval_result.grade
  

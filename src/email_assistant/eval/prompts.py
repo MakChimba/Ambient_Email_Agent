@@ -51,6 +51,17 @@ IMPORTANT EVALUATION INSTRUCTIONS:
 7. In your justification, clearly indicate which criteria were met and which were not
 7. If ANY criteria are not met, the overall grade must be 'False'
 
+Tool name normalization note (Gmail vs. dataset tools):
+- Treat the following tool names as equivalent:
+  - send_email_tool == write_email
+  - check_calendar_tool == check_calendar_availability
+  - schedule_meeting_tool == schedule_meeting
+  - Done/done are the same
+
+Evaluation source of truth:
+- Consider the content of tool calls (e.g., the 'content' or 'response_text' fields) and any final assistant summary text as the assistant's reply.
+- Do not penalize for the specific literal tool name if the equivalent Gmail tool was used.
+
 Your output will be used for automated testing, so maintain a consistent evaluation approach."""
 
 # Used in /tests/test_hitl.py
