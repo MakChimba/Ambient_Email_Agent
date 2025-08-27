@@ -39,6 +39,12 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - Gmail completion toggle: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` optionally skips the final Gmail `mark_as_read` call for demos without credentials (default is disabled).
  - No‑reply/system notifications: If the email comes from a no‑reply address or explicitly says “do not reply,” the agent may finalize with `Done` without drafting an email, preventing loops and matching expected policy.
  - Auto‑HITL Question handling: In auto‑accept demos/tests, `Question` prompts receive a minimal synthetic response so flows proceed without manual input. In live HITL, true interrupts are preserved.
+ - Gmail HITL card improvements: For `send_email_tool`, the Agent Inbox card now clearly shows the resolved recipient (original sender) as `To`, your account as `From`, and a normalized `Subject` (adds `Re:` if missing) alongside the drafted body. This makes approvals unambiguous.
+ - StructuredPrompt outputs (Gmail): The Gmail agent now returns additional top-level fields in the final state to support external evaluators:
+   - `assistant_reply`: concise summary of the sent reply
+   - `tool_trace`: normalized conversation + tool-call trace
+   - `email_markdown`: canonical email context block
+ - Tool-arg compatibility toggle: Some evaluators expect `send_email_tool.email_address` to contain the reply recipient (the other party). By default (live mode), `email_address` remains your address (correct for Gmail). For compatibility in evals/demos, set `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (this is also implied when `EMAIL_ASSISTANT_EVAL_MODE=1`).
 
 ### Defaults and Test Modes
 
@@ -52,6 +58,7 @@ Environment summary for CI-like runs:
 - `HITL_AUTO_ACCEPT=1`
 - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
 - `EMAIL_ASSISTANT_EVAL_MODE=1`
+ - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (puts recipient into `send_email_tool.email_address` for compatibility with some evaluators)
 
 ## Spam Flow (Gmail)
 

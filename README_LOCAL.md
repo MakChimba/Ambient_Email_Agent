@@ -53,6 +53,7 @@ This repo supports both offline-friendly tests and live model evaluation.
   - `HITL_AUTO_ACCEPT=1`
   - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
   - `EMAIL_ASSISTANT_EVAL_MODE=1` (synthesize tool calls without a live LLM)
+  - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (compatibility for evaluators that expect `send_email_tool.email_address` to be the reply recipient rather than your address)
 
 ### Notebooks
 
@@ -84,6 +85,19 @@ Notes
 - Auto‑HITL mode (`HITL_AUTO_ACCEPT=1`):
   - Tool prompts that ask a Question will receive a minimal synthetic response so the flow can continue in demos/tests.
   - Deterministic fallbacks for premature `Done` are enabled only in auto/test modes to avoid loops; live HITL behavior is unchanged.
+
+### Gmail HITL Display and Structured Outputs
+
+- HITL card (Gmail): For `send_email_tool`, the Agent Inbox card shows:
+  - `To`: original sender (reply recipient)
+  - `From`: your account (sender)
+  - `Subject`: normalized with `Re:` when missing
+  - Draft body content
+
+- Final outputs (Gmail): The Gmail agent appends the following keys in the final state for external evaluators:
+  - `assistant_reply`: concise summary of the reply that was sent
+  - `tool_trace`: normalized conversation and tool-call trace
+  - `email_markdown`: canonical email context block
 
 ### Troubleshooting
 
