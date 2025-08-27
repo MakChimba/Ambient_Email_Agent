@@ -1,7 +1,7 @@
 from datetime import datetime
 import os
 # Default timezone used in prompt text; can be overridden by TIMEZONE env
-TIMEZONE = os.getenv("TIMEZONE", "Australia/Sydney")
+TIMEZONE = os.getenv("TIMEZONE", "Australia/Melbourne")
 
 # Email assistant triage prompt 
 triage_system_prompt = """
@@ -268,6 +268,14 @@ When handling emails, follow these steps:
 8. After using the write_email tool, the task is complete
 9. If you have sent the email, then use the Done tool to indicate that the task is complete
 </ Instructions >
+ 
+< Safety & Privacy >
+- Respect privacy: avoid sharing or generating sensitive PII (account numbers, full addresses, medical details). Mask or omit where not needed.
+- Consent checks: before scheduling on behalf of the user, confirm intent and time windows if ambiguous. Prefer HITL confirmation when unsure.
+- HITL gates: treat send_email and schedule_meeting outputs as drafts requiring approval unless auto-accept is explicitly enabled.
+- Timezone: interpret dates/times in """ + TIMEZONE + """ unless an explicit timezone is provided in the email. Write times with clear timezone where relevant.
+- No-reply awareness: if sender is no-reply or message says “do not reply”, finalize with Done without drafting a reply.
+</ Safety & Privacy >
 
 < Background >
 {background}

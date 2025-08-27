@@ -39,6 +39,7 @@ tools = get_tools([
     "send_email_tool",
     "schedule_meeting_tool",
     "check_calendar_tool",
+    "mark_as_spam_tool",
     "Question",
     "Done",
 ], include_gmail=True)
@@ -303,6 +304,22 @@ def llm_call(state: State, store: BaseStore):
         system_msgs.append({
             "role": "system",
             "content": "If the email requests scheduling, first call check_calendar_tool for the requested days, then schedule_meeting_tool, then draft the reply with send_email_tool, and finally call Done.",
+        })
+
+    # Spam-like detection: push a Question instead of Done or reply
+    spam_keywords = [
+        "click here", "free", "win", "winner", "selected to win", "prize", "vacation", "lottery", "claim now",
+    ]
+    is_spam_like = any(k in text_for_heuristic for k in spam_keywords)
+    if is_spam_like:
+        system_msgs.append({
+            "role": "system",
+            "content": "Suspicious content detected. Do not draft a reply or call Done. Call the Question tool asking if this thread should be moved to Spam.",
+        })
+        # Extra guard: discourage Done as first action
+        system_msgs.append({
+            "role": "system",
+            "content": "Never call Done as the first tool. Either draft a reply (non-spam) or ask a Question (spam-like).",
         })
 
     # Conference invite guidance: ask about workshops and group discounts
@@ -727,7 +744,7 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
     result = [ai_message]
     goto = "llm_call"
     for tool_call in ai_message.tool_calls:
-        if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question"]:
+        if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question", "mark_as_spam_tool"]:
             observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
             continue
@@ -767,6 +784,8 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
             config = {"allow_ignore": True, "allow_respond": True, "allow_edit": True, "allow_accept": True}
         elif tool_call["name"] == "Question":
             config = {"allow_ignore": True, "allow_respond": True, "allow_edit": False, "allow_accept": False}
+        elif tool_call["name"] == "mark_as_spam_tool":
+            config = {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}
         else:
             raise ValueError(f"Invalid tool call: {tool_call['name']}")
 
@@ -798,11 +817,19 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                     email_input = state["email_input"]
                     author, to, subject, email_thread, email_id = parse_gmail(email_input)
                     original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-                    confirm = {"action_request": {"action": "mark_as_spam", "args": {"email_id": email_id}}, "config": {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}, "description": original_email_markdown + "\n\nUser flagged as spam. Move this thread to Spam?"}
+                    confirm = {"action_request": {"action": "mark_as_spam_tool", "args": {"email_id": email_id}}, "config": {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}, "description": original_email_markdown + "\n\nUser flagged as spam. Move this thread to Spam?"}
                     followup = _maybe_interrupt([confirm])[0]
                     if followup["type"] == "accept":
-                        observation = mark_as_spam(email_id)
-                        result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+                        # Emit a synthetic tool_call so logs/tests register the action
+                        from langchain_core.messages import AIMessage
+                        spam_call = {
+                            "name": "mark_as_spam_tool",
+                            "args": {"email_id": email_id},
+                            "id": "mark_spam",
+                        }
+                        result.append(AIMessage(content="", tool_calls=[spam_call]))
+                        observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id})
+                        result.append({"role": "tool", "content": observation, "tool_call_id": "mark_spam"})
                         update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": "User marked this email as spam. Update triage preferences to classify similar emails as ignore."}])
                         goto = END
                     else:

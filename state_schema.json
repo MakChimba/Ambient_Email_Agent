@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EmailAssistantState",
+  "type": "object",
+  "properties": {
+    "messages": {"type": "array"},
+    "email_input": {"type": "object"},
+    "classification_decision": {"type": "string", "enum": ["ignore", "respond", "notify"]},
+    "assistant_reply": {"type": "string", "description": "Concise summary of the sent reply"},
+    "tool_trace": {"type": "string", "description": "Normalized conversation + tool-call trace"},
+    "email_markdown": {"type": "string", "description": "Canonical email context block"},
+    "analysis_notes": {"type": "string", "description": "Offloaded scratchpad for internal reasoning"},
+    "plan": {"type": "string", "description": "High-level next-action plan"},
+    "open_questions": {"type": "string", "description": "Outstanding clarifications for the user"}
+  },
+  "required": ["messages", "email_input"],
+  "x-hide-by-default": ["tool_trace", "email_markdown", "analysis_notes"],
+  "x-selectors": {
+    "triage_router": ["email_input"],
+    "response_agent": ["messages", "email_input"],
+    "interrupt_handler": ["messages", "email_input"],
+    "mark_as_read_node": ["messages", "email_input"],
+    "external_display": ["assistant_reply", "tool_trace", "email_markdown"]
+  }
+}

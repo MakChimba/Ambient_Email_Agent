@@ -1,0 +1,15 @@
+selectors:
+  - id: policies.core
+    query: ["privacy", "PII", "consent", "HITL", "no-reply"]
+    source: policies/
+  - id: user.prefs
+    query: ["response preferences", "calendar preferences", "triage preferences"]
+    source: memory/sqlite
+  - id: product.facts
+    query: ["Gmail", "Calendar", "tool args", "constraints"]
+    source: docs/
+limits:
+  max_chunks: 3
+  max_tokens: 2000
+rerank: cosine-hybrid
+provenance: include

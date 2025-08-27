@@ -821,7 +821,7 @@ class ScheduleMeetingInput(BaseModel):
         description="Email address of the meeting organizer"
     )
     timezone: str = Field(
-        default="America/Los_Angeles",
+        default="Australia/Melbourne",
         description="Timezone for the meeting"
     )
 
@@ -831,7 +831,7 @@ def send_calendar_invite(
     start_time: str,
     end_time: str,
     organizer_email: str,
-    timezone: str = "America/Los_Angeles"
+    timezone: str = "Australia/Melbourne"
 ) -> bool:
     """
     Schedule a meeting with Google Calendar and send invites.
@@ -900,7 +900,7 @@ def schedule_meeting_tool(
     start_time: str,
     end_time: str,
     organizer_email: str,
-    timezone: str = "America/Los_Angeles"
+    timezone: str = "Australia/Melbourne"
 ) -> str:
     """
     Schedule a meeting with Google Calendar and send invites.
@@ -965,5 +965,19 @@ def mark_as_spam(
             body={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]},
         ).execute()
         return f"Moved message {message_id} to Spam."
+    except Exception as e:
+        return f"Failed to move to Spam: {e}"
+
+
+class MarkAsSpamInput(BaseModel):
+    """Input schema to move a Gmail message to Spam."""
+    email_id: str = Field(description="Gmail message ID to move to Spam")
+
+
+@tool(args_schema=MarkAsSpamInput)
+def mark_as_spam_tool(email_id: str) -> str:
+    """Move a Gmail message to Spam (HITL-gated). Returns a status string."""
+    try:
+        return mark_as_spam(email_id)
     except Exception as e:
         return f"Failed to move to Spam: {e}"
