@@ -37,7 +37,8 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - HITL auto-accept: Both memory agents support `HITL_AUTO_ACCEPT=1` to accept interrupt actions automatically (useful for demos/tests). Unset the env var to use Agent Inbox interactively.
 - Gmail agent safety: Tool invocation wrapped with try/except, fallback to `Done` when the model fails to emit a call, and safer classification handling. Tests mock `mark_as_read` to avoid auth in CI.
 - Gmail completion toggle: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` optionally skips the final Gmail `mark_as_read` call for demos without credentials (default is disabled).
- - No‑reply/system notifications: If the email comes from a no‑reply address or explicitly says “do not reply,” the agent may finalize with `Done` without drafting an email, preventing loops and matching expected policy.
+- Spam tool: Added `mark_as_spam_tool` (HITL-gated). After explicit confirmation, the agent may move a thread to Spam and end the workflow without `Done`.
+- No‑reply/system notifications: If the email comes from a no‑reply address or explicitly says “do not reply,” the agent may finalize with `Done` without drafting an email, preventing loops and matching expected policy.
  - Auto‑HITL Question handling: In auto‑accept demos/tests, `Question` prompts receive a minimal synthetic response so flows proceed without manual input. In live HITL, true interrupts are preserved.
  - Gmail HITL card improvements: For `send_email_tool`, the Agent Inbox card now clearly shows the resolved recipient (original sender) as `To`, your account as `From`, and a normalized `Subject` (adds `Re:` if missing) alongside the drafted body. This makes approvals unambiguous.
  - StructuredPrompt outputs (Gmail): The Gmail agent now returns additional top-level fields in the final state to support external evaluators:
@@ -45,6 +46,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
    - `tool_trace`: normalized conversation + tool-call trace
    - `email_markdown`: canonical email context block
  - Tool-arg compatibility toggle: Some evaluators expect `send_email_tool.email_address` to contain the reply recipient (the other party). By default (live mode), `email_address` remains your address (correct for Gmail). For compatibility in evals/demos, set `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (this is also implied when `EMAIL_ASSISTANT_EVAL_MODE=1`).
+  - Timezone defaults: The Gmail agent uses Australia/Melbourne by default for prompts and scheduling tools unless an explicit timezone is provided.
 
 ### Defaults and Test Modes
 
@@ -77,10 +79,20 @@ Environment summary for CI-like runs:
 - Env:
   - `GOOGLE_API_KEY=...`
   - `GEMINI_MODEL=gemini-2.5-pro`
-  - Optional: `HITL_AUTO_ACCEPT=1` (auto-accept HITL)
+ - Optional: `HITL_AUTO_ACCEPT=1` (auto-accept HITL)
  - Tips:
    - For long tool sequences, set `recursion_limit` to `100` in the request config to avoid premature termination.
    - No‑reply/system notifications can end with `Done` (no drafted email) by design.
+
+### Studio Mapping (LLM-as-Judge)
+- For general LLM-as-Judge correctness evaluations, map these fields:
+  - `email_markdown` → `output.email_markdown`
+  - `assistant_reply` → `output.assistant_reply`
+  - `tool_trace` → `output.tool_trace`
+  - `raw_output_optional` → `output`
+- If running an older build without these keys, use fallbacks:
+  - `assistant_reply` → `output.messages[-1].content`
+  - `tool_trace` → last AI message’s `tool_calls`
 
 ## Agent Inbox (HITL) Resume Payloads
 

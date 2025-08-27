@@ -53,7 +53,7 @@ This repo supports both offline-friendly tests and live model evaluation.
   - `HITL_AUTO_ACCEPT=1`
   - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
   - `EMAIL_ASSISTANT_EVAL_MODE=1` (synthesize tool calls without a live LLM)
-  - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (compatibility for evaluators that expect `send_email_tool.email_address` to be the reply recipient rather than your address)
+  - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (compat mode for evaluators that expect the reply recipient in `send_email_tool.email_address` instead of your address). Off by default for live-correct Gmail behavior.
 
 ### Notebooks
 
@@ -71,13 +71,14 @@ Notes
 
 ### Quality Evaluation (UI Judge)
 
-- Use the LangStudio/LangSmith UI judge to score correctness and tool-policy compliance.
+- Use the LangStudio/LangSmith UI judge (general LLM-as-Judge) to score correctness and tool-policy compliance.
 - Each run includes a clear history with tool calls; the assistant’s final reply appears in the Output column.
 - Recommended rubric (example):
   - Scheduling: `check_calendar_tool → schedule_meeting_tool → send_email_tool → Done`.
   - 90-minute availability: `check_calendar_tool → send_email_tool → Done` (no scheduling).
   - Default respond-only: `send_email_tool → Done`.
   - `send_email_tool` must include `email_id` and `email_address`; `schedule_meeting_tool` should include attendees (incl. organizer), organizer_email, and valid start/end times.
+  - Exceptions: No‑reply/system “do not reply” can end with `Done` without a draft; spam may end with `mark_as_spam_tool` after HITL confirm.
 
 ### Special Cases and Behavior
 
@@ -98,6 +99,25 @@ Notes
   - `assistant_reply`: concise summary of the reply that was sent
   - `tool_trace`: normalized conversation and tool-call trace
   - `email_markdown`: canonical email context block
+
+### Studio Mapping (LLM-as-Judge)
+- Recommended mapping for general correctness evaluations:
+  - `email_markdown` → `output.email_markdown`
+  - `assistant_reply` → `output.assistant_reply`
+  - `tool_trace` → `output.tool_trace`
+  - `raw_output_optional` → `output`
+- Fallbacks (older builds):
+  - `assistant_reply` → `output.messages[-1].content`
+  - `tool_trace` → last AI message’s `tool_calls`
+
+### Timezone Defaults
+- The agent interprets dates/times in Australia/Melbourne by default unless the email specifies a timezone. `schedule_meeting_tool.timezone` defaults to this value.
+
+### Experiment Dataset
+- File: `datasets/experiment_gmail.jsonl`
+- Register with LangSmith:
+  - `PYTHONPATH=src python scripts/register_dataset_from_jsonl.py --jsonl datasets/experiment_gmail.jsonl --dataset-name standalone.email_assistant.experiments`
+- Use graph: `email_assistant_hitl_memory_gmail`. Approve HITL cards or set `HITL_AUTO_ACCEPT=1` for faster runs.
 
 ### Troubleshooting
 

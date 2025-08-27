@@ -2,6 +2,14 @@
 
 Connect your email assistant to Gmail and Google Calendar APIs.
 
+Tools overview (Gmail graph)
+- `fetch_emails_tool(email_address, minutes_since)`
+- `check_calendar_tool(dates)`
+- `schedule_meeting_tool(attendees, title, start_time, end_time, organizer_email, timezone)`
+- `send_email_tool(email_id, response_text, email_address, additional_recipients)`
+- `mark_as_spam_tool(email_id)` (HITL-gated)
+- `Done` (end after a successful send)
+
 ## Graph
 
 The `src/email_assistant/email_assistant_hitl_memory_gmail.py` graph is configured to use Gmail tools.
@@ -264,6 +272,14 @@ In summary:
 - `--skip-filters`: Process all messages found by search, using the latest message in each thread
 - `--include-read`: Include read messages in the search
 - `--include-read --skip-filters`: Most comprehensive, processes the latest message in all threads found by search
+
+## Semantics & Defaults
+
+- Timezone default: Scheduling uses `Australia/Melbourne` by default unless you provide an explicit timezone.
+- Sender/recipient semantics for replies:
+  - In live Gmail mode, `send_email_tool.email_address` is your account (sender).
+  - Some evaluators expect the recipient in `email_address`; enable compat mode with `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (not recommended for live).
+- Spam safety: `mark_as_spam_tool` is HITL-gated. After explicit approval, the agent may move a thread to Spam and end the workflow without `Done`.
 
 ## Important Gmail API Limitations
 
