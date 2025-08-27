@@ -343,7 +343,22 @@ def llm_call(state: State, store: BaseStore):
             "content": "For 90-minute planning sessions, first call check_calendar_tool for Monday or Wednesday next week, then reply with send_email_tool acknowledging the request and providing availability for a 90-minute meeting between 10 AM and 3 PM. Do not schedule a meeting. Then call Done.",
         })
 
-    prompt = system_msgs + state["messages"]
+    # Ensure the LLM sees the email context even if upstream routing didn't attach it
+    try:
+        email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+    except Exception:
+        email_markdown = ""
+    base_messages = state.get("messages", []) or []
+    needs_injection = not base_messages
+    if not needs_injection and isinstance(getattr(base_messages[-1], "content", None), str):
+        content_l = (base_messages[-1].content or "").lower()
+        # If last message lacks obvious email context markers, inject a minimal context prompt
+        if ("subject" not in content_l) and ("from" not in content_l) and ("to:" not in content_l) and ("respond to the email" not in content_l):
+            needs_injection = True
+    if needs_injection and email_markdown:
+        base_messages = base_messages + [{"role": "user", "content": f"Respond to the email: {email_markdown}"}]
+
+    prompt = system_msgs + base_messages
 
     # Anti-loop fallback (test/auto-HITL only): if the model called Done without drafting a reply yet,
     # synthesize a minimal send_email_tool + Done plan for non-scheduling threads. This is gated so

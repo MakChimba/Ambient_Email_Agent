@@ -19,9 +19,13 @@ class StateInput(TypedDict):
     email_input: dict
 
 class State(MessagesState):
-    # This state class has the messages key build in
+    # This state class has the messages key built in
     email_input: dict
     classification_decision: Literal["ignore", "respond", "notify"]
+    # Optional fields populated at finalization for evaluators/Studio mapping
+    assistant_reply: str | None
+    tool_trace: str | None
+    email_markdown: str | None
 
 class EmailData(TypedDict):
     id: str
