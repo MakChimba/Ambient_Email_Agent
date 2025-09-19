@@ -28,7 +28,7 @@ def configure_langsmith_projects(monkeypatch, request):
         return
 
     sydney_tz = ZoneInfo("Australia/Sydney")
-    timestamp = datetime.now(tz=sydney_tz).strftime("%Y%m%d-%H%M%S")
+    date_stamp = datetime.now(tz=sydney_tz).strftime("%Y%m%d")
 
     def slugify(text: str, limit: int, fallback: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -53,8 +53,8 @@ def configure_langsmith_projects(monkeypatch, request):
         base_parts.append(param_slug)
     base_slug = "-".join(part for part in base_parts if part) or judge_base
 
-    project_name = f"AGENT-{base_slug}-{timestamp}"
-    judge_project = f"JUDGE-{judge_base}-{timestamp}"
+    project_name = f"AGENT-{base_slug}-{date_stamp}"
+    judge_project = f"JUDGE-{judge_base}-{date_stamp}"
 
     monkeypatch.setenv("LANGSMITH_PROJECT", project_name)
     monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", judge_project)

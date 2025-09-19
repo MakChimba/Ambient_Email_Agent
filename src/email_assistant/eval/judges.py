@@ -362,20 +362,13 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
         run_id = str(run_id)
         client = Client()
 
-        # Primary feedback payload with full JSON in the extra field to mirror the UI judge.
-        try:
-            client.create_feedback(
-                run_id=run_id,
-                key="gemini_correctness_judge",
-                score=result.overall_correctness,
-                value=result.verdict,
-                comment=result.notes,
-                extra=result.model_dump(),
-            )
-        except Exception:
-            pass
-
         metric_entries = [
+            (
+                "verdict",
+                result.verdict,
+                f"Pass when overall_correctness ≥ 0.70 (scored {result.overall_correctness:.2f})",
+                None,
+            ),
             (
                 "overall_correctness",
                 result.overall_correctness,
@@ -404,6 +397,7 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                     score=score if isinstance(score, (int, float)) else None,
                     value=str(value),
                     comment=comment,
+                    extra=result.model_dump() if key == "verdict" else None,
                 )
             except Exception:
                 continue
