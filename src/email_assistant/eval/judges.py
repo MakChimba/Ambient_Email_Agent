@@ -29,6 +29,7 @@ __all__ = [
     "JudgeResult",
     "JudgeUnavailableError",
     "build_correctness_judge_chain",
+    "build_tool_call_context",
     "run_correctness_judge",
     "serialise_messages",
     "create_langsmith_correctness_evaluator",
@@ -288,6 +289,12 @@ def _build_tool_call_context(messages: Iterable[object]) -> Tuple[str, str]:
     return summary, tool_calls_json
 
 
+def build_tool_call_context(messages: Iterable[object]) -> Tuple[str, str]:
+    """Public wrapper that returns (summary_text, json_payload) for tool calls."""
+
+    return _build_tool_call_context(messages)
+
+
 def _normalise_result_dict(data: dict) -> dict:
     result = data.copy()
     incorrect = result.get("incorrect_tool_uses") or []
@@ -354,17 +361,53 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
             run_id = run_tree.id
         run_id = str(run_id)
         client = Client()
-        client.create_feedback(
-            run_id=run_id,
-            key="gemini_correctness_judge",
-            score=result.overall_correctness,
-            value=result.verdict,
-            comment=result.notes,
-            extra=result.model_dump(),
-        )
-        # Surface granular judge findings as additional feedback entries so
-        # the LangSmith UI displays the same rich chips shown by the hosted
-        # Gemini judge.
+
+        # Primary feedback payload with full JSON in the extra field to mirror the UI judge.
+        try:
+            client.create_feedback(
+                run_id=run_id,
+                key="gemini_correctness_judge",
+                score=result.overall_correctness,
+                value=result.verdict,
+                comment=result.notes,
+                extra=result.model_dump(),
+            )
+        except Exception:
+            pass
+
+        metric_entries = [
+            (
+                "overall_correctness",
+                result.overall_correctness,
+                "Weighted correctness (0..1)",
+                result.overall_correctness,
+            ),
+            (
+                "content_alignment",
+                result.content_alignment,
+                "Content alignment score (0-5)",
+                float(result.content_alignment),
+            ),
+            (
+                "tool_usage",
+                result.tool_usage,
+                "Tool usage score (0-5)",
+                float(result.tool_usage),
+            ),
+            ("notes", result.notes, "Judge guidance", None),
+        ]
+        for key, value, comment, score in metric_entries:
+            try:
+                client.create_feedback(
+                    run_id=run_id,
+                    key=key,
+                    score=score if isinstance(score, (int, float)) else None,
+                    value=str(value),
+                    comment=comment,
+                )
+            except Exception:
+                continue
+
         if result.missing_tools:
             try:
                 client.create_feedback(
@@ -375,6 +418,7 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                 )
             except Exception:
                 pass
+
         if result.incorrect_tool_uses:
             for issue in result.incorrect_tool_uses:
                 try:
@@ -396,6 +440,7 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                     )
                 except Exception:
                     continue
+
         if result.evidence:
             try:
                 client.create_feedback(

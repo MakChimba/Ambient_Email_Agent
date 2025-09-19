@@ -3,9 +3,10 @@
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -26,7 +27,8 @@ def configure_langsmith_projects(monkeypatch, request):
     if tracing_flag not in TRACING_ENABLED_VALUES:
         return
 
-    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
+    sydney_tz = ZoneInfo("Australia/Sydney")
+    timestamp = datetime.now(tz=sydney_tz).strftime("%Y%m%d-%H%M%S")
 
     def slugify(text: str, limit: int, fallback: str) -> str:
         slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
@@ -36,13 +38,13 @@ def configure_langsmith_projects(monkeypatch, request):
 
     node_id = request.node.nodeid
     module_part, *_ = node_id.split("::", 1)
-    module_slug = slugify(Path(module_part).stem, 16, "module")
+    module_slug = slugify(Path(module_part).stem, 28, "module")
 
     func_name = getattr(request.node, "originalname", request.node.name)
-    func_slug = slugify(func_name, 20, "test")
+    func_slug = slugify(func_name, 32, "test")
 
     param_id = getattr(getattr(request.node, "callspec", None), "id", "")
-    param_slug = slugify(param_id, 12, "param") if param_id else ""
+    param_slug = slugify(param_id, 32, "param") if param_id else ""
 
     base_parts = [module_slug, func_slug]
     judge_base = "-".join(part for part in base_parts if part) or "test"
@@ -51,8 +53,8 @@ def configure_langsmith_projects(monkeypatch, request):
         base_parts.append(param_slug)
     base_slug = "-".join(part for part in base_parts if part) or judge_base
 
-    project_name = f"asst-{base_slug}-{timestamp}"
-    judge_project = f"judge-{judge_base}"
+    project_name = f"AGENT-{base_slug}-{timestamp}"
+    judge_project = f"JUDGE-{judge_base}-{timestamp}"
 
     monkeypatch.setenv("LANGSMITH_PROJECT", project_name)
     monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", judge_project)

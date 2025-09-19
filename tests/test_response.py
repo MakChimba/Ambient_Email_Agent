@@ -18,6 +18,7 @@ from tests.agent_test_utils import (
 )
 from email_assistant.eval.judges import (
     JudgeUnavailableError,
+    build_tool_call_context,
     run_correctness_judge,
     serialise_messages,
 )
@@ -176,6 +177,7 @@ def maybe_invoke_llm_judge(
     email_markdown = values.get("email_markdown", "")
     assistant_reply = values.get("assistant_reply", "")
     tool_trace = values.get("tool_trace") or format_messages_string(values.get("messages", []))
+    tool_calls_summary, tool_calls_json = build_tool_call_context(values.get("messages", []))
     raw_output = _build_raw_output_payload(values)
 
     try:
@@ -183,6 +185,8 @@ def maybe_invoke_llm_judge(
             email_markdown=email_markdown,
             assistant_reply=assistant_reply,
             tool_trace=tool_trace,
+            tool_calls_summary=tool_calls_summary,
+            tool_calls_json=tool_calls_json,
             raw_output_optional=raw_output,
             parent_run_id=parent_run_id,
         )

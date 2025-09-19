@@ -40,7 +40,7 @@ def test_build_tool_call_context_returns_ordered_summary():
         },
     ]
 
-    summary, tool_calls_json = judges._build_tool_call_context(messages)
+    summary, tool_calls_json = judges.build_tool_call_context(messages)
 
     assert "1. check_calendar_tool" in summary
     assert "result={" in summary
