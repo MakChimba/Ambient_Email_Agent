@@ -10,7 +10,7 @@ import email.utils
 import json
 import logging
 from datetime import datetime
-from typing import List, Optional, Dict, Any, Iterator
+from typing import List, Optional, Dict, Any, Iterator, Tuple
 from pathlib import Path
 from pydantic import Field, BaseModel
 from langchain_core.tools import tool
@@ -832,10 +832,10 @@ def send_calendar_invite(
     end_time: str,
     organizer_email: str,
     timezone: str = "Australia/Melbourne"
-) -> bool:
+) -> Tuple[bool, str]:
     """
     Schedule a meeting with Google Calendar and send invites.
-    
+
     Args:
         attendees: Email addresses of meeting attendees
         title: Meeting title/subject
@@ -843,24 +843,35 @@ def send_calendar_invite(
         end_time: Meeting end time in ISO format (YYYY-MM-DDTHH:MM:SS)
         organizer_email: Email address of the meeting organizer
         timezone: Timezone for the meeting
-        
+
     Returns:
-        Success flag (True if meeting was scheduled)
+        Tuple of success flag and a human readable status message
     """
     if not GMAIL_API_AVAILABLE:
         logger.info("Gmail API not available, simulating calendar invite")
         logger.info(f"Would schedule: {title} from {start_time} to {end_time}")
         logger.info(f"Attendees: {', '.join(attendees)}")
-        return True
-        
+        message = (
+            "Simulated meeting scheduling because Gmail API libraries are unavailable. "
+            f"Intended invite '{title}' from {start_time} to {end_time} for {len(attendees)} attendee(s)."
+        )
+        return True, message
+
     try:
         # Get Gmail API credentials from environment variables or local files
         creds = get_credentials(
             gmail_token=os.getenv("GMAIL_TOKEN"),
             gmail_secret=os.getenv("GMAIL_SECRET")
         )
+        if not creds:
+            message = (
+                "Failed to schedule meeting: Gmail API credentials missing. "
+                "Provide GMAIL_TOKEN / GMAIL_SECRET or .secrets/token.json before retrying."
+            )
+            logger.warning(message)
+            return False, message
         service = build("calendar", "v3", credentials=creds)
-        
+
         # Create event details
         event = {
             "summary": title,
@@ -885,13 +896,18 @@ def send_calendar_invite(
         
         # Create the event
         event = service.events().insert(calendarId="primary", body=event).execute()
-        
+
         logger.info(f"Meeting created: {event.get('htmlLink')}")
-        return True
-        
+        message = (
+            f"Meeting '{title}' scheduled successfully from {start_time} to {end_time} "
+            f"with {len(attendees)} attendee(s)."
+        )
+        return True, message
+
     except Exception as e:
         logger.error(f"Error scheduling meeting: {str(e)}")
-        return False
+        message = f"Failed to schedule meeting via Gmail API: {str(e)}"
+        return False, message
 
 @tool(args_schema=ScheduleMeetingInput)
 def schedule_meeting_tool(
@@ -917,7 +933,7 @@ def schedule_meeting_tool(
         Success or failure message
     """
     try:
-        success = send_calendar_invite(
+        success, message = send_calendar_invite(
             attendees,
             title,
             start_time,
@@ -925,11 +941,8 @@ def schedule_meeting_tool(
             organizer_email,
             timezone
         )
-        
-        if success:
-            return f"Meeting '{title}' scheduled successfully from {start_time} to {end_time} with {len(attendees)} attendees"
-        else:
-            return "Failed to schedule meeting"
+
+        return message
     except Exception as e:
         return f"Error scheduling meeting: {str(e)}"
     

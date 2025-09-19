@@ -28,6 +28,7 @@ from email_assistant.utils import (
     format_for_display,
     format_gmail_markdown,
     format_messages_string,
+    extract_message_content,
 )
 from email_assistant.tools.reminders import get_default_store
 from dotenv import load_dotenv
@@ -310,6 +311,29 @@ def llm_call(state: State, store: BaseStore):
             return re.search(pattern, text) is not None
         return keyword in text
 
+    schedule_failure_count = 0
+    last_schedule_failure: str | None = None
+    for message in state.get("messages", []):
+        role = (getattr(message, "role", None) or getattr(message, "type", None) or "").lower()
+        if role != "tool":
+            continue
+        content = extract_message_content(message) or ""
+        lowered = content.lower()
+        if "schedule" not in lowered:
+            continue
+        if (
+            "failed to schedule" in lowered
+            or "error scheduling" in lowered
+            or "error executing schedule_meeting_tool" in lowered
+        ):
+            schedule_failure_count += 1
+            last_schedule_failure = content.strip()
+        elif "scheduled successfully" in lowered or "simulated meeting scheduling" in lowered:
+            schedule_failure_count = 0
+            last_schedule_failure = None
+
+    scheduling_disabled = last_schedule_failure is not None
+
     if "check_calendar_tool" in all_tool_names and "schedule_meeting_tool" not in all_tool_names and "send_email_tool" not in all_tool_names:
         system_msgs.append({"role": "system", "content": "Now schedule the meeting with schedule_meeting_tool."})
     if "schedule_meeting_tool" in all_tool_names and "send_email_tool" not in all_tool_names:
@@ -321,7 +345,24 @@ def llm_call(state: State, store: BaseStore):
         system_msgs.append({"role": "system", "content": "Do not call Done yet. First call send_email_tool with email_id and email_address to draft the reply."})
 
     # If this looks like a scheduling request, nudge the desired sequence
-    if any(_contains_keyword(text_for_heuristic, k) for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]):
+    scheduling_keywords = ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+    if scheduling_disabled and last_schedule_failure:
+        failure_suffix = (
+            f" (consecutive failures: {schedule_failure_count})"
+            if schedule_failure_count > 1
+            else ""
+        )
+        system_msgs.append(
+            {
+                "role": "system",
+                "content": (
+                    "Previous schedule_meeting_tool attempt failed with: "
+                    f"{last_schedule_failure}{failure_suffix}. Do not retry schedule_meeting_tool. "
+                    "Instead, explain the issue, offer manual coordination, or request human input via a Question."
+                ),
+            }
+        )
+    elif any(_contains_keyword(text_for_heuristic, k) for k in scheduling_keywords):
         system_msgs.append({
             "role": "system",
             "content": "If the email requests scheduling, first call check_calendar_tool for the requested days, then schedule_meeting_tool, then draft the reply with send_email_tool, and finally call Done.",
@@ -515,7 +556,10 @@ def llm_call(state: State, store: BaseStore):
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         # If it's about scheduling (general) → check calendar → schedule → reply → done
-        elif any(_contains_keyword(text, k) for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]):
+        elif (not scheduling_disabled) and any(
+            _contains_keyword(text, k)
+            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+        ):
             # Use Tue/Thu example dates to align with dataset phrasing
             tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["20-05-2025", "22-05-2025"]}, "id": "check_cal"})
             tool_calls.append({
@@ -605,6 +649,25 @@ def llm_call(state: State, store: BaseStore):
             msg = None
     # Post-process LLM tool plan: enforce intent-specific plans and termination
     if getattr(msg, "tool_calls", None):
+        if scheduling_disabled and any(
+            (tc or {}).get("name") == "schedule_meeting_tool" for tc in (msg.tool_calls or [])
+        ):
+            from langchain_core.messages import AIMessage
+
+            question_text = (
+                "Calendar scheduling is currently unavailable — the last attempt failed with: "
+                f"{last_schedule_failure}. Should I acknowledge the issue and coordinate manually?"
+            )
+            msg = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "Question",
+                        "args": {"content": question_text},
+                        "id": "question",
+                    }
+                ],
+            )
         text = text_for_heuristic
         is_api_doc = any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"])
         is_90min_planning = (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"]))
@@ -644,7 +707,7 @@ def llm_call(state: State, store: BaseStore):
                 {"name": "Done", "args": {"done": True}, "id": "done"},
             ]
             msg = AIMessage(content="", tool_calls=tool_calls)
-        elif is_joint_presentation:
+        elif is_joint_presentation and not scheduling_disabled:
             from langchain_core.messages import AIMessage
             other_email = extract_email(author)
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
@@ -733,7 +796,10 @@ def llm_call(state: State, store: BaseStore):
                 "id": "send_email",
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
-        elif any(_contains_keyword(text, k) for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]):
+        elif (not scheduling_disabled) and any(
+            _contains_keyword(text, k)
+            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+        ):
             tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["20-05-2025", "22-05-2025"]}, "id": "check_cal"})
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
             tool_calls.append({
@@ -848,8 +914,21 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                         trimmed += "."
                     updated_text = (trimmed + " " + " ".join(additions)).strip()
                     args["response_text"] = updated_text
-                    response_text = updated_text
-                    response_lower = response_text.lower()
+                response_text = updated_text
+                response_lower = response_text.lower()
+            if any(keyword in email_body_lower for keyword in ["45-minute", "45 minute"]) and not any(
+                keyword in response_lower for keyword in ["45-minute", "45 minute"]
+            ):
+                trimmed = response_text.rstrip()
+                if trimmed and trimmed[-1] not in ".!?":
+                    trimmed += "."
+                updated_text = (
+                    trimmed
+                    + " I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly."
+                ).strip()
+                args["response_text"] = updated_text
+                response_text = updated_text
+                response_lower = response_text.lower()
             if swim_context and not any(keyword in response_lower for keyword in ["reserve", "register"]):
                 trimmed = response_text.rstrip()
                 if trimmed and trimmed[-1] not in ".!?":

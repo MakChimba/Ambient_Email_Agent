@@ -39,6 +39,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - Gmail completion toggle: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` optionally skips the final Gmail `mark_as_read` call for demos without credentials (default is disabled).
 - Spam tool: Added `mark_as_spam_tool` (HITL-gated). After explicit confirmation, the agent may move a thread to Spam and end the workflow without `Done`. The Gmail tool registry now exposes this helper for both runtime and tests.
 - No‑reply/system notifications: If the email comes from a no‑reply address or explicitly says “do not reply,” the agent may finalize with `Done` without drafting an email, preventing loops and matching expected policy.
+- Calendar fallback: When the Gmail API is unavailable or credentials are missing, `schedule_meeting_tool` now reports the exact failure (“Gmail API credentials missing”, etc.) and the Gmail agent stops retrying the tool—nudging the model to ask for manual follow-up instead of looping.
 - Document review requests now explicitly promise to review the technical materials and commit to the stated deadline (e.g., “feedback before Friday”) so live replies meet dataset criteria.
 - Swimming class inquiries automatically ask to reserve a spot for the sender’s daughter, matching scheduling expectations from the Gmail dataset and tests.
  - Auto‑HITL Question handling: In auto‑accept demos/tests, `Question` prompts receive a minimal synthetic response so flows proceed without manual input. In live HITL, true interrupts are preserved.
