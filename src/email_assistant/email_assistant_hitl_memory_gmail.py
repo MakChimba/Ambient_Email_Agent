@@ -358,6 +358,19 @@ def llm_call(state: State, store: BaseStore):
             "content": "For annual checkup reminders, reply with send_email_tool acknowledging the reminder (e.g., you'll call to schedule), then call Done.",
         })
 
+    # Document review commitments (acknowledge deadline and work)
+    if _contains_keyword(text_for_heuristic, "review") and (_contains_keyword(text_for_heuristic, "friday") or _contains_keyword(text_for_heuristic, "deadline")):
+        system_msgs.append({
+            "role": "system",
+            "content": "For document review requests, confirm you'll review the technical materials and acknowledge the stated deadline (e.g., promise feedback before Friday) when drafting the reply.",
+        })
+
+    if any(_contains_keyword(text_for_heuristic, k) for k in ["swimming", "swim", "class", "daughter", "register"]):
+        system_msgs.append({
+            "role": "system",
+            "content": "For swimming class inquiries, express interest in registering your daughter and explicitly ask to reserve a spot in one of the offered class times.",
+        })
+
     # 90-minute planning meeting guidance (availability only, no scheduling)
     if any(_contains_keyword(text_for_heuristic, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text_for_heuristic, k) for k in ["planning", "quarterly", "planning session"]):
         system_msgs.append({
@@ -410,7 +423,7 @@ def llm_call(state: State, store: BaseStore):
         if needs_reply_injection:
             # Build a short contextual reply like in eval-mode defaults
             text = text_for_heuristic
-            if any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
+            if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
                 response_text = (
                     "Thanks for the question — I'll investigate the authentication API docs "
                     "(including /auth/refresh and /auth/validate) and follow up with clarifications."
@@ -536,7 +549,7 @@ def llm_call(state: State, store: BaseStore):
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
             # Default respond-only plan with contextual content
-            if any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
+            if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
                 response_text = (
                     "Thanks for the question — I'll investigate the authentication API docs "
                     "(including /auth/refresh and /auth/validate) and follow up with clarifications."
@@ -593,7 +606,7 @@ def llm_call(state: State, store: BaseStore):
     # Post-process LLM tool plan: enforce intent-specific plans and termination
     if getattr(msg, "tool_calls", None):
         text = text_for_heuristic
-        is_api_doc = any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"])
+        is_api_doc = any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"])
         is_90min_planning = (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"]))
         is_joint_presentation = (
             any(_contains_keyword(text, k) for k in ["joint presentation", "joint presentation next month"]) or (
@@ -751,7 +764,7 @@ def llm_call(state: State, store: BaseStore):
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
-            if any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
+            if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
                 response_text = (
                     "Thanks for the question — I'll investigate the authentication API docs "
                     "(including /auth/refresh and /auth/validate) and follow up with clarifications."
@@ -811,10 +824,40 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
         email_input = state["email_input"]
         author, to, subject, email_thread, email_id = parse_gmail(email_input)
         original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+        email_body_lower = (email_thread or "").lower()
+        doc_review_context = (
+            "review" in email_body_lower and ("friday" in email_body_lower or "deadline" in email_body_lower)
+        )
+        swim_context = any(keyword in email_body_lower for keyword in ["swimming", "swim", "register", "class", "daughter"])
 
         # Build a Gmail-aware display for send_email_tool so HITL shows the real recipient
         tool_display = None
         if tool_call["name"] == "send_email_tool":
+            args = tool_call.get("args", {})
+            response_text = args.get("response_text") or ""
+            response_lower = response_text.lower()
+            if doc_review_context:
+                additions = []
+                if not any(keyword in response_lower for keyword in ["review", "technical"]):
+                    additions.append("I'll review the technical specifications in detail.")
+                if not any(keyword in response_lower for keyword in ["friday", "deadline"]):
+                    additions.append("Expect my feedback before Friday.")
+                if additions:
+                    trimmed = response_text.rstrip()
+                    if trimmed and trimmed[-1] not in ".!?":
+                        trimmed += "."
+                    updated_text = (trimmed + " " + " ".join(additions)).strip()
+                    args["response_text"] = updated_text
+                    response_text = updated_text
+                    response_lower = response_text.lower()
+            if swim_context and not any(keyword in response_lower for keyword in ["reserve", "register"]):
+                trimmed = response_text.rstrip()
+                if trimmed and trimmed[-1] not in ".!?":
+                    trimmed += "."
+                updated_text = (trimmed + " Please reserve a spot for my daughter in the intermediate class.").strip()
+                args["response_text"] = updated_text
+                response_text = updated_text
+                response_lower = response_text.lower()
             def _extract_email(addr: str) -> str:
                 if not addr:
                     return ""

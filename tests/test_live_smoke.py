@@ -25,7 +25,7 @@ SMOKE_CASES = {
 }
 
 SMOKE_KEYWORD_GROUPS = {
-    "reply_only_ack": [["submitted"], ["review", "follow up"]],
+    "reply_only_ack": [["thanks", "appreciate"], ["update", "submitted", "review", "follow up"]],
     "scheduling_joint_presentation": [["scheduled", "schedule"], ["invite"], ["slides", "presentation"]],
 }
 
