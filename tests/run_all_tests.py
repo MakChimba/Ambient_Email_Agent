@@ -59,6 +59,8 @@ def main():
 
     if args.offline_eval:
         os.environ["EMAIL_ASSISTANT_EVAL_MODE"] = "1"
+        # Provide a placeholder key so Google clients avoid looking up ADC credentials.
+        os.environ.setdefault("GOOGLE_API_KEY", "offline-test-key")
     else:
         os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "0")
         if not os.getenv("GOOGLE_API_KEY"):
@@ -66,50 +68,83 @@ def main():
                 "WARNING: GOOGLE_API_KEY not set. Tests depending on live Gemini calls will skip or fail."
             )
 
+    # Keep notebook execution short/deterministic by default.
+    os.environ.setdefault("NB_TEST_MODE", "1")
+
+    gmail_core_tests = [
+        ("test_response.py", ["-k", "tool_calls"]),
+        ("test_spam_flow.py", []),
+        ("test_reminders.py", []),
+    ]
+
+    # LangSmith-backed reminder suite is optional; include when credentials exist.
+    if os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY"):
+        gmail_core_tests.append(("test_reminders_langsmith.py", []))
+
+    gmail_notebook_tests = [("test_notebooks.py", [])]
+
+    implementation_test_matrix = {
+        "email_assistant": {
+            "core": [("test_response.py", ["-k", "tool_calls"])],
+            "notebook": [],
+        },
+        "email_assistant_hitl_memory_gmail": {
+            "core": gmail_core_tests,
+            "notebook": gmail_notebook_tests,
+        },
+    }
+
     # Run tests for each implementation
     for implementation in implementations_to_test:
         print(f"\nRunning tests for {implementation}...")
-        
-        # Skip LangSmith/Tracing env for offline/local runs
-        
+
         # Create a fresh copy of the pytest options for this run
         pytest_options = base_pytest_options.copy()
-        
+
         # Add the module parameter for this specific implementation
         module_param = f"--agent-module={implementation}"
         pytest_options.append(module_param)
-        
-        # Determine which test files to run based on implementation
-        test_files = ["test_response.py"]  # All implementations run response tests
-                    
-        # Run each test file
-        print(f"   Project: {langsmith_project}")
-        for test_file in test_files:
-            print(f"\nRunning {test_file} for {implementation}...")
-            experiment_name = f"Test: {test_file.split('/')[-1]} | Agent: {implementation}"
-            print(f"   Experiment: {experiment_name}")
-            # Not setting LANGSMITH_EXPERIMENT to keep tests offline
-            
-            # Ensure third-party pytest plugins are not auto-loaded
-            os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
 
-            # Run pytest from the tests directory
-            # Use the same Python interpreter that's running this script
-            python_executable = sys.executable
-            # Emphasize tool-call tests by default (avoid flaky LLM-as-judge)
-            cmd = [python_executable, "-m", "pytest", test_file, "-k", "tool_calls"] + pytest_options
-            
-            # Change to the script's directory to ensure correct imports
-            script_dir = Path(__file__).parent
-            cwd = os.getcwd()
-            os.chdir(script_dir)
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            os.chdir(cwd)  # Restore original working directory
-            
-            # Print test output
-            print(result.stdout)
-            if result.stderr:
-                print(result.stderr)
+        configured_tests = implementation_test_matrix.get(implementation, {})
+        core_tests = configured_tests.get("core", [])
+        notebook_tests = configured_tests.get("notebook", [])
+
+        if not (core_tests or notebook_tests):
+            print(f"WARNING: No tests configured for implementation '{implementation}'.")
+            continue
+
+        def run_suite(label: str, tests: list[tuple[str, list[str]]]) -> None:
+            if not tests:
+                return
+            print(f"\n-- {label} --")
+            print(f"   Project: {langsmith_project}")
+            for test_file, extra_args in tests:
+                print(f"\nRunning {test_file} for {implementation}...")
+                experiment_name = f"Test: {test_file.split('/')[-1]} | Agent: {implementation}"
+                print(f"   Experiment: {experiment_name}")
+                # Not setting LANGSMITH_EXPERIMENT to keep tests offline
+
+                # Ensure third-party pytest plugins are not auto-loaded
+                os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+
+                # Run pytest from the tests directory using the current Python interpreter
+                python_executable = sys.executable
+                cmd = [python_executable, "-m", "pytest", test_file] + extra_args + pytest_options
+
+                # Change to the script's directory to ensure correct imports
+                script_dir = Path(__file__).parent
+                cwd = os.getcwd()
+                os.chdir(script_dir)
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                os.chdir(cwd)  # Restore original working directory
+
+                # Print test output
+                print(result.stdout)
+                if result.stderr:
+                    print(result.stderr)
+
+        run_suite("Core coverage", core_tests)
+        run_suite("Notebook coverage", notebook_tests)
                 
 if __name__ == "__main__":
     sys.exit(main() or 0)

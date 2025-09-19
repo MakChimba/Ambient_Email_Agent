@@ -124,6 +124,7 @@ Runs the production-target Gmail agent. Provide `GOOGLE_API_KEY` for live Gemini
 - Plain pytest:
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
   - Add `EMAIL_ASSISTANT_EVAL_MODE=1` (or `--offline-eval` when using `tests/run_all_tests.py`) if you need deterministic tool calls without Gemini access.
+  - `tests/run_all_tests.py` now orchestrates the full hero-agent coverage: the Gmail HITL+memory agent runs response, spam-flow, and reminder suites first, then executes the notebook smoke tests. Earlier agent iterations stick to the dataset-driven response check. Pass `--offline-eval` for deterministic runs; the script will set `GOOGLE_API_KEY=offline-test-key` and `NB_TEST_MODE=1` automatically.
 
 ### Live Gemini Coverage
 
