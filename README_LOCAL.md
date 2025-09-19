@@ -111,7 +111,7 @@ Judge output structure example:
 ```
 
 Notes
-- Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery. When calendar access is unavailable, `schedule_meeting_tool` now surfaces the missing-credential reason and the Gmail agent stops retrying the tool in favor of manual follow-up.
+- Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery. When calendar access is unavailable, `schedule_meeting_tool` now surfaces the missing-credential reason and the Gmail agent stops retrying the tool in favor of manual follow-up. Replies still restate any requested meeting duration (e.g., “45 minutes”) so deterministic checks remain satisfied even without a booked event.
 - Qualitative response grading is performed in LangStudio/LangSmith via the UI judge; the local `tests/test_judges.py` suite only sanity-checks judge invariants (summaries, score clamps).
 
 ### Quality Evaluation (UI Judge)
