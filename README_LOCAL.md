@@ -65,6 +65,11 @@ This repo supports both offline-friendly tests and live model evaluation.
 - Tool-call smoke tests (stable, offline-friendly):
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
   - or `python scripts/run_tests_langsmith.py` (records to LangSmith if configured)
+- Live Gemini coverage:
+  - `pytest tests/test_live_smoke.py --agent-module=email_assistant_hitl_memory_gmail`
+    - Uses two experiment cases to snapshot tool order + reply excerpts. Run with real Gemini creds (default) or set `EMAIL_ASSISTANT_EVAL_MODE=1` for deterministic runs. Update the baseline snapshot with `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when intentional changes are made.
+  - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
+    - Exercises the Question → `mark_as_spam_tool` HITL path end-to-end. Works live by default; set `EMAIL_ASSISTANT_EVAL_MODE=1` for offline CI paths.
 
 Notes
 - Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery.

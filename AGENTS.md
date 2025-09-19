@@ -122,11 +122,18 @@ Runs the production-target Gmail agent. Provide `GOOGLE_API_KEY` for live Gemini
 
 ### Live Gemini Coverage
 
-Current automated tests only assert tool-call presence when Gemini is live. They do **not** verify reply content, tool ordering, or HITL behaviour. Planned enhancements include:
-- A live “smoke” test that snapshots the drafted reply for 1–2 dataset cases.
-- Additional assertions in `tests/test_response.py` to enforce tool order and key response phrases when running live.
-- A HITL path test exercising the Question → mark_as_spam_tool flow using real model output.
-Use these notes when spinning up improvements so the new work aligns with roadmap expectations.
+The automated suite now exercises the live Gemini workflow end-to-end:
+- `tests/test_live_smoke.py` runs two experiment cases against the Gmail agent, snapshots the drafted reply (subject/body excerpt) and verifies the tool-call sequence. The test auto-generates `tests/snapshots/live_smoke.json` in eval mode and compares live runs against the stored ordering.
+- `tests/test_response.py` enforces tool ordering and validates reply content against dataset criteria whenever the agent runs live (i.e., `EMAIL_ASSISTANT_EVAL_MODE` disabled).
+- `tests/test_live_hitl_spam.py` drives the Question → `mark_as_spam_tool` HITL flow using the agent’s actual tool plan, ensuring Gmail helpers are invoked after confirmation. The test falls back to deterministic behaviour when `EMAIL_ASSISTANT_EVAL_MODE=1`.
+
+To run the live suite locally:
+```
+pytest tests/test_live_smoke.py --agent-module=email_assistant_hitl_memory_gmail
+pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail
+pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls
+```
+For deterministic/offline runs, set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionally `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when updating the smoke snapshots).
 
 ### Quality Evaluation
 

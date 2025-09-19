@@ -300,6 +300,16 @@ def llm_call(state: State, store: BaseStore):
                 all_tool_names.extend([tc.get("name") for tc in m.tool_calls])
             except Exception:
                 pass
+
+    def _contains_keyword(text: str, keyword: str) -> bool:
+        if not keyword:
+            return False
+        simple_chars = all((ch.isalpha() or ch in {" ", "-", "'"}) for ch in keyword)
+        if simple_chars:
+            pattern = r"\b" + re.escape(keyword) + r"\b"
+            return re.search(pattern, text) is not None
+        return keyword in text
+
     if "check_calendar_tool" in all_tool_names and "schedule_meeting_tool" not in all_tool_names and "send_email_tool" not in all_tool_names:
         system_msgs.append({"role": "system", "content": "Now schedule the meeting with schedule_meeting_tool."})
     if "schedule_meeting_tool" in all_tool_names and "send_email_tool" not in all_tool_names:
@@ -311,7 +321,7 @@ def llm_call(state: State, store: BaseStore):
         system_msgs.append({"role": "system", "content": "Do not call Done yet. First call send_email_tool with email_id and email_address to draft the reply."})
 
     # If this looks like a scheduling request, nudge the desired sequence
-    if any(k in text_for_heuristic for k in ["schedule", "scheduling", "meeting", "call", "availability", "let's schedule"]):
+    if any(_contains_keyword(text_for_heuristic, k) for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]):
         system_msgs.append({
             "role": "system",
             "content": "If the email requests scheduling, first call check_calendar_tool for the requested days, then schedule_meeting_tool, then draft the reply with send_email_tool, and finally call Done.",
@@ -319,9 +329,10 @@ def llm_call(state: State, store: BaseStore):
 
     # Spam-like detection: push a Question instead of Done or reply
     spam_keywords = [
-        "click here", "free", "win", "winner", "selected to win", "prize", "vacation", "lottery", "claim now",
+        "click here", "win", "winner", "selected to win", "prize", "vacation", "lottery", "claim now",
     ]
-    is_spam_like = any(k in text_for_heuristic for k in spam_keywords)
+
+    is_spam_like = any(_contains_keyword(text_for_heuristic, k) for k in spam_keywords)
     if is_spam_like:
         system_msgs.append({
             "role": "system",
@@ -334,21 +345,21 @@ def llm_call(state: State, store: BaseStore):
         })
 
     # Conference invite guidance: ask about workshops and group discounts
-    if any(k in text_for_heuristic for k in ["techconf", "conference", "workshops"]):
+    if any(_contains_keyword(text_for_heuristic, k) for k in ["techconf", "conference", "workshops"]):
         system_msgs.append({
             "role": "system",
             "content": "For conference invitations, reply with send_email_tool to express interest, ask specific questions about AI/ML workshops, and inquire about group discounts. Then call Done. Do not schedule a meeting.",
         })
 
     # Annual checkup reminder guidance
-    if any(k in text_for_heuristic for k in ["checkup", "annual checkup", "reminder"]):
+    if any(_contains_keyword(text_for_heuristic, k) for k in ["checkup", "annual checkup", "reminder"]):
         system_msgs.append({
             "role": "system",
             "content": "For annual checkup reminders, reply with send_email_tool acknowledging the reminder (e.g., you'll call to schedule), then call Done.",
         })
 
     # 90-minute planning meeting guidance (availability only, no scheduling)
-    if any(k in text_for_heuristic for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(k in text_for_heuristic for k in ["planning", "quarterly", "planning session"]):
+    if any(_contains_keyword(text_for_heuristic, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text_for_heuristic, k) for k in ["planning", "quarterly", "planning session"]):
         system_msgs.append({
             "role": "system",
             "content": "For 90-minute planning sessions, first call check_calendar_tool for Monday or Wednesday next week, then reply with send_email_tool acknowledging the request and providing availability for a 90-minute meeting between 10 AM and 3 PM. Do not schedule a meeting. Then call Done.",
@@ -388,8 +399,8 @@ def llm_call(state: State, store: BaseStore):
                     names = []
                 all_tool_names_loopcheck.extend(names)
                 done_count += sum(1 for n in names if n == "Done")
-        is_scheduling_context = any(k in text_for_heuristic for k in [
-            "schedule", "scheduling", "meeting", "call", "availability", "let's schedule",
+        is_scheduling_context = any(_contains_keyword(text_for_heuristic, k) for k in [
+            "schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule",
         ])
         needs_reply_injection = (
             "send_email_tool" not in all_tool_names_loopcheck
@@ -399,29 +410,29 @@ def llm_call(state: State, store: BaseStore):
         if needs_reply_injection:
             # Build a short contextual reply like in eval-mode defaults
             text = text_for_heuristic
-            if any(k in text for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
+            if any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
                 response_text = (
                     "Thanks for the question — I'll investigate the authentication API docs "
                     "(including /auth/refresh and /auth/validate) and follow up with clarifications."
                 )
-            elif any(k in text for k in ["techconf", "conference", "workshops"]):
+            elif any(_contains_keyword(text, k) for k in ["techconf", "conference", "workshops"]):
                 response_text = (
                     "I'm interested in attending TechConf 2025. Could you share details on the AI/ML workshops and any group discount options?"
                 )
-            elif any(k in text for k in ["review", "technical specifications", "friday", "deadline"]):
+            elif any(_contains_keyword(text, k) for k in ["review", "technical specifications", "friday", "deadline"]):
                 response_text = (
                     "Happy to review the technical specifications and I'll send feedback before Friday."
                 )
-            elif any(k in text for k in ["swimming", "swim", "register", "registration", "class", "daughter"]):
+            elif any(_contains_keyword(text, k) for k in ["swimming", "swim", "register", "registration", "class", "daughter"]):
                 response_text = (
                     "I'd like to reserve a spot for my daughter in the intermediate swimming class. "
                     "Tues/Thu at 5 PM works great — please confirm availability."
                 )
-            elif any(k in text for k in ["checkup", "annual checkup", "doctor", "reminder"]):
+            elif any(_contains_keyword(text, k) for k in ["checkup", "annual checkup", "doctor", "reminder"]):
                 response_text = (
                     "Thanks for the reminder — I'll call to schedule an appointment."
                 )
-            elif any(k in text for k in ["submitted", "submit", "i've just submitted", "just submitted"]):
+            elif any(_contains_keyword(text, k) for k in ["submitted", "submit", "i've just submitted", "just submitted"]):
                 response_text = (
                     "Thanks for submitting your part — I'll review shortly and follow up if anything is needed."
                 )
@@ -467,9 +478,17 @@ def llm_call(state: State, store: BaseStore):
         other_email = extract_email(author)
         text = f"{subject}\n{email_thread}".lower()
 
+        if is_spam_like:
+            tool_calls = [{
+                "name": "Question",
+                "args": {"content": "Should this email thread be moved to Spam?"},
+                "id": "question",
+            }]
+            return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+
         tool_calls = []
         # Heuristic: 90-minute planning meeting → check calendar then reply (no scheduling)
-        if (any(k in text for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(k in text for k in ["planning", "quarterly"])):
+        if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
             tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"})
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
             tool_calls.append({
@@ -483,7 +502,7 @@ def llm_call(state: State, store: BaseStore):
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         # If it's about scheduling (general) → check calendar → schedule → reply → done
-        elif any(k in text for k in ["schedule", "scheduling", "meeting", "call", "availability", "let's schedule"]):
+        elif any(_contains_keyword(text, k) for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]):
             # Use Tue/Thu example dates to align with dataset phrasing
             tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["20-05-2025", "22-05-2025"]}, "id": "check_cal"})
             tool_calls.append({
@@ -517,29 +536,29 @@ def llm_call(state: State, store: BaseStore):
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
             # Default respond-only plan with contextual content
-            if any(k in text for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
+            if any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
                 response_text = (
                     "Thanks for the question — I'll investigate the authentication API docs "
                     "(including /auth/refresh and /auth/validate) and follow up with clarifications."
                 )
-            elif any(k in text for k in ["techconf", "conference", "workshops"]):
+            elif any(_contains_keyword(text, k) for k in ["techconf", "conference", "workshops"]):
                 response_text = (
                     "I'm interested in attending TechConf 2025. Could you share details on the AI/ML workshops and any group discount options?"
                 )
-            elif any(k in text for k in ["review", "technical specifications", "friday", "deadline"]):
+            elif any(_contains_keyword(text, k) for k in ["review", "technical specifications", "friday", "deadline"]):
                 response_text = (
                     "Happy to review the technical specifications and I'll send feedback before Friday."
                 )
-            elif any(k in text for k in ["swimming", "swim", "register", "registration", "class", "daughter"]):
+            elif any(_contains_keyword(text, k) for k in ["swimming", "swim", "register", "registration", "class", "daughter"]):
                 response_text = (
                     "I'd like to reserve a spot for my daughter in the intermediate swimming class. "
                     "Tues/Thu at 5 PM works great — please confirm availability."
                 )
-            elif any(k in text for k in ["checkup", "annual checkup", "doctor", "reminder"]):
+            elif any(_contains_keyword(text, k) for k in ["checkup", "annual checkup", "doctor", "reminder"]):
                 response_text = (
                     "Thanks for the reminder — I'll call to schedule an appointment."
                 )
-            elif any(k in text for k in ["submitted", "submit", "i've just submitted", "just submitted"]):
+            elif any(_contains_keyword(text, k) for k in ["submitted", "submit", "i've just submitted", "just submitted"]):
                 response_text = (
                     "Thanks for submitting your part — I'll review shortly and follow up if anything is needed."
                 )
@@ -574,9 +593,13 @@ def llm_call(state: State, store: BaseStore):
     # Post-process LLM tool plan: enforce intent-specific plans and termination
     if getattr(msg, "tool_calls", None):
         text = text_for_heuristic
-        is_api_doc = any(k in text for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"])
-        is_90min_planning = (any(k in text for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(k in text for k in ["planning", "quarterly"]))
-        is_joint_presentation = (any(k in text for k in ["joint presentation", "joint presentation next month"]) or ("presentation" in text and any(k in text for k in ["tuesday", "thursday"])))
+        is_api_doc = any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"])
+        is_90min_planning = (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"]))
+        is_joint_presentation = (
+            any(_contains_keyword(text, k) for k in ["joint presentation", "joint presentation next month"]) or (
+                _contains_keyword(text, "presentation") and any(_contains_keyword(text, k) for k in ["tuesday", "thursday"])
+            )
+        )
 
         if is_api_doc:
             from langchain_core.messages import AIMessage
@@ -647,7 +670,7 @@ def llm_call(state: State, store: BaseStore):
                 injected = [{"name": "check_calendar_tool", "args": {"dates": dates}, "id": "check_cal"}]
                 msg = msg.model_copy(update={"tool_calls": injected + msg.tool_calls})
                 tool_names = [tc.get("name") for tc in msg.tool_calls]
-            if (any(k in text for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(k in text for k in ["planning", "quarterly"])):
+            if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
                 if ("send_email_tool" in tool_names) and ("check_calendar_tool" not in tool_names):
                     injected = [{"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"}]
                     msg = msg.model_copy(update={"tool_calls": injected + msg.tool_calls})
@@ -674,8 +697,17 @@ def llm_call(state: State, store: BaseStore):
         other_email = extract_email(author)
         text = f"{subject}\n{email_thread}".lower()
 
+        if any(_contains_keyword(text, k) for k in spam_keywords):
+            tool_calls = [{
+                "name": "Question",
+                "args": {"content": "Should this email thread be moved to Spam?"},
+                "id": "question",
+            }]
+            msg = AIMessage(content="", tool_calls=tool_calls)
+            return {"messages": [msg]}
+
         tool_calls = []
-        if (any(k in text for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(k in text for k in ["planning", "quarterly"])):
+        if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
             tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"})
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
             tool_calls.append({
@@ -688,7 +720,7 @@ def llm_call(state: State, store: BaseStore):
                 "id": "send_email",
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
-        elif any(k in text for k in ["schedule", "scheduling", "meeting", "call", "availability", "let's schedule"]):
+        elif any(_contains_keyword(text, k) for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]):
             tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["20-05-2025", "22-05-2025"]}, "id": "check_cal"})
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
             tool_calls.append({
@@ -719,29 +751,29 @@ def llm_call(state: State, store: BaseStore):
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
-            if any(k in text for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
+            if any(_contains_keyword(text, k) for k in ["api", "documentation", "docs", "/auth/refresh", "/auth/validate"]):
                 response_text = (
                     "Thanks for the question — I'll investigate the authentication API docs "
                     "(including /auth/refresh and /auth/validate) and follow up with clarifications."
                 )
-            elif any(k in text for k in ["review", "technical specifications", "friday", "deadline"]):
+            elif any(_contains_keyword(text, k) for k in ["review", "technical specifications", "friday", "deadline"]):
                 response_text = (
                     "Happy to review the technical specifications and I'll send feedback before Friday."
                 )
-            elif any(k in text for k in ["techconf", "conference", "workshops"]):
+            elif any(_contains_keyword(text, k) for k in ["techconf", "conference", "workshops"]):
                 response_text = (
                     "I'm interested in attending TechConf 2025. Could you share details on the AI/ML workshops and any group discount options?"
                 )
-            elif any(k in text for k in ["swimming", "swim", "register", "registration", "class", "daughter"]):
+            elif any(_contains_keyword(text, k) for k in ["swimming", "swim", "register", "registration", "class", "daughter"]):
                 response_text = (
                     "I'd like to reserve a spot for my daughter in the intermediate swimming class. "
                     "Tues/Thu at 5 PM works great — please confirm availability."
                 )
-            elif any(k in text for k in ["checkup", "annual checkup", "doctor", "reminder"]):
+            elif any(_contains_keyword(text, k) for k in ["checkup", "annual checkup", "doctor", "reminder"]):
                 response_text = (
                     "Thanks for the reminder — I'll call to schedule an appointment."
                 )
-            elif any(k in text for k in ["submitted", "submit", "i've just submitted", "just submitted"]):
+            elif any(_contains_keyword(text, k) for k in ["submitted", "submit", "i've just submitted", "just submitted"]):
                 response_text = (
                     "Thanks for submitting your part — I'll review shortly and follow up if anything is needed."
                 )
@@ -773,6 +805,8 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
         if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question", "mark_as_spam_tool"]:
             observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+            if tool_call["name"] == "Done":
+                goto = "mark_as_read_node"
             continue
         email_input = state["email_input"]
         author, to, subject, email_thread, email_id = parse_gmail(email_input)

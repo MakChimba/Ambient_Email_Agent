@@ -1,0 +1,20 @@
+{
+  "reply_only_ack": {
+    "tool_order": [
+      "send_email_tool",
+      "done"
+    ],
+    "assistant_reply": "Email sent to reply to 'Quick update': Thanks for submitting your part — I'll review shortly and follow up if anything is needed.",
+    "response_excerpt": "Thanks for submitting your part — I'll review shortly and follow up if anything is needed."
+  },
+  "scheduling_joint_presentation": {
+    "tool_order": [
+      "check_calendar_tool",
+      "schedule_meeting_tool",
+      "send_email_tool",
+      "done"
+    ],
+    "assistant_reply": "Email sent to reply to 'Joint presentation next month': Confirmed availability — I've scheduled a 45-minute meeting and sent the invite.",
+    "response_excerpt": "Confirmed availability — I've scheduled a 45-minute meeting and sent the invite."
+  }
+}

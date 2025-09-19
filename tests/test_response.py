@@ -1,22 +1,24 @@
 #!/usr/bin/env python
 
-import importlib
 import os
-import sys
-import uuid
 from typing import Any, Dict, List, Tuple
 
 import pytest
 from dotenv import find_dotenv, load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
 from langgraph.types import Command
+from langgraph.store.memory import InMemoryStore
 
 from email_assistant.utils import extract_tool_calls, format_messages_string
+from tests.agent_test_utils import (
+    compile_agent,
+    get_last_tool_args,
+    is_eval_mode,
+    load_dataset,
+)
 
 load_dotenv(find_dotenv(), override=True)
 
-EVAL_MODE_ENABLED = os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
+EVAL_MODE_ENABLED = is_eval_mode()
 HAS_GOOGLE_KEY = bool(os.getenv("GOOGLE_API_KEY"))
 if not (EVAL_MODE_ENABLED or HAS_GOOGLE_KEY):
     pytest.skip(
@@ -34,80 +36,20 @@ def _route_gmail_through_fixture(gmail_service, monkeypatch):
 from langsmith import testing as t
 
 
-def load_dataset(agent_module_name: str):
-    """Load the appropriate dataset for the given agent module."""
-
-    # Force reload the base dataset module to ensure we get the latest version
-    if "email_assistant.eval.email_dataset" in sys.modules:
-        importlib.reload(sys.modules["email_assistant.eval.email_dataset"])
-
-    if "gmail" in agent_module_name:
-        print(f"\nINFO: Loading Gmail-specific dataset for module: {agent_module_name}")
-        if "email_assistant.eval.email_gmail_dataset" in sys.modules:
-            importlib.reload(sys.modules["email_assistant.eval.email_gmail_dataset"])
-        from email_assistant.eval.email_gmail_dataset import (
-            email_inputs,
-            email_names,
-            response_criteria_list,
-            triage_outputs_list,
-            expected_tool_calls,
-        )
-
-        # Map expected tool names to Gmail tool names
-        _tool_map = {
-            "write_email": "send_email_tool",
-            "schedule_meeting": "schedule_meeting_tool",
-            "check_calendar_availability": "check_calendar_tool",
-            "done": "done",
-        }
-        expected_tool_calls = [
-            [_tool_map.get(call.lower(), call.lower()) for call in calls]
-            for calls in expected_tool_calls
-        ]
-        os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
-        # Default to live LLM for local runs; CI can override
-        os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "0")
-        os.environ.setdefault("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "1")
-        # Assume GOOGLE_API_KEY is provided via environment variables
-    else:
-        print(f"\nINFO: Loading standard dataset for module: {agent_module_name}")
-        from email_assistant.eval.email_dataset import (
-            email_inputs,
-            email_names,
-            response_criteria_list,
-            triage_outputs_list,
-            expected_tool_calls,
-        )
-
-    return (
-        email_inputs,
-        email_names,
-        response_criteria_list,
-        triage_outputs_list,
-        expected_tool_calls,
-    )
-
-
 # Removed: local LLM-as-Judge setup. Use LangStudio/LangSmith UI judge for qualitative evaluation.
 
-# Global variables for module name and imported module
+# Global variable for module name (used by setup helper)
 AGENT_MODULE = None
-agent_module = None
 
 
 @pytest.fixture(autouse=True, scope="function")
 def set_agent_module(agent_module_name):
     """Set the global AGENT_MODULE for each test function.
     Using scope="function" ensures we get a fresh import for each test."""
-    global AGENT_MODULE, agent_module
+    global AGENT_MODULE
     AGENT_MODULE = agent_module_name
     print(f"Using agent module: {AGENT_MODULE}")
 
-    # Force reload the module to ensure we get the latest code
-    if f"email_assistant.{AGENT_MODULE}" in sys.modules:
-        importlib.reload(sys.modules[f"email_assistant.{AGENT_MODULE}"])
-
-    agent_module = importlib.import_module(f"email_assistant.{AGENT_MODULE}")
     return AGENT_MODULE
 
 
@@ -116,26 +58,7 @@ def setup_assistant() -> Tuple[Any, Dict[str, Any], InMemoryStore]:
     Setup the email assistant and create thread configuration.
     Returns the assistant, thread config, and store.
     """
-    # Set up checkpointer and store
-    checkpointer = MemorySaver()
-    store = InMemoryStore()
-
-    # Create a thread ID and config
-    thread_id = uuid.uuid4()
-    thread_config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 100}
-
-    # Compile the graph based on module type
-    if AGENT_MODULE in ["email_assistant_hitl_memory", "email_assistant_hitl_memory_gmail"]:
-        # Memory implementation needs a store and a checkpointer
-        email_assistant = agent_module.overall_workflow.compile(checkpointer=checkpointer, store=store)
-    elif AGENT_MODULE in ["email_assistant_hitl"]:
-        # Just use a checkpointer for HITL version
-        email_assistant = agent_module.overall_workflow.compile(checkpointer=checkpointer)
-    else:
-        # Just use a checkpointer for other versions
-        email_assistant = agent_module.overall_workflow.compile(checkpointer=checkpointer)
-        store = None
-
+    email_assistant, thread_config, store, _ = compile_agent(AGENT_MODULE)
     return email_assistant, thread_config, store
 
 
@@ -148,6 +71,41 @@ def extract_values(state: Any) -> Dict[str, Any]:
 
 
 # Helper previously used by judge evaluation removed.
+
+
+# Key phrase groups the drafted email should address per dataset case.
+# Each inner list represents interchangeable keywords; at least one keyword
+# from every group must appear in the email body when running against the live
+# model. The words are deliberately narrow so we can catch regressions without
+# relying on an LLM judge locally.
+RESPONSE_KEYWORD_GROUPS: Dict[str, List[List[str]]] = {
+    "email_input_1": [["/auth/refresh"], ["/auth/validate"]],
+    "email_input_4": [["tax", "planning"], ["45-minute", "45 minute"], ["tuesday", "thursday"]],
+    "email_input_6": [["techconf"], ["ai/ml", "ai", "ml"], ["group discount", "discount"]],
+    "email_input_7": [["review", "reviewing"], ["technical"], ["friday", "deadline"]],
+    "email_input_8": [["reserve", "register"], ["daughter"], ["swimming", "class", "intermediate"]],
+    "email_input_10": [["90-minute", "90 minute"], ["monday", "wednesday"], ["10 am", "3 pm"]],
+    "email_input_13": [["reminder"], ["schedule", "appointment", "call"]],
+    "email_input_15": [["scheduled", "schedule"], ["60-minute", "60 minute"], ["slides", "collaborate"]],
+}
+
+
+def assert_response_matches_criteria(email_name: str, response_text: str) -> None:
+    """Ensure the drafted email covers the dataset's core requirements."""
+
+    groups = RESPONSE_KEYWORD_GROUPS.get(email_name)
+    if not groups:
+        return
+
+    text = (response_text or "").lower()
+    missing_groups: List[List[str]] = []
+    for group in groups:
+        if not any(keyword in text for keyword in group):
+            missing_groups.append(group)
+
+    assert not missing_groups, (
+        f"Draft for {email_name} is missing required phrases: {missing_groups}."
+    )
 
 
 # Heuristic/structured judge removed from local tests.
@@ -249,6 +207,29 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
     missing_calls = [call for call in expected_calls if call.lower() not in extracted_tool_calls]
     # Extra calls are allowed (we only fail if expected calls are missing)
     extra_calls = [call for call in extracted_tool_calls if call.lower() not in [c.lower() for c in expected_calls]]
+
+    if not EVAL_MODE_ENABLED:
+        expected_lower = [call.lower() for call in expected_calls]
+        if expected_lower:
+            seq_index = 0
+            for name in extracted_tool_calls:
+                if name == expected_lower[seq_index]:
+                    seq_index += 1
+                    if seq_index == len(expected_lower):
+                        break
+            assert (
+                seq_index == len(expected_lower)
+            ), f"Tool call order mismatch for {email_name}: expected {expected_lower}, saw {extracted_tool_calls}"
+
+        if any(call in (expected_lower or []) for call in ("send_email_tool", "write_email")):
+            args = get_last_tool_args(values["messages"], "send_email_tool")
+            if args is None:
+                args = get_last_tool_args(values["messages"], "write_email")
+            response_text = ""
+            if args:
+                response_text = args.get("response_text") or args.get("content") or ""
+            assert response_text, f"Expected a drafted email body for {email_name} but none was found."
+            assert_response_matches_criteria(email_name, response_text)
 
     # Log
     all_messages_str = format_messages_string(values["messages"])
