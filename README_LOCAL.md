@@ -70,19 +70,14 @@ This repo supports both offline-friendly tests and live model evaluation.
     - Uses two experiment cases to snapshot tool order + reply excerpts. Run with real Gemini creds (default) or set `EMAIL_ASSISTANT_EVAL_MODE=1` for deterministic runs. Update the baseline snapshot with `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when intentional changes are made.
   - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
     - Exercises the Question → `mark_as_spam_tool` HITL path end-to-end. Works live by default; set `EMAIL_ASSISTANT_EVAL_MODE=1` for offline CI paths.
-- When `LANGSMITH_TRACING=true`, each suite defaults its project name automatically:
-  - `tests/test_response.py` → `email-assistant-test-response`
-  - `tests/test_live_smoke.py` → `email-assistant-test-live-smoke`
-  - `tests/test_live_hitl_spam.py` → `email-assistant-test-live-hitl-spam`
-  - `tests/test_reminders_langsmith.py` → `email-assistant-test-reminders`
-  - Set `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name during ad-hoc runs if needed.
+- When `LANGSMITH_TRACING=true`, a pytest autouse fixture assigns every test its own LangSmith assistant project: `asst-<module>-<test>[-<params>]-<UTC timestamp>`. Judge traces for that test land in `judge-<module>-<test>`, so multiple parametrised examples share the same judge project. Set `EMAIL_ASSISTANT_TRACE_PROJECT` to override the assistant project entirely for ad-hoc runs if you prefer your own naming scheme.
 - LLM-as-judge (optional, Gemini 2.5 Flash):
   - `EMAIL_ASSISTANT_LLM_JUDGE=1` adds a post-test review powered by the Gemini judge for every `test_response.py` case. The prompt now makes the model list any missing or incorrect tool usages explicitly and clamps scores when issues exist, so flaky high scores are avoided.
   - Add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail the test immediately when the judge's verdict is `fail`.
   - Judge inputs include `<tool_calls_summary>` and `<tool_calls_json>` blocks (ordered tool names, args, results) to keep Gemini focused on the relevant evidence.
   - The judge prompt and runner live in `src/email_assistant/eval/judges.py` and can also be consumed from LangSmith via `create_langsmith_correctness_evaluator()`.
   - Override the model with `EMAIL_ASSISTANT_JUDGE_MODEL=gemini-2.5-pro` (or another Gemini family model) if you want a different reviewer tier.
-  - Each test suite sets a default judge project when the feature is enabled (e.g., `email-assistant-judge-test-response`). Use `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` to force a different project for tests, or `EMAIL_ASSISTANT_JUDGE_PROJECT` to set a global default. Enable tracing with `LANGSMITH_TRACING=true` so judge runs show up in the UI.
+- Judge traces use the same naming scheme described above (`judge-<module>-<test>`). Override the grouping with `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` or set a global default via `EMAIL_ASSISTANT_JUDGE_PROJECT`. Enable tracing with `LANGSMITH_TRACING=true` so judge runs show up in the UI.
   - Guardrails: `pytest tests/test_judges.py` exercises the new tool-call summariser and post-processing clamps so CI catches accidental regressions.
   - Example (LangSmith evaluate API):
     ```python

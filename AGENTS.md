@@ -137,7 +137,7 @@ pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -
 ```
 For deterministic/offline runs, set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionally `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when updating the smoke snapshots).
 
-With `LANGSMITH_TRACING=true`, each suite sets a descriptive default project automatically (`email-assistant-test-response`, `email-assistant-test-live-smoke`, `email-assistant-test-live-hitl-spam`, and `email-assistant-test-reminders`).
+With `LANGSMITH_TRACING=true`, pytest now assigns a fresh LangSmith assistant project per test (`asst-<module>-<test>[-<params>]-<UTC timestamp>`). Judge traces for that test share a stable project named `judge-<module>-<test>`, making it easy to compare parametrised runs side-by-side.
 Use `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name for ad-hoc runs.
 
 ### Quality Evaluation
@@ -147,7 +147,7 @@ Use `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name for ad-hoc runs
 - Judge inputs now include `<tool_calls_summary>` and `<tool_calls_json>` blocks: the first is a readable list of ordered tool invocations, the second is a compact JSON array of `{step, name, args, result}`. This steers Gemini toward the relevant arguments/results instead of raw dumps.
 - For LangSmith datasets/experiments, call `create_langsmith_correctness_evaluator()` to obtain a `LangChainStringEvaluator` that embeds the same prompt and scoring rubric. This keeps Studio reviews and local pytest perfectly aligned.
 - Override the reviewer model via `EMAIL_ASSISTANT_JUDGE_MODEL` (default `gemini-2.5-flash`).
-- Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to the LangSmith project you want the judge runs logged under (default `email-assistant-judge`). Each pytest module also assigns a suite-specific default automatically; set `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` when you want to force a different project for a run. Make sure `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are configured when you want tracing enabled.
+- Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to the LangSmith project you want the judge runs logged under if you prefer a global override. Otherwise, the pytest hook groups them by test (`judge-<module>-<test>`). Use `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` for one-off changes. Make sure `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are configured when you want tracing enabled.
 - Regression coverage: `pytest tests/test_judges.py` checks the tool-call serialization and score-clamping logic so prompt tweaks stay honest.
 
 Sample output:

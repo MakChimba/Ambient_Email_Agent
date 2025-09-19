@@ -31,7 +31,7 @@ This file highlights recent project changes that affect the notebooks and how to
   "notes": "Align meeting durations with the email ask before finalizing."
 }
 ```
-- Regular tests also auto-assign per-suite tracing projects when `LANGSMITH_TRACING=true`. Set `EMAIL_ASSISTANT_TRACE_PROJECT` if you need to override that default.
+- Regular tests now auto-assign per-test tracing projects when `LANGSMITH_TRACING=true` (`asst-<module>-<test>[-<params>]-<UTC timestamp>` for assistant traces, `judge-<module>-<test>` for judge traces). Set `EMAIL_ASSISTANT_TRACE_PROJECT` if you need to override that default.
 
 ## Gmail Agent HITL Display
 

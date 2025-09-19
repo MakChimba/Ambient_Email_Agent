@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import hashlib
 import os
 import re
 import sys
@@ -29,34 +28,34 @@ def configure_langsmith_projects(monkeypatch, request):
 
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
 
-    def slugify(text: str, limit: int) -> str:
-        slug = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
+    def slugify(text: str, limit: int, fallback: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
         if len(slug) > limit:
             slug = slug[:limit].rstrip("-")
-        return slug or "test"
+        return slug or fallback
 
     node_id = request.node.nodeid
-    module_part, *rest = node_id.split("::")
-    module_slug = slugify(Path(module_part).stem, 20)
+    module_part, *_ = node_id.split("::", 1)
+    module_slug = slugify(Path(module_part).stem, 16, "module")
 
-    func_part = rest[0] if rest else request.node.name
-    params_slug = ""
-    if "[" in func_part:
-        func_name, params = func_part.split("[", 1)
-        func_slug = slugify(func_name, 24)
-        params = params.rstrip("]")
-        if params:
-            params_slug = hashlib.sha1(params.encode("utf-8")).hexdigest()[:6]
-    else:
-        func_slug = slugify(func_part, 24)
+    func_name = getattr(request.node, "originalname", request.node.name)
+    func_slug = slugify(func_name, 20, "test")
 
-    parts = ["email-asst", module_slug, func_slug]
-    if params_slug:
-        parts.append(params_slug)
-    project_name = "-".join(part for part in parts if part)
-    project_name = f"{project_name}-{timestamp}"
+    param_id = getattr(getattr(request.node, "callspec", None), "id", "")
+    param_slug = slugify(param_id, 12, "param") if param_id else ""
+
+    base_parts = [module_slug, func_slug]
+    judge_base = "-".join(part for part in base_parts if part) or "test"
+
+    if param_slug:
+        base_parts.append(param_slug)
+    base_slug = "-".join(part for part in base_parts if part) or judge_base
+
+    project_name = f"asst-{base_slug}-{timestamp}"
+    judge_project = f"judge-{judge_base}"
+
     monkeypatch.setenv("LANGSMITH_PROJECT", project_name)
-    monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", f"{project_name}-judge")
+    monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", judge_project)
 
     try:
         from langsmith import utils as langsmith_utils
