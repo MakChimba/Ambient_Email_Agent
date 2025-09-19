@@ -8,6 +8,7 @@ from email_assistant.utils import extract_tool_calls, format_gmail_markdown, par
 from langgraph.store.memory import InMemoryStore
 
 from tests.agent_test_utils import has_google_key, is_eval_mode
+from tests.trace_utils import configure_tracing_project
 from email_assistant.email_assistant_hitl_memory_gmail import interrupt_handler, llm_call
 
 
@@ -34,6 +35,7 @@ def _extract_values(state):
 
 @pytest.fixture(autouse=True)
 def _ensure_eval_when_key_missing(monkeypatch):
+    configure_tracing_project("email-assistant-test-live-hitl-spam")
     if not has_google_key() and not is_eval_mode():
         monkeypatch.setenv("EMAIL_ASSISTANT_EVAL_MODE", "1")
     os.environ.setdefault("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "1")

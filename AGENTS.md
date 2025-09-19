@@ -137,6 +137,9 @@ pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -
 ```
 For deterministic/offline runs, set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionally `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when updating the smoke snapshots).
 
+With `LANGSMITH_TRACING=true`, each suite sets a descriptive default project automatically (`email-assistant-test-response`, `email-assistant-test-live-smoke`, `email-assistant-test-live-hitl-spam`, and `email-assistant-test-reminders`).
+Use `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name for ad-hoc runs.
+
 ### Quality Evaluation
 
 - The repo now ships with a Gemini 2.5 Flash “LLM-as-judge” (`src/email_assistant/eval/judges.py`).

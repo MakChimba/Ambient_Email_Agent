@@ -8,6 +8,8 @@ import pytest
 from langsmith import Client
 from langsmith.schemas import Dataset, Example
 
+from tests.trace_utils import configure_tracing_project
+
 # Add src to path to allow for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
@@ -27,6 +29,8 @@ if not (EVAL_MODE_ENABLED or HAS_GOOGLE_KEY):
         "Reminders LangSmith tests require GOOGLE_API_KEY for live runs; set EMAIL_ASSISTANT_EVAL_MODE=1 to run offline.",
         allow_module_level=True,
     )
+
+configure_tracing_project("email-assistant-test-reminders")
 
 # --- 1. Setup LangSmith Client and Dataset ---
 DATASET_NAME = "Reminder Scenarios Evaluation v1"

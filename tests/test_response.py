@@ -9,6 +9,7 @@ from langgraph.types import Command
 from langgraph.store.memory import InMemoryStore
 
 from email_assistant.utils import extract_tool_calls, format_messages_string
+from tests.trace_utils import configure_tracing_project
 from tests.agent_test_utils import (
     compile_agent,
     get_last_tool_args,
@@ -24,6 +25,8 @@ import warnings
 import json
 
 load_dotenv(find_dotenv(), override=True)
+
+configure_tracing_project("email-assistant-test-response")
 
 EVAL_MODE_ENABLED = is_eval_mode()
 HAS_GOOGLE_KEY = bool(os.getenv("GOOGLE_API_KEY"))

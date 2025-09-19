@@ -70,6 +70,12 @@ This repo supports both offline-friendly tests and live model evaluation.
     - Uses two experiment cases to snapshot tool order + reply excerpts. Run with real Gemini creds (default) or set `EMAIL_ASSISTANT_EVAL_MODE=1` for deterministic runs. Update the baseline snapshot with `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when intentional changes are made.
   - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
     - Exercises the Question → `mark_as_spam_tool` HITL path end-to-end. Works live by default; set `EMAIL_ASSISTANT_EVAL_MODE=1` for offline CI paths.
+- When `LANGSMITH_TRACING=true`, each suite defaults its project name automatically:
+  - `tests/test_response.py` → `email-assistant-test-response`
+  - `tests/test_live_smoke.py` → `email-assistant-test-live-smoke`
+  - `tests/test_live_hitl_spam.py` → `email-assistant-test-live-hitl-spam`
+  - `tests/test_reminders_langsmith.py` → `email-assistant-test-reminders`
+  - Set `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name during ad-hoc runs if needed.
 - LLM-as-judge (optional, Gemini 2.5 Flash):
   - `EMAIL_ASSISTANT_LLM_JUDGE=1` adds a post-test review powered by the new Gemini judge for every `test_response.py` case. The judge logs findings via LangSmith (if configured) and prints warnings.
   - Add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail the test immediately when the judge's verdict is `fail`.
