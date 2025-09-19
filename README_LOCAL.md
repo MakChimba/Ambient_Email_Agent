@@ -92,6 +92,8 @@ Notes
 - Auto‑HITL mode (`HITL_AUTO_ACCEPT=1`):
   - Tool prompts that ask a Question will receive a minimal synthetic response so the flow can continue in demos/tests.
   - Deterministic fallbacks for premature `Done` are enabled only in auto/test modes to avoid loops; live HITL behavior is unchanged.
+- Document-review replies now promise to tackle the technical sections and acknowledge the stated deadline (e.g., “feedback before Friday”).
+- Swimming-class inquiries explicitly ask the city to reserve a spot for the sender’s daughter in one of the offered time slots.
 
 ### Gmail HITL Display and Structured Outputs
 
