@@ -77,11 +77,13 @@ This repo supports both offline-friendly tests and live model evaluation.
   - `tests/test_reminders_langsmith.py` → `email-assistant-test-reminders`
   - Set `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name during ad-hoc runs if needed.
 - LLM-as-judge (optional, Gemini 2.5 Flash):
-  - `EMAIL_ASSISTANT_LLM_JUDGE=1` adds a post-test review powered by the new Gemini judge for every `test_response.py` case. The judge logs findings via LangSmith (if configured) and prints warnings.
+  - `EMAIL_ASSISTANT_LLM_JUDGE=1` adds a post-test review powered by the Gemini judge for every `test_response.py` case. The prompt now makes the model list any missing or incorrect tool usages explicitly and clamps scores when issues exist, so flaky high scores are avoided.
   - Add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail the test immediately when the judge's verdict is `fail`.
+  - Judge inputs include `<tool_calls_summary>` and `<tool_calls_json>` blocks (ordered tool names, args, results) to keep Gemini focused on the relevant evidence.
   - The judge prompt and runner live in `src/email_assistant/eval/judges.py` and can also be consumed from LangSmith via `create_langsmith_correctness_evaluator()`.
   - Override the model with `EMAIL_ASSISTANT_JUDGE_MODEL=gemini-2.5-pro` (or another Gemini family model) if you want a different reviewer tier.
   - Each test suite sets a default judge project when the feature is enabled (e.g., `email-assistant-judge-test-response`). Use `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` to force a different project for tests, or `EMAIL_ASSISTANT_JUDGE_PROJECT` to set a global default. Enable tracing with `LANGSMITH_TRACING=true` so judge runs show up in the UI.
+  - Guardrails: `pytest tests/test_judges.py` exercises the new tool-call summariser and post-processing clamps so CI catches accidental regressions.
   - Example (LangSmith evaluate API):
     ```python
     from langsmith import Client
@@ -95,10 +97,10 @@ This repo supports both offline-friendly tests and live model evaluation.
 Judge output structure example:
 ```
 {
-  "overall_correctness": 0.6,
+  "overall_correctness": 0.56,
   "verdict": "fail",
   "content_alignment": 3,
-  "tool_usage": 3,
+  "tool_usage": 2,
   "missing_tools": [],
   "incorrect_tool_uses": [
     {"tool": "schedule_meeting_tool", "why": "The assistant scheduled 45 min despite a 60 min request."}
@@ -114,7 +116,7 @@ Judge output structure example:
 
 Notes
 - Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery.
-- Qualitative response grading is performed in LangStudio/LangSmith via the UI judge; there is no local LLM-as-judge test.
+- Qualitative response grading is performed in LangStudio/LangSmith via the UI judge; the local `tests/test_judges.py` suite only sanity-checks judge invariants (summaries, score clamps).
 
 ### Quality Evaluation (UI Judge)
 

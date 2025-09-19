@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
+import hashlib
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +28,33 @@ def configure_langsmith_projects(monkeypatch, request):
         return
 
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
-    project_name = f"email-assistant-{request.node.name}-{timestamp}"
+
+    def slugify(text: str, limit: int) -> str:
+        slug = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
+        if len(slug) > limit:
+            slug = slug[:limit].rstrip("-")
+        return slug or "test"
+
+    node_id = request.node.nodeid
+    module_part, *rest = node_id.split("::")
+    module_slug = slugify(Path(module_part).stem, 20)
+
+    func_part = rest[0] if rest else request.node.name
+    params_slug = ""
+    if "[" in func_part:
+        func_name, params = func_part.split("[", 1)
+        func_slug = slugify(func_name, 24)
+        params = params.rstrip("]")
+        if params:
+            params_slug = hashlib.sha1(params.encode("utf-8")).hexdigest()[:6]
+    else:
+        func_slug = slugify(func_part, 24)
+
+    parts = ["email-asst", module_slug, func_slug]
+    if params_slug:
+        parts.append(params_slug)
+    project_name = "-".join(part for part in parts if part)
+    project_name = f"{project_name}-{timestamp}"
     monkeypatch.setenv("LANGSMITH_PROJECT", project_name)
     monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", f"{project_name}-judge")
 

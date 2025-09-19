@@ -142,18 +142,21 @@ Use `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name for ad-hoc runs
 
 ### Quality Evaluation
 
-- The repo now ships with a Gemini 2.5 Flash “LLM-as-judge” (`src/email_assistant/eval/judges.py`).
+- The repo now ships with a Gemini 2.5 Flash “LLM-as-judge” (`src/email_assistant/eval/judges.py`). The prompt now spells out when to populate `missing_tools` / `incorrect_tool_uses` and prohibits high tool scores when issues are present so broken flows surface reliably.
 - Enable it locally by setting `EMAIL_ASSISTANT_LLM_JUDGE=1` when running pytest; optionally add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail tests on a judge “fail” verdict. With tracing enabled, the judge now records a primary `gemini_correctness_judge` feedback row plus granular entries for missing tools, incorrect tool calls (“tool” / “why”), and the evidence snippets so the LangSmith UI mirrors the hosted Gemini judge experience.
+- Judge inputs now include `<tool_calls_summary>` and `<tool_calls_json>` blocks: the first is a readable list of ordered tool invocations, the second is a compact JSON array of `{step, name, args, result}`. This steers Gemini toward the relevant arguments/results instead of raw dumps.
 - For LangSmith datasets/experiments, call `create_langsmith_correctness_evaluator()` to obtain a `LangChainStringEvaluator` that embeds the same prompt and scoring rubric. This keeps Studio reviews and local pytest perfectly aligned.
 - Override the reviewer model via `EMAIL_ASSISTANT_JUDGE_MODEL` (default `gemini-2.5-flash`).
 - Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to the LangSmith project you want the judge runs logged under (default `email-assistant-judge`). Each pytest module also assigns a suite-specific default automatically; set `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` when you want to force a different project for a run. Make sure `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are configured when you want tracing enabled.
-- Sample output:
+- Regression coverage: `pytest tests/test_judges.py` checks the tool-call serialization and score-clamping logic so prompt tweaks stay honest.
+
+Sample output:
 ```
 {
-  "overall_correctness": 0.6,
+  "overall_correctness": 0.56,
   "verdict": "fail",
   "content_alignment": 3,
-  "tool_usage": 3,
+  "tool_usage": 2,
   "missing_tools": [],
   "incorrect_tool_uses": [
     {"tool": "schedule_meeting_tool", "why": "Scheduled 45 min instead of the requested ~60 min."}
