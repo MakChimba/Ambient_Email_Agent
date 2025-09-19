@@ -37,7 +37,10 @@ def main(argv: list[str]) -> int:
     # Prefer prod-target Gmail agent and deterministic eval mode in CI-like runs
     os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
     os.environ.setdefault("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "1")
-    os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "1")
+    if "EMAIL_ASSISTANT_EVAL_MODE" not in os.environ:
+        os.environ["EMAIL_ASSISTANT_EVAL_MODE"] = "0"
+    if os.environ.get("EMAIL_ASSISTANT_EVAL_MODE") != "1" and not os.getenv("GOOGLE_API_KEY"):
+        print("WARNING: GOOGLE_API_KEY not set; live Gemini calls will fail. Set EMAIL_ASSISTANT_EVAL_MODE=1 for offline runs.")
 
     # Friendly status
     project = os.getenv("LANGSMITH_PROJECT", "ambient-email-agent")

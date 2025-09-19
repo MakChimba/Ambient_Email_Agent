@@ -33,14 +33,16 @@ def get_tools(tool_names: Optional[List[str]] = None, include_gmail: bool = Fals
                 fetch_emails_tool,
                 send_email_tool,
                 check_calendar_tool,
-                schedule_meeting_tool
+                schedule_meeting_tool,
+                mark_as_spam_tool,
             )
-            
+
             all_tools.update({
                 "fetch_emails_tool": fetch_emails_tool,
                 "send_email_tool": send_email_tool,
                 "check_calendar_tool": check_calendar_tool,
                 "schedule_meeting_tool": schedule_meeting_tool,
+                "mark_as_spam_tool": mark_as_spam_tool,
             })
         except ImportError:
             # If Gmail tools aren't available, continue without them

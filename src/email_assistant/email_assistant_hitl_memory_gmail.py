@@ -45,6 +45,11 @@ tools = get_tools([
 ], include_gmail=True)
 tools_by_name = get_tools_by_name(tools)
 
+
+def _eval_mode_enabled() -> bool:
+    """Return True when EMAIL_ASSISTANT_EVAL_MODE requests deterministic mode."""
+    return os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
+
 # Initialize the reminder store globally
 reminder_store = get_default_store()
 
@@ -83,7 +88,9 @@ def _maybe_interrupt(requests):
 # Safe tool invocation helper
 def _safe_tool_invoke(name: str, args):
     try:
-        tool = tools_by_name[name]
+        tool = tools_by_name.get(name)
+        if tool is None:
+            raise KeyError(name)
         return tool.invoke(args)
     except Exception as e:
         return f"Error executing {name}: {str(e)}"
@@ -117,6 +124,10 @@ def get_memory(store, namespace, default_content=None):
 
 def update_memory(store, namespace, messages):
     """Update memory profile in the store with robust fallbacks."""
+    if _eval_mode_enabled():
+        # Skip LLM-powered memory updates during deterministic eval mode to avoid
+        # network calls and ensure offline runs remain stable.
+        return
     existing = store.get(namespace, "user_preferences")
     current_profile = getattr(existing, "value", str(existing) if existing else "")
     new_profile = None
@@ -238,7 +249,7 @@ def llm_call(state: State, store: BaseStore):
     """LLM decides whether to call a tool or not with Gmail-specific nudges."""
     # Offline-friendly evaluation mode: optionally produce deterministic tool plans
     # without relying on live LLM calls. Enabled when EMAIL_ASSISTANT_EVAL_MODE is truthy.
-    eval_mode = os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
+    eval_mode = _eval_mode_enabled()
     recipient_compat = eval_mode or (
         os.getenv("EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS", "").lower() in ("1", "true", "yes")
     )
@@ -972,7 +983,7 @@ agent_builder.add_edge("mark_as_read_node", END)
 response_agent = agent_builder.compile()
 
 overall_workflow = (
-    StateGraph(State, input=StateInput)
+    StateGraph(State, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)

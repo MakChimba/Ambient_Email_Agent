@@ -37,7 +37,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - HITL auto-accept: Both memory agents support `HITL_AUTO_ACCEPT=1` to accept interrupt actions automatically (useful for demos/tests). Unset the env var to use Agent Inbox interactively.
 - Gmail agent safety: Tool invocation wrapped with try/except, fallback to `Done` when the model fails to emit a call, and safer classification handling. Tests mock `mark_as_read` to avoid auth in CI.
 - Gmail completion toggle: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` optionally skips the final Gmail `mark_as_read` call for demos without credentials (default is disabled).
-- Spam tool: Added `mark_as_spam_tool` (HITL-gated). After explicit confirmation, the agent may move a thread to Spam and end the workflow without `Done`.
+- Spam tool: Added `mark_as_spam_tool` (HITL-gated). After explicit confirmation, the agent may move a thread to Spam and end the workflow without `Done`. The Gmail tool registry now exposes this helper for both runtime and tests.
 - No‑reply/system notifications: If the email comes from a no‑reply address or explicitly says “do not reply,” the agent may finalize with `Done` without drafting an email, preventing loops and matching expected policy.
  - Auto‑HITL Question handling: In auto‑accept demos/tests, `Question` prompts receive a minimal synthetic response so flows proceed without manual input. In live HITL, true interrupts are preserved.
  - Gmail HITL card improvements: For `send_email_tool`, the Agent Inbox card now clearly shows the resolved recipient (original sender) as `To`, your account as `From`, and a normalized `Subject` (adds `Re:` if missing) alongside the drafted body. This makes approvals unambiguous.
@@ -51,16 +51,16 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 ### Defaults and Test Modes
 
 - Default agent (tests/runners): The project’s default test target is now the Gmail HITL+memory agent `email_assistant_hitl_memory_gmail` since this is the intended production agent.
-- Offline eval mode: Set `EMAIL_ASSISTANT_EVAL_MODE=1` to synthesize deterministic tool calls without a live LLM. Useful for CI and tool-call tests; disable to exercise full model behavior.
+- Offline eval mode (optional): Set `EMAIL_ASSISTANT_EVAL_MODE=1` when you need deterministic tool calls without a live Gemini model. Leave it unset/`0` for real-model runs.
 - HITL auto-accept: `HITL_AUTO_ACCEPT=1` auto-accepts tool interrupts during tests/demos.
 - Skip mark-as-read: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` avoids calling Gmail in tests/demos.
 - Notebook test mode: `NB_TEST_MODE=1` makes notebooks skip long-running or online-only cells.
 
-Environment summary for CI-like runs:
+Environment summary for deterministic/offline runs:
 - `HITL_AUTO_ACCEPT=1`
 - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
 - `EMAIL_ASSISTANT_EVAL_MODE=1`
- - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (puts recipient into `send_email_tool.email_address` for compatibility with some evaluators)
+- Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (puts recipient into `send_email_tool.email_address` for compatibility with some evaluators)
 
 ## Spam Flow (Gmail)
 
@@ -110,14 +110,15 @@ In Studio, paste the array as-is into the Resume field. In Python, wrap with `Co
 
 ### Quick smoke (tool calls only)
 
-Runs the production-target Gmail agent with stable, offline-friendly settings.
+Runs the production-target Gmail agent. Provide `GOOGLE_API_KEY` for live Gemini calls, or enable offline synthesis when needed.
 
 - LangSmith-enabled runner (records to LangSmith if tracing/env is configured):
   - `python scripts/run_tests_langsmith.py`
-    - Defaults: `--agent-module=email_assistant_hitl_memory_gmail`, `-k tool_calls`, and sets the CI env toggles above.
+    - Defaults: `--agent-module=email_assistant_hitl_memory_gmail`, `-k tool_calls`, and honors the live/offline environment you set.
 
 - Plain pytest:
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
+  - Add `EMAIL_ASSISTANT_EVAL_MODE=1` (or `--offline-eval` when using `tests/run_all_tests.py`) if you need deterministic tool calls without Gemini access.
 
 ### Quality Evaluation
 

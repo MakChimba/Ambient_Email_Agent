@@ -49,7 +49,8 @@ This repo supports both offline-friendly tests and live model evaluation.
 ### Defaults
 
 - The default agent for test runs is the Gmail HITL+memory agent: `email_assistant_hitl_memory_gmail`.
-- For stable CI-style runs, the following env toggles are commonly set:
+- Live testing (default): provide `GOOGLE_API_KEY` and leave `EMAIL_ASSISTANT_EVAL_MODE` unset/`0` to exercise the real Gemini model.
+- Deterministic/offline runs: set the following toggles when you need to avoid live calls:
   - `HITL_AUTO_ACCEPT=1`
   - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
   - `EMAIL_ASSISTANT_EVAL_MODE=1` (synthesize tool calls without a live LLM)

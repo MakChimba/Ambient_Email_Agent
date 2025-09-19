@@ -1,9 +1,10 @@
-import pytest
 import os
 import sys
 import json
 import uuid
 import glob
+
+import pytest
 from langsmith import Client
 from langsmith.schemas import Dataset, Example
 
@@ -13,6 +14,19 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 's
 from email_assistant.email_assistant_hitl_memory_gmail import overall_workflow
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
+
+EVAL_MODE_ENABLED = os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
+HAS_GOOGLE_KEY = bool(os.getenv("GOOGLE_API_KEY"))
+LANGSMITH_CONFIGURED = bool(os.getenv("LANGSMITH_API_KEY") or os.getenv("LANGCHAIN_API_KEY"))
+
+if not LANGSMITH_CONFIGURED:
+    pytest.skip("LangSmith credentials are required for reminder LangSmith tests", allow_module_level=True)
+
+if not (EVAL_MODE_ENABLED or HAS_GOOGLE_KEY):
+    pytest.skip(
+        "Reminders LangSmith tests require GOOGLE_API_KEY for live runs; set EMAIL_ASSISTANT_EVAL_MODE=1 to run offline.",
+        allow_module_level=True,
+    )
 
 # --- 1. Setup LangSmith Client and Dataset ---
 DATASET_NAME = "Reminder Scenarios Evaluation v1"
@@ -73,4 +87,3 @@ def test_reminder_scenarios_on_langsmith(example: Example, gmail_service):
     # Basic assertion to ensure the run didn't crash
     assert result is not None
     print(f"Successfully ran agent for example ID: {example.id}")
-

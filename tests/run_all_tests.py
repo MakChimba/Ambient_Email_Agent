@@ -15,6 +15,11 @@ def main():
     parser.add_argument("--experiment-name", help="Name for the LangSmith experiment")
     parser.add_argument("--implementation", help="Run tests for a specific implementation")
     parser.add_argument("--all", action="store_true", help="Run tests for all implementations")
+    parser.add_argument(
+        "--offline-eval",
+        action="store_true",
+        help="Enable EMAIL_ASSISTANT_EVAL_MODE=1 to synthesize tool calls deterministically",
+    )
     args = parser.parse_args()
     
     # Base pytest options (kept offline-friendly)
@@ -51,7 +56,15 @@ def main():
     # Stabilize agent behavior for CI-like runs
     os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
     os.environ.setdefault("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "1")
-    os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "1")
+
+    if args.offline_eval:
+        os.environ["EMAIL_ASSISTANT_EVAL_MODE"] = "1"
+    else:
+        os.environ.setdefault("EMAIL_ASSISTANT_EVAL_MODE", "0")
+        if not os.getenv("GOOGLE_API_KEY"):
+            print(
+                "WARNING: GOOGLE_API_KEY not set. Tests depending on live Gemini calls will skip or fail."
+            )
 
     # Run tests for each implementation
     for implementation in implementations_to_test:
