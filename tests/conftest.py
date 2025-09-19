@@ -2,6 +2,7 @@
 
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -11,6 +12,31 @@ project_root = Path(__file__).parent.parent
 src_path = project_root / "src"
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(src_path))
+
+
+TRACING_ENABLED_VALUES = {"1", "true", "yes", "on"}
+
+
+@pytest.fixture(autouse=True)
+def configure_langsmith_projects(monkeypatch, request):
+    """Assign per-test LangSmith projects when tracing is enabled."""
+
+    tracing_flag = os.getenv("LANGSMITH_TRACING", "").lower()
+    if tracing_flag not in TRACING_ENABLED_VALUES:
+        return
+
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
+    project_name = f"email-assistant-{request.node.name}-{timestamp}"
+    monkeypatch.setenv("LANGSMITH_PROJECT", project_name)
+    monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", f"{project_name}-judge")
+
+    try:
+        from langsmith import utils as langsmith_utils
+    except ImportError:
+        langsmith_utils = None
+
+    if langsmith_utils is not None and hasattr(langsmith_utils.get_env_var, "cache_clear"):
+        langsmith_utils.get_env_var.cache_clear()
 
 
 def pytest_addoption(parser):

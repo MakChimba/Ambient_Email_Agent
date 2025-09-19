@@ -14,6 +14,9 @@ def configure_tracing_project(default_project: str) -> None:
     if tracing_flag not in TRACING_ENABLED_VALUES:
         return
 
+    if os.getenv("LANGSMITH_PROJECT"):
+        return
+
     override = os.getenv("EMAIL_ASSISTANT_TRACE_PROJECT")
     project = override or default_project
     if not project:
