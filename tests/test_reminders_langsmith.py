@@ -8,7 +8,7 @@ import pytest
 from langsmith import Client
 from langsmith.schemas import Dataset, Example
 
-from tests.trace_utils import configure_tracing_project
+from tests.trace_utils import configure_tracing_project, configure_judge_project
 
 # Add src to path to allow for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
@@ -31,6 +31,7 @@ if not (EVAL_MODE_ENABLED or HAS_GOOGLE_KEY):
     )
 
 configure_tracing_project("email-assistant-test-reminders")
+configure_judge_project("email-assistant-judge-test-reminders")
 
 # --- 1. Setup LangSmith Client and Dataset ---
 DATASET_NAME = "Reminder Scenarios Evaluation v1"

@@ -146,7 +146,7 @@ Use `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name for ad-hoc runs
 - Enable it locally by setting `EMAIL_ASSISTANT_LLM_JUDGE=1` when running pytest; optionally add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail tests on a judge “fail” verdict. Results (score, verdict, notes) are logged through `langsmith.testing.log_outputs` so they appear in LangSmith if tracing is enabled.
 - For LangSmith datasets/experiments, call `create_langsmith_correctness_evaluator()` to obtain a `LangChainStringEvaluator` that embeds the same prompt and scoring rubric. This keeps Studio reviews and local pytest perfectly aligned.
 - Override the reviewer model via `EMAIL_ASSISTANT_JUDGE_MODEL` (default `gemini-2.5-flash`).
-- Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to the LangSmith project you want the judge runs logged under (default `email-assistant-judge`). Make sure `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are configured when you want tracing enabled.
+- Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to the LangSmith project you want the judge runs logged under (default `email-assistant-judge`). Each pytest module also assigns a suite-specific default automatically; set `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` when you want to force a different project for a run. Make sure `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are configured when you want tracing enabled.
 - Sample output:
 ```
 {

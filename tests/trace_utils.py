@@ -20,3 +20,18 @@ def configure_tracing_project(default_project: str) -> None:
         return
 
     os.environ["LANGSMITH_PROJECT"] = project
+
+
+def configure_judge_project(default_project: str) -> None:
+    """Set default project for judge traces when LLM judge is active."""
+
+    judge_flag = os.getenv("EMAIL_ASSISTANT_LLM_JUDGE", "").lower()
+    if judge_flag not in TRACING_ENABLED_VALUES:
+        return
+
+    override = os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE")
+    project = override or os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT") or default_project
+    if not project:
+        return
+
+    os.environ["EMAIL_ASSISTANT_JUDGE_PROJECT"] = project

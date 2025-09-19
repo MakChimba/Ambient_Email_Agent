@@ -81,7 +81,7 @@ This repo supports both offline-friendly tests and live model evaluation.
   - Add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail the test immediately when the judge's verdict is `fail`.
   - The judge prompt and runner live in `src/email_assistant/eval/judges.py` and can also be consumed from LangSmith via `create_langsmith_correctness_evaluator()`.
   - Override the model with `EMAIL_ASSISTANT_JUDGE_MODEL=gemini-2.5-pro` (or another Gemini family model) if you want a different reviewer tier.
-  - Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to control the LangSmith project name (default: `email-assistant-judge`). Enable tracing with `LANGSMITH_TRACING=true` so judge runs show up in the UI.
+  - Each test suite sets a default judge project when the feature is enabled (e.g., `email-assistant-judge-test-response`). Use `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE` to force a different project for tests, or `EMAIL_ASSISTANT_JUDGE_PROJECT` to set a global default. Enable tracing with `LANGSMITH_TRACING=true` so judge runs show up in the UI.
   - Example (LangSmith evaluate API):
     ```python
     from langsmith import Client

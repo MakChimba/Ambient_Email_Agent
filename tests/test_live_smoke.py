@@ -12,7 +12,7 @@ from tests.agent_test_utils import (
     has_google_key,
     is_eval_mode,
 )
-from tests.trace_utils import configure_tracing_project
+from tests.trace_utils import configure_tracing_project, configure_judge_project
 
 
 SMOKE_CASES = {
@@ -67,6 +67,7 @@ def _assert_keyword_coverage(case: str, text: str) -> None:
 @pytest.fixture(autouse=True)
 def _fallback_to_eval_when_key_missing(monkeypatch):
     configure_tracing_project("email-assistant-test-live-smoke")
+    configure_judge_project("email-assistant-judge-test-live-smoke")
     if not has_google_key() and not is_eval_mode():
         monkeypatch.setenv("EMAIL_ASSISTANT_EVAL_MODE", "1")
     os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
