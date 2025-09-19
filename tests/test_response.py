@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 from dotenv import find_dotenv, load_dotenv
@@ -73,6 +73,38 @@ def setup_assistant() -> Tuple[Any, Dict[str, Any], InMemoryStore]:
     return email_assistant, thread_config, store
 
 
+def _safe_log_inputs(payload: Dict[str, Any], run_id: Optional[str]) -> None:
+    try:
+        if run_id:
+            t.log_inputs(payload, run_id=run_id)
+        else:
+            t.log_inputs(payload)
+    except TypeError:
+        if run_id:
+            try:
+                t.log_inputs(payload)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _safe_log_outputs(payload: Dict[str, Any], run_id: Optional[str]) -> None:
+    try:
+        if run_id:
+            t.log_outputs(payload, run_id=run_id)
+        else:
+            t.log_outputs(payload)
+    except TypeError:
+        if run_id:
+            try:
+                t.log_outputs(payload)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def extract_values(state: Any) -> Dict[str, Any]:
     """Extract values from state object regardless of type."""
     if hasattr(state, "values"):
@@ -132,7 +164,9 @@ def _build_raw_output_payload(values: Dict[str, Any]) -> str:
         return ""
 
 
-def maybe_invoke_llm_judge(email_name: str, values: Dict[str, Any]) -> None:
+def maybe_invoke_llm_judge(
+    email_name: str, values: Dict[str, Any], parent_run_id: Optional[str]
+) -> None:
     if not ENABLE_LLM_JUDGE:
         return
     if not HAS_GOOGLE_KEY:
@@ -150,17 +184,19 @@ def maybe_invoke_llm_judge(email_name: str, values: Dict[str, Any]) -> None:
             assistant_reply=assistant_reply,
             tool_trace=tool_trace,
             raw_output_optional=raw_output,
+            parent_run_id=parent_run_id,
         )
     except JudgeUnavailableError as exc:
         warnings.warn(f"LLM judge unavailable: {exc}")
         return
 
     try:
-        t.log_outputs(
+        _safe_log_outputs(
             {
                 "judge": verdict.model_dump(),
                 "judge_summary": verdict.short_summary(),
-            }
+            },
+            parent_run_id,
         )
     except Exception:
         pass
@@ -245,16 +281,17 @@ def pytest_generate_tests(metafunc):
 # Reference output key
 def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_calls, gmail_service):
     """Test if email processing contains expected tool calls."""
-    # Log minimal inputs for LangSmith (safe noop if plugin disabled)
-    try:
-        t.log_inputs({"module": AGENT_MODULE, "test": "test_email_dataset_tool_calls"})
-    except Exception:
-        pass
-
     print(f"Processing {email_name}...")
 
     # Set up the assistant
     email_assistant, thread_config, _ = setup_assistant()
+    run_id = thread_config.get("run_id")
+
+    # Log minimal inputs for LangSmith (safe noop if plugin disabled)
+    _safe_log_inputs(
+        {"module": AGENT_MODULE, "test": "test_email_dataset_tool_calls"},
+        run_id,
+    )
 
     # Run the agent
     if AGENT_MODULE in ["email_assistant", "email_assistant_hitl_memory_gmail"]:
@@ -300,23 +337,21 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
 
     # Log
     all_messages_str = format_messages_string(values["messages"])
-    try:
-        t.log_outputs(
-            {
-                "extracted_tool_calls": extracted_tool_calls,
-                "missing_calls": missing_calls,
-                "extra_calls": extra_calls,
-                "response": all_messages_str,
-            }
-        )
-    except Exception:
-        pass
+    _safe_log_outputs(
+        {
+            "extracted_tool_calls": extracted_tool_calls,
+            "missing_calls": missing_calls,
+            "extra_calls": extra_calls,
+            "response": all_messages_str,
+        },
+        run_id,
+    )
 
     # Pass feedback key
     assert len(missing_calls) == 0
 
     if ENABLE_LLM_JUDGE and AGENT_MODULE == "email_assistant_hitl_memory_gmail":
-        maybe_invoke_llm_judge(email_name, values)
+        maybe_invoke_llm_judge(email_name, values, run_id)
 
 
 # Reference output key

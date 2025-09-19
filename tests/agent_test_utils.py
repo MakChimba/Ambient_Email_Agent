@@ -112,7 +112,9 @@ def compile_agent(agent_module_name: str) -> Tuple[Any, Dict[str, Any], Optional
 
     checkpointer = MemorySaver()
     store: Optional[InMemoryStore] = InMemoryStore()
+    run_id = str(uuid.uuid4())
     thread_config = {
+        "run_id": run_id,
         "configurable": {"thread_id": uuid.uuid4()},
         "recursion_limit": 100,
     }
@@ -162,4 +164,3 @@ def get_last_tool_args(messages: Iterable[Any], tool_name: str) -> Optional[Dict
             if name == tool_name_lower:
                 return call.get("args") or {}
     return None
-

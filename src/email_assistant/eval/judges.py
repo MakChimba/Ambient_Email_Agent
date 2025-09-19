@@ -18,9 +18,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
+from langsmith import Client
 from langsmith.evaluation import EvaluationResult, LangChainStringEvaluator, StringEvaluator
+from langsmith.run_helpers import get_current_run_tree, traceable
 from langsmith.schemas import Example, Run
-from langsmith.run_helpers import traceable
 
 from email_assistant.utils import format_messages_string
 
@@ -60,7 +61,7 @@ class JudgeResult(BaseModel):
         )
 
 
-SYSTEM_PROMPT = """You are “LLM Reviewer.” Return ONE valid JSON object only.\n\nJudge CORRECTNESS of an email agent’s final reply and its tool usage.\n\nAxes (0–5 each):\n• Tool Usage — Were the right tools used with correct arguments, in a valid order?\n\nPolicies:\n\n- Scheduling request → check_calendar_tool → schedule_meeting_tool → send_email_tool → Done. Confirm meeting duration matches the ask (allow ±10 minutes for “about” phrasing).\n- 90-minute planning (availability-only) → check_calendar_tool → send_email_tool → Done (NO scheduling). Ensure reply offers availability covering the requested window.\n- send_email_tool must include email_id and email_address, then Done.\n- Never call Done before drafting the reply.\n- Spam requires explicit confirmation before mark_as_spam_tool.\n- Tool-name normalization: treat as equivalent\n    - send_email_tool == write_email\n    - check_calendar_tool == check_calendar_availability\n    - schedule_meeting_tool == schedule_meeting\n- Exceptions:\n    - No‑reply/system “do not reply”: may end without send_email_tool (Done allowed).\n    - Spam (after explicit HITL confirmation): may end via mark_as_spam_tool without Done and without drafting a reply.\n- Question is correct when information is missing or consent is ambiguous.\n- For schedule_meeting_tool: start_time/end_time must be ISO; organizer_email required; timezone present or defaulted; duration should respect the request.\n- Tool-name/arg normalization: send_email_tool == write_email. When the name is write_email (normalized), accept the fields “to”, “subject”, and “content” and do not require Gmail-only args. Require email_id and email_address only when the raw name is send_email_tool.\n- When evaluating send_email_tool/write_email content, ensure the reply acknowledges key user constraints (deadlines, commitments, next steps) reflected in the email context and any executed tools.\n\nRubric:\n• Content Alignment: 5 exact/complete/tone-appropriate; 3 minor gaps; 1 misses/incorrect.\n• Tool Usage: 5 correct tools/args/order (+ terminal Done when applicable); 3 minor issues; 1 wrong/missing tools or invalid sequence.\n\nEvaluation source of truth:\n\n- Prefer final-state fields if present: output.assistant_reply, output.tool_trace, output.email_markdown.\n- Otherwise, derive from output.messages (e.g., last assistant content; AI tool_calls).\n- Validate arguments using raw tool calls from output.messages (AI messages with tool_calls). Use output.tool_trace for sequence evidence only; it is lossy/normalized.\n- Do not penalize the literal tool name when an equivalent normalized name is used.\n\nCompute:\noverall_correctness = 0.6*(content_alignment/5) + 0.4*(tool_usage/5)\nverdict = "pass" if overall_correctness ≥ 0.70 else "fail".\n\nSTRICT OUTPUT CONTRACT: return valid JSON with these exact keys (empty arrays allowed): overall_correctness, verdict, content_alignment, tool_usage, missing_tools, incorrect_tool_uses, evidence, notes. Use double quotes and no trailing commas.\n\nValidity rules: standard JSON only (no markdown or free-text outside the JSON). Provide 2–4 evidence strings (≤120 chars each). If information is insufficient, still return the full object with zeros and empty arrays and put the reason in notes."""
+SYSTEM_PROMPT = """You are “LLM Reviewer.” Return ONE valid JSON object only.\n\nJudge CORRECTNESS of an email agent’s final reply and its tool usage.\n\nAxes (0–5 each):\n• Tool Usage — Were the right tools used with correct arguments, in a valid order?\n\nPolicies:\n\n- Scheduling request → check_calendar_tool → schedule_meeting_tool → send_email_tool → Done. Confirm meeting duration matches the ask (allow ±10 minutes for “about” phrasing).\n- 90-minute planning (availability-only) → check_calendar_tool → send_email_tool → Done (NO scheduling). Ensure reply offers availability covering the requested window.\n- send_email_tool must include email_id and email_address, then Done.\n- Never call Done before drafting the reply.\n- Spam requires explicit confirmation before mark_as_spam_tool.\n- Tool-name normalization: treat as equivalent\n    - send_email_tool == write_email\n    - check_calendar_tool == check_calendar_availability\n    - schedule_meeting_tool == schedule_meeting\n- Exceptions:\n    - No‑reply/system “do not reply”: may end without send_email_tool (Done allowed).\n    - Spam (after explicit HITL confirmation): may end via mark_as_spam_tool without Done and without drafting a reply.\n- Question is correct when information is missing or consent is ambiguous.\n- For schedule_meeting_tool: start_time/end_time must be ISO; organizer_email required; timezone present or defaulted; duration should respect the request.\n- Tool-name/arg normalization: send_email_tool == write_email. When the name is write_email (normalized), accept the fields “to”, “subject”, and “content” and do not require Gmail-only args. Require email_id and email_address only when the raw name is send_email_tool.\n- When evaluating send_email_tool/write_email content, ensure the reply acknowledges key user constraints (deadlines, commitments, next steps) reflected in the email context and any executed tools.\n\nRubric:\n• Content Alignment: 5 exact/complete/tone-appropriate; 3 minor gaps; 1 misses/incorrect.\n• Tool Usage: 5 correct tools/args/order (+ terminal Done when applicable); 3 minor issues; 1 wrong/missing tools or invalid sequence.\n\nEvaluation source of truth:\n\n- Prefer final-state fields if present: output.assistant_reply, output.tool_trace, output.email_markdown.\n- Otherwise, derive from output.messages (e.g., last assistant content; AI tool_calls).\n- Validate arguments using raw tool calls from output.messages (AI messages with tool_calls). Use output.tool_trace for sequence evidence only; it is lossy/normalized.\n- Do not penalize the literal tool name when an equivalent normalized name is used.\n\nCompute:\noverall_correctness = 0.6*(content_alignment/5) + 0.4*(tool_usage/5)\nverdict = "pass" if overall_correctness ≥ 0.70 else "fail".\n\nSTRICT OUTPUT CONTRACT: return valid JSON with these exact keys (empty arrays allowed): overall_correctness, verdict, content_alignment, tool_usage, missing_tools, incorrect_tool_uses, evidence, notes. Use double quotes and no trailing commas.\n\nValidity rules: standard JSON only (no markdown or free-text outside the JSON). Provide 2–4 evidence strings (≤120 chars each). Notes must always contain a concise (≤300 chars) insight: for passes, highlight strengths; for fails, state the key fix. If information is insufficient, still return the full object with zeros and empty arrays and put the reason in notes."""
 
 HUMAN_PROMPT = """Evaluate this run per the rubric and return ONLY the JSON object.\n\n<email_markdown>\n{{email_markdown}}\n</email_markdown>\n\n<assistant_reply>\n{{assistant_reply}}\n</assistant_reply>\n\n<tool_trace>\n{{tool_trace}}\n</tool_trace>\n\n<raw_output_optional>\n{{raw_output_optional}}\n</raw_output_optional>\n"""
 
@@ -102,6 +103,7 @@ def run_correctness_judge(
     assistant_reply: str,
     tool_trace: str,
     raw_output_optional: str = "",
+    parent_run_id: Optional[str] = None,
     model_name: Optional[str] = None,
     temperature: float = 0.1,
 ) -> JudgeResult:
@@ -140,11 +142,15 @@ def run_correctness_judge(
     try:
         raw = invoke_fn(payload)
         if isinstance(raw, JudgeResult):
-            return raw
-        if isinstance(raw, dict):
+            result = raw
+        elif isinstance(raw, dict):
             normalised = _normalise_result_dict(raw)
-            return JudgeResult(**normalised)
-        raise TypeError(f"Unexpected judge payload type: {type(raw)}")
+            result = JudgeResult(**normalised)
+        else:
+            raise TypeError(f"Unexpected judge payload type: {type(raw)}")
+
+        _record_feedback(result, parent_run_id=parent_run_id)
+        return result
     except Exception as exc:  # pragma: no cover - defensive logging
         raise JudgeUnavailableError(f"Judge invocation failed: {exc}") from exc
 
@@ -198,8 +204,42 @@ def _normalise_result_dict(data: dict) -> dict:
         result["tool_usage"] = int(result["tool_usage"])
     if "verdict" in result:
         result["verdict"] = str(result["verdict"]).lower()
-    result.setdefault("notes", "")
+    notes = str(result.get("notes") or "").strip()
+    verdict = str(result.get("verdict", "")).lower()
+    if not notes:
+        if verdict == "pass":
+            notes = "Pass: reply and tool usage met the request; keep matching user constraints."
+        elif verdict == "fail":
+            notes = "Fail: review evidence and address the highlighted tool/content issues."
+        else:
+            notes = "No additional notes provided."
+    result["notes"] = notes[:300]
     return result
+
+
+def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -> None:
+    """Attach judge feedback to the current LangSmith run if possible."""
+
+    try:
+        run_id = parent_run_id
+        if not run_id:
+            run_tree = get_current_run_tree()
+            if not run_tree:
+                return
+            run_id = run_tree.id
+        run_id = str(run_id)
+        client = Client()
+        client.create_feedback(
+            run_id=run_id,
+            key="gemini_correctness_judge",
+            score=result.overall_correctness,
+            value=result.verdict,
+            comment=result.notes,
+            extra=result.model_dump(),
+        )
+    except Exception:
+        # Feedback attachment is best-effort; ignore failures so tests keep running.
+        return
 
 
 class GeminiJudgeStringEvaluator(StringEvaluator):
@@ -243,11 +283,14 @@ class GeminiJudgeStringEvaluator(StringEvaluator):
 
         raw_output = serialise_messages(messages)
 
+        parent_run_id = getattr(run, "id", None)
+
         result = run_correctness_judge(
             email_markdown=email_markdown,
             assistant_reply=assistant_reply,
             tool_trace=tool_trace,
             raw_output_optional=raw_output,
+            parent_run_id=parent_run_id,
             model_name=self.model_name,
             temperature=self.temperature,
         )
