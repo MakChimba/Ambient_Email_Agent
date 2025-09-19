@@ -237,6 +237,50 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
             comment=result.notes,
             extra=result.model_dump(),
         )
+        # Surface granular judge findings as additional feedback entries so
+        # the LangSmith UI displays the same rich chips shown by the hosted
+        # Gemini judge.
+        if result.missing_tools:
+            try:
+                client.create_feedback(
+                    run_id=run_id,
+                    key="missing_tools",
+                    value=", ".join(result.missing_tools),
+                    comment="Tools the agent failed to invoke",
+                )
+            except Exception:
+                pass
+        if result.incorrect_tool_uses:
+            for issue in result.incorrect_tool_uses:
+                try:
+                    client.create_feedback(
+                        run_id=run_id,
+                        key="tool",
+                        value=issue.tool or "(unknown)",
+                        comment=issue.why or "Incorrect tool usage detected",
+                    )
+                    client.create_feedback(
+                        run_id=run_id,
+                        key="why",
+                        value=issue.why or "See comment",
+                        comment=(
+                            f"Tool '{issue.tool}' flagged by judge"
+                            if issue.tool
+                            else "Incorrect tool usage details"
+                        ),
+                    )
+                except Exception:
+                    continue
+        if result.evidence:
+            try:
+                client.create_feedback(
+                    run_id=run_id,
+                    key="evidence",
+                    value=" | ".join(result.evidence),
+                    comment="Judge evidence snippets",
+                )
+            except Exception:
+                pass
     except Exception:
         # Feedback attachment is best-effort; ignore failures so tests keep running.
         return
