@@ -120,6 +120,14 @@ Runs the production-target Gmail agent. Provide `GOOGLE_API_KEY` for live Gemini
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
   - Add `EMAIL_ASSISTANT_EVAL_MODE=1` (or `--offline-eval` when using `tests/run_all_tests.py`) if you need deterministic tool calls without Gemini access.
 
+### Live Gemini Coverage
+
+Current automated tests only assert tool-call presence when Gemini is live. They do **not** verify reply content, tool ordering, or HITL behaviour. Planned enhancements include:
+- A live “smoke” test that snapshots the drafted reply for 1–2 dataset cases.
+- Additional assertions in `tests/test_response.py` to enforce tool order and key response phrases when running live.
+- A HITL path test exercising the Question → mark_as_spam_tool flow using real model output.
+Use these notes when spinning up improvements so the new work aligns with roadmap expectations.
+
 ### Quality Evaluation
 
 We rely on the LangStudio/LangSmith UI judge to evaluate reply quality and tool usage policy compliance. Local pytest focuses on tool-call presence and order only; there is no LLM-as-judge test in the repository.
