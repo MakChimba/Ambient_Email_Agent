@@ -163,8 +163,6 @@ For deterministic/offline runs, set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionall
   "notes": "Match scheduled duration to the request before calling Done."
 }
 ```
-++ EOF
-
 ## S-Class: Reminders & Follow-ups
 
 ### Overview
