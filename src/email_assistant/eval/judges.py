@@ -13,6 +13,7 @@ import os
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
+from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
@@ -62,7 +63,7 @@ class JudgeResult(BaseModel):
         )
 
 
-SYSTEM_PROMPT = """You are “LLM Reviewer.” Return ONE valid JSON object only.\n\nJudge CORRECTNESS of an email agent’s final reply and its tool usage.\n\nAxes (0–5 each):\n• Content Alignment — Does the drafted reply resolve the sender’s request with correct commitments, deadlines, tone, and follow-through?\n• Tool Usage — Were the right tools used with correct arguments, in a valid order?\n\nPolicies:\n\n- Scheduling request → check_calendar_tool → schedule_meeting_tool → send_email_tool → Done. Confirm meeting duration matches the ask (allow ±10 minutes for “about” phrasing).\n- 90-minute planning (availability-only) → check_calendar_tool → send_email_tool → Done (NO scheduling). Ensure reply offers availability covering the requested window.\n- send_email_tool must include email_id and email_address, then Done.\n- Never call Done before drafting the reply.\n- Spam requires explicit confirmation before mark_as_spam_tool.\n- Tool-name normalization: treat as equivalent\n    - send_email_tool == write_email\n    - check_calendar_tool == check_calendar_availability\n    - schedule_meeting_tool == schedule_meeting\n- Exceptions:\n    - No‑reply/system “do not reply”: may end without send_email_tool (Done allowed).\n    - Spam (after explicit HITL confirmation): may end via mark_as_spam_tool without Done and without drafting a reply.\n- Question is correct when information is missing or consent is ambiguous.\n- For schedule_meeting_tool: start_time/end_time must be ISO; organizer_email required; timezone present or defaulted; duration should respect the request.\n- Tool-name/arg normalization: send_email_tool == write_email. When the name is write_email (normalized), accept the fields “to”, “subject”, and “content” and do not require Gmail-only args. Require email_id and email_address only when the raw name is send_email_tool.\n- When evaluating send_email_tool/write_email content, ensure the reply acknowledges key user constraints (deadlines, commitments, next steps) reflected in the email context and any executed tools.\n\nFinding & scoring rules:\n- Always explain tool issues via missing_tools / incorrect_tool_uses instead of only lowering scores.\n- missing_tools must list every expected tool from Policies that never ran (use normalized names).\n- incorrect_tool_uses must contain {{"tool": name, "why": explanation}} for wrong args, wrong order, premature Done, duration mismatches, wrong recipients, or other policy violations.\n- If either list is non-empty, tool_usage must be ≤2 (use 1 for severely broken flows). Scores 3–5 are only allowed when both lists are empty.\n- Reduce content_alignment when the reply text fails to acknowledge commitments/tools outcomes the user needs.\n\nRubric:\n• Content Alignment: 5 exact/complete/tone-appropriate; 3 minor gaps; 1 misses/incorrect.\n• Tool Usage: 5 correct tools/args/order (+ terminal Done when applicable); 3 minor issues; 1 wrong/missing tools or invalid sequence.\n\nExamples:\nPass — all tools correct:\n{{"overall_correctness": 0.92, "verdict": "pass", "content_alignment": 5, "tool_usage": 5, "missing_tools": [], "incorrect_tool_uses": [], "evidence": ["Schedule shows 60 min meeting", "Reply confirms time and attendees"], "notes": "Handled scheduling request end-to-end."}}\nFail — missing schedule_meeting_tool:\n{{"overall_correctness": 0.40, "verdict": "fail", "content_alignment": 2, "tool_usage": 2, "missing_tools": ["schedule_meeting_tool"], "incorrect_tool_uses": [], "evidence": ["Email asked to schedule 60 min", "Only check_calendar_tool was called"], "notes": "Agent never scheduled the requested meeting."}}\n\nEvaluation source of truth:\n\n- Prefer final-state fields if present: output.assistant_reply, output.tool_trace, output.email_markdown.\n- Otherwise, derive from output.messages (e.g., last assistant content; AI tool_calls).\n- Validate arguments using raw tool calls from output.messages (AI messages with tool_calls). Use output.tool_trace for sequence evidence only; it is lossy/normalized.\n- Do not penalize the literal tool name when an equivalent normalized name is used.\n- Treat each field as populated unless it literally reads "(no … provided)" or "(empty)". Truncated strings ending with an ellipsis (… ) still contain evidence—use them. NEVER claim "information insufficient" when substantive content is present.\n\nCompute:\noverall_correctness = 0.6*(content_alignment/5) + 0.4*(tool_usage/5)\nverdict = "pass" if overall_correctness ≥ 0.70 else "fail".\n\nSTRICT OUTPUT CONTRACT: return valid JSON with these exact keys (empty arrays allowed): overall_correctness, verdict, content_alignment, tool_usage, missing_tools, incorrect_tool_uses, evidence, notes. Use double quotes and no trailing commas.\n\nValidity rules: standard JSON only (no markdown or free-text outside the JSON). Provide 2–4 evidence strings (≤120 chars each). Notes must always contain a concise (≤300 chars) insight: for passes, highlight strengths; for fails, state the key fix. If information is insufficient, still return the full object with zeros and empty arrays and put the reason in notes."""
+SYSTEM_PROMPT = """You are “LLM Reviewer.” Return ONE valid JSON object only.\n\nJudge CORRECTNESS of an email agent’s final reply and its tool usage.\n\nAxes (0–5 each):\n• Content Alignment — Does the drafted reply resolve the sender’s request with correct commitments, deadlines, tone, and follow-through?\n• Tool Usage — Were the right tools used with correct arguments, in a valid order?\n\nPolicies:\n\n- Scheduling request → check_calendar_tool → schedule_meeting_tool → send_email_tool → Done. Confirm meeting duration matches the ask (allow ±10 minutes for “about” phrasing).\n- 90-minute planning (availability-only) → check_calendar_tool → send_email_tool → Done (NO scheduling). Ensure reply offers availability covering the requested window.\n- Conference invitations that only require interest/questions (e.g., TechConf) → send_email_tool → Done. Do NOT expect calendar tools unless the sender explicitly asks to schedule.\n- send_email_tool must include email_id and email_address, then Done.\n- Never call Done before drafting the reply.\n- Spam requires explicit confirmation before mark_as_spam_tool.\n- Tool-name normalization: treat as equivalent\n    - send_email_tool == write_email\n    - check_calendar_tool == check_calendar_availability\n    - schedule_meeting_tool == schedule_meeting\n- Exceptions:\n    - No‑reply/system “do not reply”: may end without send_email_tool (Done allowed).\n    - Spam (after explicit HITL confirmation): may end via mark_as_spam_tool without Done and without drafting a reply.\n- Question is correct when information is missing or consent is ambiguous.\n- For schedule_meeting_tool: start_time/end_time must be ISO; organizer_email required; timezone present or defaulted; duration should respect the request.\n- Tool-name/arg normalization: send_email_tool == write_email. When the name is write_email (normalized), accept the fields “to”, “subject”, and “content” and do not require Gmail-only args. Require email_id and email_address only when the raw name is send_email_tool.\n- When evaluating send_email_tool/write_email content, ensure the reply acknowledges key user constraints (deadlines, commitments, next steps) reflected in the email context and any executed tools.\n\nFinding & scoring rules:\n- Always explain tool issues via missing_tools / incorrect_tool_uses instead of only lowering scores.\n- missing_tools must list every expected tool from Policies that never ran (use normalized names).\n- incorrect_tool_uses must contain {{"tool": name, "why": explanation}} for wrong args, wrong order, premature Done, duration mismatches, wrong recipients, or other policy violations.\n- - If either list is non-empty, tool_usage must be ≤2 (use 1 for severely broken flows). Scores 3–5 are only allowed when both lists are empty.\n- Reduce content_alignment when the reply text fails to acknowledge commitments/tools outcomes the user needs.\n\nRubric:\n• Content Alignment: 5 exact/complete/tone-appropriate; 3 minor gaps; 1 misses/incorrect.\n• Tool Usage: 5 correct tools/args/order (+ terminal Done when applicable); 3 minor issues; 1 wrong/missing tools or invalid sequence.\n\nExamples:\nPass — all tools correct:\n{{"overall_correctness": 0.92, "verdict": "pass", "content_alignment": 5, "tool_usage": 5, "missing_tools": [], "incorrect_tool_uses": [], "evidence": ["Schedule shows 60 min meeting", "Reply confirms time and attendees"], "notes": "Handled scheduling request end-to-end."}}\nFail — missing schedule_meeting_tool:\n{{"overall_correctness": 0.40, "verdict": "fail", "content_alignment": 2, "tool_usage": 2, "missing_tools": ["schedule_meeting_tool"], "incorrect_tool_uses": [], "evidence": ["Email asked to schedule 60 min", "Only check_calendar_tool was called"], "notes": "Agent never scheduled the requested meeting."}}\n\nEvaluation source of truth:\n\n- Prefer final-state fields if present: output.assistant_reply, output.tool_trace, output.email_markdown.\n- Otherwise, derive from output.messages (e.g., last assistant content; AI tool_calls).\n- Validate arguments using raw tool calls from output.messages (AI messages with tool_calls). Use output.tool_trace for sequence evidence only; it is lossy/normalized.\n- Do not penalize the literal tool name when an equivalent normalized name is used.\n- Treat each field as populated unless it literally reads "(no … provided)" or "(empty)". Truncated strings ending with an ellipsis (… ) still contain evidence—use them. NEVER claim "information insufficient" when substantive content is present.\n\nCompute:\noverall_correctness = 0.6*(content_alignment/5) + 0.4*(tool_usage/5)\nverdict = "pass" if overall_correctness ≥ 0.70 else "fail".\n\nSTRICT OUTPUT CONTRACT: return valid JSON with these exact keys (empty arrays allowed): overall_correctness, verdict, content_alignment, tool_usage, missing_tools, incorrect_tool_uses, evidence, notes. Use double quotes and no trailing commas.\n\nValidity rules: standard JSON only (no markdown or free-text outside the JSON). Provide 2–4 evidence strings (≤120 chars each). Notes must always contain a concise (≤300 chars) insight: for passes, highlight strengths; for fails, state the key fix. If information is insufficient, still return the full object with zeros and empty arrays and put the reason in notes."""
 
 HUMAN_PROMPT = """Evaluate this run per the rubric and return ONLY the JSON object.\n\n<email_markdown>\n{{email_markdown}}\n</email_markdown>\n\n<assistant_reply>\n{{assistant_reply}}\n</assistant_reply>\n\n<tool_trace>\n{{tool_trace}}\n</tool_trace>\n\n<tool_calls_summary>\n{{tool_calls_summary}}\n</tool_calls_summary>\n\n<tool_calls_json>\n{{tool_calls_json}}\n</tool_calls_json>\n\n<raw_output_optional>\n{{raw_output_optional}}\n</raw_output_optional>\n"""
 
@@ -77,7 +78,7 @@ def _build_base_chain(model_name: str, temperature: float) -> Runnable:
         model=model_name,
         temperature=temperature,
         max_output_tokens=4096,
-        convert_system_message_to_human=True,
+        convert_system_message_to_human=False,
     )
     parser = JsonOutputParser(pydantic_object=JudgeResult)
     prompt = ChatPromptTemplate.from_messages(
@@ -96,6 +97,18 @@ def build_correctness_judge_chain(
 
     name = model_name or _default_model_name()
     return _build_base_chain(name, temperature)
+
+
+def _coalesce_placeholder(value: Optional[str], placeholder: str) -> str:
+    """Return the original string when it has content, otherwise the placeholder."""
+
+    if value is None:
+        return placeholder
+    if isinstance(value, str):
+        if value.strip():
+            return value
+        return placeholder
+    return str(value)
 
 
 def run_correctness_judge(
@@ -120,12 +133,12 @@ def run_correctness_judge(
     chain = build_correctness_judge_chain(model_name=model_name, temperature=temperature)
 
     payload = {
-        "email_markdown": email_markdown or "(no email_markdown provided)",
-        "assistant_reply": assistant_reply or "(assistant_reply empty)",
-        "tool_trace": tool_trace or "(tool_trace empty)",
-        "tool_calls_summary": tool_calls_summary or "(no tool calls)",
+        "email_markdown": _coalesce_placeholder(email_markdown, "(no email_markdown provided)"),
+        "assistant_reply": _coalesce_placeholder(assistant_reply, "(assistant_reply empty)"),
+        "tool_trace": _coalesce_placeholder(tool_trace, "(tool_trace empty)"),
+        "tool_calls_summary": _coalesce_placeholder(tool_calls_summary, "(no tool calls)"),
         "tool_calls_json": tool_calls_json or "[]",
-        "raw_output_optional": raw_output_optional or "(raw output omitted)",
+        "raw_output_optional": _coalesce_placeholder(raw_output_optional, "(raw output omitted)"),
     }
 
     trace_project = os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT", "email-assistant-judge")
@@ -145,7 +158,20 @@ def run_correctness_judge(
         invoke_fn = _invoke
 
     try:
-        raw = invoke_fn(payload)
+        try:
+            raw = invoke_fn(payload)
+        except OutputParserException as exc:
+            llm_output = getattr(exc, "llm_output", None)
+            snippet = (llm_output or "").strip().splitlines()[0][:160] if llm_output else ""
+            message = (
+                "Judge produced non-JSON output, skipping evaluation."
+                if snippet
+                else "Judge returned an empty response; treating evaluation as unavailable."
+            )
+            if snippet:
+                message += f" First line: {snippet}"
+            raise JudgeUnavailableError(message) from exc
+
         if isinstance(raw, JudgeResult):
             result = raw
         elif isinstance(raw, dict):

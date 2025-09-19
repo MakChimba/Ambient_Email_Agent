@@ -55,7 +55,8 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 ### Defaults and Test Modes
 
 - Default agent (tests/runners): The project’s default test target is now the Gmail HITL+memory agent `email_assistant_hitl_memory_gmail` since this is the intended production agent.
-- Offline eval mode (optional): Set `EMAIL_ASSISTANT_EVAL_MODE=1` when you need deterministic tool calls without a live Gemini model. Leave it unset/`0` for real-model runs.
+- Live-first testing: Run all automated tests without `EMAIL_ASSISTANT_EVAL_MODE` so they exercise the real Gemini stack. Only reach for eval mode when a fully offline run is absolutely required.
+- Offline eval mode (optional): Set `EMAIL_ASSISTANT_EVAL_MODE=1` **only** when you need deterministic tool calls without a live Gemini model (e.g., CI without API keys). Leave it unset/`0` for normal development and local verification.
 - HITL auto-accept: `HITL_AUTO_ACCEPT=1` auto-accepts tool interrupts during tests/demos.
 - Skip mark-as-read: `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` avoids calling Gmail in tests/demos.
 - Notebook test mode: `NB_TEST_MODE=1` makes notebooks skip long-running or online-only cells.

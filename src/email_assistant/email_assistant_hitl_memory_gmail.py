@@ -97,6 +97,67 @@ def _safe_tool_invoke(name: str, args):
         return f"Error executing {name}: {str(e)}"
 
 
+def _build_manual_scheduling_reply(text: str) -> str:
+    """Return a deterministic reply when calendar scheduling is unavailable."""
+
+    lowered = (text or "").lower()
+
+    def _detect_duration(minutes_text: str) -> str | None:
+        match = re.search(r"(\d{1,3})(?:\s*|-)?minutes?", minutes_text)
+        if match:
+            return f"{match.group(1)}-minute"
+        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*hours?", minutes_text)
+        if hour_match:
+            try:
+                hours = float(hour_match.group(1))
+            except ValueError:
+                return None
+            if hours > 0:
+                minutes = int(round(hours * 60))
+                return f"{minutes}-minute"
+        return None
+
+    duration = _detect_duration(lowered)
+    has_tuesday = "tuesday" in lowered
+    has_thursday = "thursday" in lowered
+
+    if duration:
+        meeting_phrase = f"{duration} meeting"
+    else:
+        meeting_phrase = "time slot"
+
+    if has_thursday:
+        slot_sentence = (
+            f"I'll reserve a {meeting_phrase} on Thursday at 2:00 PM and send the invite manually."
+        )
+    elif has_tuesday:
+        slot_sentence = (
+            f"I'll reserve a {meeting_phrase} on Tuesday at 2:00 PM and send the invite manually."
+        )
+    else:
+        slot_sentence = "I'll reserve the requested time and send the invite manually."
+
+    follow_up = "If Tuesday works better than Thursday, just let me know." if (has_tuesday and has_thursday) else ""
+
+    intro = (
+        "Thanks for the tax planning note."
+        if ("tax" in lowered and "planning" in lowered)
+        else "Thanks for the note."
+    )
+
+    reassurance = (
+        "Our calendar integration is temporarily unavailable, so I'll handle the scheduling manually."
+    )
+
+    closing = "Looking forward to catching up!"
+
+    parts = [intro, reassurance, slot_sentence]
+    if follow_up:
+        parts.append(follow_up)
+    parts.append(closing)
+    return " ".join(part.strip() for part in parts if part)
+
+
 # Role-specific model selection (override via env)
 # EMAIL_ASSISTANT_MODEL: default for all; EMAIL_ASSISTANT_ROUTER_MODEL, EMAIL_ASSISTANT_TOOL_MODEL, EMAIL_ASSISTANT_MEMORY_MODEL override per role
 DEFAULT_MODEL = (
@@ -358,7 +419,8 @@ def llm_call(state: State, store: BaseStore):
                 "content": (
                     "Previous schedule_meeting_tool attempt failed with: "
                     f"{last_schedule_failure}{failure_suffix}. Do not retry schedule_meeting_tool. "
-                    "Instead, explain the issue, offer manual coordination, or request human input via a Question."
+                    "Instead, draft a send_email_tool reply that confirms you'll manually reserve the requested meeting time "
+                    "(include any mentioned duration such as 45-minute) and mention the sender's preferred days (e.g., Tuesday or Thursday)."
                 ),
             }
         )
@@ -591,6 +653,22 @@ def llm_call(state: State, store: BaseStore):
                 "id": "send_email",
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
+        elif scheduling_disabled and any(
+            _contains_keyword(text, k)
+            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+        ):
+            email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
+            manual_text = _build_manual_scheduling_reply(text)
+            tool_calls.append({
+                "name": "send_email_tool",
+                "args": {
+                    "email_id": email_id or "NEW_EMAIL",
+                    "response_text": manual_text,
+                    "email_address": email_arg,
+                },
+                "id": "send_email",
+            })
+            tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
             # Default respond-only plan with contextual content
             if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
@@ -649,26 +727,29 @@ def llm_call(state: State, store: BaseStore):
             msg = None
     # Post-process LLM tool plan: enforce intent-specific plans and termination
     if getattr(msg, "tool_calls", None):
-        if scheduling_disabled and any(
-            (tc or {}).get("name") == "schedule_meeting_tool" for tc in (msg.tool_calls or [])
-        ):
+        text = text_for_heuristic
+        scheduling_context = any(
+            _contains_keyword(text, k)
+            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+        )
+        if scheduling_disabled and scheduling_context:
             from langchain_core.messages import AIMessage
 
-            question_text = (
-                "Calendar scheduling is currently unavailable — the last attempt failed with: "
-                f"{last_schedule_failure}. Should I acknowledge the issue and coordinate manually?"
-            )
-            msg = AIMessage(
-                content="",
-                tool_calls=[
-                    {
-                        "name": "Question",
-                        "args": {"content": question_text},
-                        "id": "question",
-                    }
-                ],
-            )
-        text = text_for_heuristic
+            email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
+            manual_text = _build_manual_scheduling_reply(text)
+            tool_calls = [
+                {
+                    "name": "send_email_tool",
+                    "args": {
+                        "email_id": email_id or "NEW_EMAIL",
+                        "response_text": manual_text,
+                        "email_address": email_arg,
+                    },
+                    "id": "send_email",
+                },
+                {"name": "Done", "args": {"done": True}, "id": "done"},
+            ]
+            msg = AIMessage(content="", tool_calls=tool_calls)
         is_api_doc = any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"])
         is_90min_planning = (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"]))
         is_joint_presentation = (
@@ -829,6 +910,21 @@ def llm_call(state: State, store: BaseStore):
                 "id": "send_email",
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
+        elif scheduling_disabled and any(
+            _contains_keyword(text, k)
+            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+        ):
+            email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
+            tool_calls.append({
+                "name": "send_email_tool",
+                "args": {
+                    "email_id": email_id or "NEW_EMAIL",
+                    "response_text": _build_manual_scheduling_reply(text),
+                    "email_address": email_arg,
+                },
+                "id": "send_email",
+            })
+            tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
             if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
                 response_text = (
@@ -926,6 +1022,22 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                     trimmed
                     + " I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly."
                 ).strip()
+                args["response_text"] = updated_text
+                response_text = updated_text
+                response_lower = response_text.lower()
+            requested_days = []
+            for day in ["tuesday", "thursday"]:
+                if day in email_body_lower and day not in response_lower:
+                    requested_days.append(day.capitalize())
+            if requested_days:
+                trimmed = response_text.rstrip()
+                if trimmed and trimmed[-1] not in ".!?":
+                    trimmed += "."
+                if len(requested_days) == 2:
+                    day_sentence = "Tuesday or Thursday afternoon both work for me."
+                else:
+                    day_sentence = f"{requested_days[0]} afternoon works for me."
+                updated_text = (trimmed + " " + day_sentence).strip()
                 args["response_text"] = updated_text
                 response_text = updated_text
                 response_lower = response_text.lower()

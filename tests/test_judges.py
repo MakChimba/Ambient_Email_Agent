@@ -77,3 +77,16 @@ def test_normalise_result_dict_clamps_tool_score(
     assert normalised["verdict"] == "fail"
     expected_overall = 0.6 * (content_alignment / 5) + 0.4 * (expected_tool_usage / 5)
     assert normalised["overall_correctness"] == pytest.approx(expected_overall)
+
+
+def test_coalesce_placeholder_uses_real_content_when_present():
+    placeholder = "(empty)"
+
+    assert judges._coalesce_placeholder("actual content", placeholder) == "actual content"
+    assert judges._coalesce_placeholder("   ", placeholder) == placeholder
+    assert judges._coalesce_placeholder(None, placeholder) == placeholder
+    assert judges._coalesce_placeholder({"foo": "bar"}, placeholder) == str({"foo": "bar"})
+
+
+def test_system_prompt_includes_conference_guidance():
+    assert "Conference invitations" in judges.SYSTEM_PROMPT

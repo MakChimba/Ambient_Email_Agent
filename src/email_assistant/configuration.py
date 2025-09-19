@@ -19,4 +19,7 @@ def get_llm(temperature: float = 0.0, **kwargs):
         _, model_name = model_name.split(":", 1)
     if model_name.startswith("models/"):
         model_name = model_name.split("/", 1)[1]
+    # Gemini now natively supports system messages; disable the legacy conversion layer to
+    # avoid the noisy "Convert_system_message_to_human will be deprecated" warning.
+    kwargs.setdefault("convert_system_message_to_human", False)
     return ChatGoogleGenerativeAI(model=model_name, temperature=temperature, **kwargs)
