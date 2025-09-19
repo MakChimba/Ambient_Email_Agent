@@ -70,6 +70,41 @@ This repo supports both offline-friendly tests and live model evaluation.
     - Uses two experiment cases to snapshot tool order + reply excerpts. Run with real Gemini creds (default) or set `EMAIL_ASSISTANT_EVAL_MODE=1` for deterministic runs. Update the baseline snapshot with `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when intentional changes are made.
   - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
     - Exercises the Question → `mark_as_spam_tool` HITL path end-to-end. Works live by default; set `EMAIL_ASSISTANT_EVAL_MODE=1` for offline CI paths.
+- LLM-as-judge (optional, Gemini 2.5 Flash):
+  - `EMAIL_ASSISTANT_LLM_JUDGE=1` adds a post-test review powered by the new Gemini judge for every `test_response.py` case. The judge logs findings via LangSmith (if configured) and prints warnings.
+  - Add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail the test immediately when the judge's verdict is `fail`.
+  - The judge prompt and runner live in `src/email_assistant/eval/judges.py` and can also be consumed from LangSmith via `create_langsmith_correctness_evaluator()`.
+  - Override the model with `EMAIL_ASSISTANT_JUDGE_MODEL=gemini-2.5-pro` (or another Gemini family model) if you want a different reviewer tier.
+  - Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to control the LangSmith project name (default: `email-assistant-judge`). Enable tracing with `LANGSMITH_TRACING=true` so judge runs show up in the UI.
+  - Example (LangSmith evaluate API):
+    ```python
+    from langsmith import Client
+    from email_assistant.eval.judges import create_langsmith_correctness_evaluator
+
+    client = Client()
+    judge = create_langsmith_correctness_evaluator()
+    client.evaluate(target_fn, data="my_dataset", evaluators=[judge])
+    ```
+
+Judge output structure example:
+```
+{
+  "overall_correctness": 0.6,
+  "verdict": "fail",
+  "content_alignment": 3,
+  "tool_usage": 3,
+  "missing_tools": [],
+  "incorrect_tool_uses": [
+    {"tool": "schedule_meeting_tool", "why": "The assistant scheduled 45 min despite a 60 min request."}
+  ],
+  "evidence": [
+    "Email: 'Could we schedule about 60 minutes sometime next week'",
+    "schedule_meeting_tool: start=2025-05-22T14:00 end=2025-05-22T14:45",
+    "assistant_reply: 'I've scheduled a 45-minute meeting'"
+  ],
+  "notes": "Match meeting durations to user constraints (requested ~60 minutes)."
+}
+```
 
 Notes
 - Gmail tools return mock results on missing credentials; tests assert tool-call presence, not delivery.

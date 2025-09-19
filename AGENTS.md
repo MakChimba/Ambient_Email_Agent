@@ -139,7 +139,31 @@ For deterministic/offline runs, set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionall
 
 ### Quality Evaluation
 
-We rely on the LangStudio/LangSmith UI judge to evaluate reply quality and tool usage policy compliance. Local pytest focuses on tool-call presence and order only; there is no LLM-as-judge test in the repository.
+- The repo now ships with a Gemini 2.5 Flash “LLM-as-judge” (`src/email_assistant/eval/judges.py`).
+- Enable it locally by setting `EMAIL_ASSISTANT_LLM_JUDGE=1` when running pytest; optionally add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail tests on a judge “fail” verdict. Results (score, verdict, notes) are logged through `langsmith.testing.log_outputs` so they appear in LangSmith if tracing is enabled.
+- For LangSmith datasets/experiments, call `create_langsmith_correctness_evaluator()` to obtain a `LangChainStringEvaluator` that embeds the same prompt and scoring rubric. This keeps Studio reviews and local pytest perfectly aligned.
+- Override the reviewer model via `EMAIL_ASSISTANT_JUDGE_MODEL` (default `gemini-2.5-flash`).
+- Set `EMAIL_ASSISTANT_JUDGE_PROJECT` to the LangSmith project you want the judge runs logged under (default `email-assistant-judge`). Make sure `LANGSMITH_TRACING=true` and `LANGSMITH_API_KEY` are configured when you want tracing enabled.
+- Sample output:
+```
+{
+  "overall_correctness": 0.6,
+  "verdict": "fail",
+  "content_alignment": 3,
+  "tool_usage": 3,
+  "missing_tools": [],
+  "incorrect_tool_uses": [
+    {"tool": "schedule_meeting_tool", "why": "Scheduled 45 min instead of the requested ~60 min."}
+  ],
+  "evidence": [
+    "Email: 'Could we schedule about 60 minutes sometime in the next week'",
+    "schedule_meeting_tool: start=2025-05-22T14:00, end=2025-05-22T14:45",
+    "assistant_reply: 'I've scheduled a 45-minute meeting'"
+  ],
+  "notes": "Match scheduled duration to the request before calling Done."
+}
+```
+++ EOF
 
 ## S-Class: Reminders & Follow-ups
 

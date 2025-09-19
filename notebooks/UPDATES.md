@@ -10,6 +10,27 @@ This file highlights recent project changes that affect the notebooks and how to
 - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1`
   - Compatibility toggle for some evaluators that expect `send_email_tool.email_address` to be the reply recipient (the original sender), not your address.
   - Leave unset for live Gmail usage (default behavior is correct for sending).
+- Optional LLM judge: set `EMAIL_ASSISTANT_LLM_JUDGE=1` during pytest runs to capture Gemini 2.5 Flash correctness scores (see `src/email_assistant/eval/judges.py`). Use `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail on judge “fail”, and `EMAIL_ASSISTANT_JUDGE_MODEL` to swap the reviewer model.
+- To trace judge runs in LangSmith, configure `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, and optionally `EMAIL_ASSISTANT_JUDGE_PROJECT` to pick a project name (default `email-assistant-judge`).
+- Judge JSON sample:
+```
+{
+  "overall_correctness": 0.6,
+  "verdict": "fail",
+  "content_alignment": 3,
+  "tool_usage": 3,
+  "missing_tools": [],
+  "incorrect_tool_uses": [
+    {"tool": "schedule_meeting_tool", "why": "Duration (45 min) did not match the ~60 min request."}
+  ],
+  "evidence": [
+    "Email: 'Could we schedule about 60 minutes sometime in the next week'",
+    "schedule_meeting_tool: start=2025-05-22T14:00 end=2025-05-22T14:45",
+    "assistant_reply: 'I've scheduled a 45-minute meeting'"
+  ],
+  "notes": "Align meeting durations with the email ask before finalizing."
+}
+```
 
 ## Gmail Agent HITL Display
 

@@ -15,6 +15,13 @@ from tests.agent_test_utils import (
     is_eval_mode,
     load_dataset,
 )
+from email_assistant.eval.judges import (
+    JudgeUnavailableError,
+    run_correctness_judge,
+    serialise_messages,
+)
+import warnings
+import json
 
 load_dotenv(find_dotenv(), override=True)
 
@@ -106,6 +113,62 @@ def assert_response_matches_criteria(email_name: str, response_text: str) -> Non
     assert not missing_groups, (
         f"Draft for {email_name} is missing required phrases: {missing_groups}."
     )
+
+
+def _build_raw_output_payload(values: Dict[str, Any]) -> str:
+    try:
+        payload = {
+            "assistant_reply": values.get("assistant_reply"),
+            "tool_trace": values.get("tool_trace"),
+            "email_markdown": values.get("email_markdown"),
+            "messages": serialise_messages(values.get("messages", [])),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return ""
+
+
+def maybe_invoke_llm_judge(email_name: str, values: Dict[str, Any]) -> None:
+    if not ENABLE_LLM_JUDGE:
+        return
+    if not HAS_GOOGLE_KEY:
+        warnings.warn("Skipping LLM judge: GOOGLE_API_KEY not configured.")
+        return
+
+    email_markdown = values.get("email_markdown", "")
+    assistant_reply = values.get("assistant_reply", "")
+    tool_trace = values.get("tool_trace") or format_messages_string(values.get("messages", []))
+    raw_output = _build_raw_output_payload(values)
+
+    try:
+        verdict = run_correctness_judge(
+            email_markdown=email_markdown,
+            assistant_reply=assistant_reply,
+            tool_trace=tool_trace,
+            raw_output_optional=raw_output,
+        )
+    except JudgeUnavailableError as exc:
+        warnings.warn(f"LLM judge unavailable: {exc}")
+        return
+
+    try:
+        t.log_outputs(
+            {
+                "judge": verdict.model_dump(),
+                "judge_summary": verdict.short_summary(),
+            }
+        )
+    except Exception:
+        pass
+
+    if verdict.verdict == "fail":
+        message = (
+            f"LLM judge flagged {email_name}: {verdict.short_summary()} | notes={verdict.notes}"
+        )
+        if STRICT_LLM_JUDGE:
+            pytest.fail(message)
+        else:
+            warnings.warn(message)
 
 
 # Heuristic/structured judge removed from local tests.
@@ -248,7 +311,12 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
     # Pass feedback key
     assert len(missing_calls) == 0
 
+    if ENABLE_LLM_JUDGE and AGENT_MODULE == "email_assistant_hitl_memory_gmail":
+        maybe_invoke_llm_judge(email_name, values)
+
 
 # Reference output key
 # Each test case is (email_input, email_name, criteria, expected_calls)
 # Qualitative judge-based test removed. Use the LangStudio UI judge instead.
+ENABLE_LLM_JUDGE = os.getenv("EMAIL_ASSISTANT_LLM_JUDGE", "").lower() in ("1", "true", "yes")
+STRICT_LLM_JUDGE = os.getenv("EMAIL_ASSISTANT_JUDGE_STRICT", "").lower() in ("1", "true", "yes")
