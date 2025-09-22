@@ -11,6 +11,11 @@ LangSmith traces for the Gmail HITL + memory workflow remain difficult to scan. 
 - **Summary via assistant_reply**: Update `mark_as_read_node` in `email_assistant_hitl_memory_gmail.py` to stop appending a synthetic `AIMessage`. Emit the final summary solely through the structured `assistant_reply` field while continuing to populate `tool_trace` and `email_markdown`.
 - **Documentation**: Extend `README_LOCAL.md` with a “LangSmith Tracing” subsection that links to LangGraph’s “Enable LangSmith Tracing” guide, describes the shared helper module (including the tests fixture import), details the run-name/tag convention (launcher-specific tag prefixes plus the Studio adapter note), reiterates the 4 KB markdown guard with the Unicode-aware whitespace trim, and calls out that non-pytest launchers must clone configs per email.
 
+## Clarifications & Constraints
+- Every curated dataset in this repo exposes `subject` and sender metadata, so the case-slug helper will normally resolve before falling back to the `thread_id` prefix; document that fallback for arbitrary inbox inputs.
+- `format_gmail_markdown(...)` already handles both Gmail exports and the simplified dataset schema; note in the README entry that we will swap to `format_email_markdown(...)` if non-Gmail providers arrive.
+- Tests and downstream consumers read `assistant_reply`/`tool_trace` rather than the terminal `AIMessage`, so removing the synthetic summary from `mark_as_read_node` is safe.
+
 ## Acceptance Criteria
 - New LangSmith runs (manual or pytest-driven) display the configured run name (module prefix + sanitized case slug), tags, and metadata, exposing dataset/subject/sender/thread UUID details per the shared fallback order, and each email processed in a loop produces a unique run config.
 - Reminder evaluation and triage experiments show the normalized run name/tag/metadata convention with unique configs per email (slug from dataset name or filename, UUID-derived thread prefix).
