@@ -199,6 +199,7 @@ def run_correctness_judge(
                 input_summary=judge_summary,
                 metadata={"payload_keys": list(payload.keys())},
                 output_transform=_summarize_output,
+                project_name=trace_project,
             )
         except OutputParserException as exc:
             llm_output = getattr(exc, "llm_output", None)

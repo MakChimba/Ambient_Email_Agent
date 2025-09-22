@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import os
-import random
 import re
-import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -15,11 +13,45 @@ from datetime import datetime, timezone
 from email_assistant.utils import extract_message_content, parse_gmail
 from email_assistant import version as EMAIL_ASSISTANT_VERSION
 
-try:  # Optional runtime dependency
-    from langsmith.run_helpers import RunTree, get_current_run_tree  # type: ignore
-except Exception:  # pragma: no cover - unavailable when LangSmith not installed
-    get_current_run_tree = None  # type: ignore
-    RunTree = None  # type: ignore
+# LangSmith recently refactored the tracing helpers. Import order keeps backward
+# compatibility with older packages while preferring the newer ``trace`` API.
+RunTree = None  # type: ignore[assignment]
+get_current_run_tree = None  # type: ignore[assignment]
+_TRACE_CONTEXT = None
+
+try:  # pragma: no cover - optional dependency
+    from langsmith.run_helpers import trace as _TRACE_CONTEXT  # type: ignore
+except Exception:  # pragma: no cover - older versions may not expose ``trace``
+    _TRACE_CONTEXT = None
+
+try:  # pragma: no cover - optional dependency
+    from langsmith.run_helpers import get_current_run_tree as _GET_CURRENT  # type: ignore
+except Exception:  # pragma: no cover
+    _GET_CURRENT = None
+
+if _GET_CURRENT is not None:  # pragma: no cover - ensure shared reference
+    get_current_run_tree = _GET_CURRENT
+
+if _TRACE_CONTEXT is None:  # Fall back to legacy RunTree context manager
+    try:  # pragma: no cover - legacy behaviour
+        from langsmith.run_helpers import RunTree as _LEGACY_RUN_TREE  # type: ignore
+    except Exception:  # pragma: no cover
+        _LEGACY_RUN_TREE = None
+    else:
+        if hasattr(_LEGACY_RUN_TREE, "__enter__"):
+            RunTree = _LEGACY_RUN_TREE
+else:
+    try:  # pragma: no cover - new API exposes RunTree from run_trees
+        from langsmith.run_trees import RunTree as _RUN_TREE  # type: ignore
+    except Exception:  # pragma: no cover - older versions still provide RunTree in run_helpers
+        try:
+            from langsmith.run_helpers import RunTree as _LEGACY_RUN_TREE  # type: ignore
+        except Exception:  # pragma: no cover
+            _RUN_TREE = None
+        else:
+            _RUN_TREE = _LEGACY_RUN_TREE
+    if _RUN_TREE is not None:
+        RunTree = _RUN_TREE
 
 
 _TRACE_DEBUG = os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes")
@@ -33,7 +65,7 @@ def _project_with_date(base: str) -> str:
     today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix, sep, suffix = base.partition(":")
     if sep:
-        return f"{prefix}:{suffix.upper()}-{today}"
+        return f"{prefix}-{suffix.upper()}-{today}"
     return f"{base}-{today}"
 
 
@@ -77,6 +109,83 @@ def _grid_text(text: str | None) -> str:
 
     value = (text or "").strip()
     return value if value else "[n/a]"
+
+
+def _start_langsmith_run(
+    name: str,
+    *,
+    run_type: str,
+    inputs_summary: str | None,
+    metadata: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+    tags: SeqType[str] | None = None,
+    parent: Any | None = None,
+    project_name: str | None = None,
+):
+    """Create a LangSmith run using the available SDK helpers."""
+
+    active_tags = list(tags or [])
+
+    if _TRACE_CONTEXT is not None:
+        payload_inputs: Mapping[str, Any] | None = None
+        if inputs_summary is not None:
+            payload_inputs = {"summary": _grid_text(inputs_summary)}
+
+        ctx = _TRACE_CONTEXT(
+            name,
+            run_type=run_type,
+            inputs=payload_inputs,
+            metadata=dict(metadata or {}),
+            extra=dict(extra or {}),
+            tags=active_tags or None,
+            parent=parent,
+            project_name=project_name,
+        )
+        run = ctx.__enter__()
+        return ctx, run
+
+    if RunTree is not None and hasattr(RunTree, "__enter__"):
+        inputs_payload: Mapping[str, Any] = {}
+        if inputs_summary is not None:
+            inputs_payload = {"summary": _grid_text(inputs_summary)}
+
+        kwargs: dict[str, Any]
+        if parent is not None:
+            kwargs = {
+                "name": name,
+                "run_type": run_type,
+                "inputs": inputs_payload,
+                "metadata": dict(metadata or {}),
+                "extra": dict(extra or {}),
+                "tags": active_tags or None,
+            }
+            child = parent.create_child(**{k: v for k, v in kwargs.items() if v is not None})  # type: ignore[arg-type]
+            run = child.__enter__()
+            return child, run
+
+        kwargs = {
+            "name": name,
+            "run_type": run_type,
+            "inputs": inputs_payload,
+            "metadata": dict(metadata or {}),
+            "extra": dict(extra or {}),
+        }
+
+        if active_tags:
+            kwargs["tags"] = active_tags
+        if project_name:
+            kwargs["project_name"] = project_name
+
+        try:
+            ctx = RunTree(**kwargs)
+        except TypeError:
+            kwargs.pop("tags", None)
+            ctx = RunTree(**kwargs)
+
+        run = ctx.__enter__()
+        return ctx, run
+
+    return None, None
 
 
 def _env_flag(name: str) -> bool:
@@ -413,118 +522,124 @@ def maybe_update_run_io(
         _debug_log("maybe_update_run_io: no run_id available")
         return False
 
-    try:
-        from langsmith import Client  # type: ignore
-    except Exception:
+    def _find_run_tree(start: Any, target: str | None) -> Any | None:
+        if start is None:
+            return None
+        target_str = target or str(getattr(start, "id", ""))
+        stack = [start]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            node_id = getattr(node, "id", None)
+            if node_id is not None and str(node_id) == target_str:
+                return node
+            children = getattr(node, "child_runs", None) or []
+            for child in children:
+                if id(child) in seen:
+                    continue
+                seen.add(id(child))
+                stack.append(child)
+        return None
+
+    run_tree_obj = None
+    if get_current_run_tree is not None:
+        try:
+            current_tree = get_current_run_tree()
+        except Exception:
+            current_tree = None
+        if current_tree is not None:
+            target_str = str(run_id)
+            current_id = getattr(current_tree, "id", None)
+            if current_id is not None and str(current_id) == target_str:
+                run_tree_obj = current_tree
+            else:
+                root = current_tree
+                while getattr(root, "parent_run", None) is not None:
+                    root = getattr(root, "parent_run")
+                run_tree_obj = _find_run_tree(root, target_str)
+
+    if run_tree_obj is None:
         return False
 
-    client = Client()
-    attempt = 0
-    while attempt < retries:
-        attempt += 1
-        try:
-            run = client.read_run(run_id)
-            if run is None:
-                _debug_log(f"maybe_update_run_io: run {run_id} not found")
-                return False
+    def _as_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, Mapping):
+            return dict(value)
+        return {}
 
-            # Walk up the parent chain to normalise updates on the root run.
-            root = run
-            seen: set[str] = set()
-            while getattr(root, "parent_run_id", None):
-                parent_id = str(getattr(root, "parent_run_id"))
-                if parent_id in seen:
-                    break
-                seen.add(parent_id)
-                parent = client.read_run(parent_id)
-                if parent is None:
-                    break
-                root = parent
+    inputs_payload = _as_dict(getattr(run_tree_obj, "inputs", {}))
+    outputs_payload = _as_dict(getattr(run_tree_obj, "outputs", {}))
+    extra_payload = _as_dict(getattr(run_tree_obj, "extra", {}))
+    metadata_payload = _as_dict(extra_payload.get("metadata", {}))
 
-            root_id = str(getattr(root, "id", run.id))
-            current_inputs = root.inputs if isinstance(root.inputs, str) else None
-            current_outputs = root.outputs if isinstance(root.outputs, str) else None
+    changed = False
 
-            update_payload: dict[str, Any] = {}
+    if force_inputs is not None:
+        inputs_payload["summary"] = _grid_text(force_inputs)
+        changed = True
+    else:
+        summary_source: str | None = None
+        if tool_name:
+            summary_source = summarize_tool_call_for_grid(tool_name, tool_args or {})
+        elif llm_payload is not None:
+            summary_source = summarize_llm_for_grid(llm_payload)
+        elif email_input is not None:
+            summary_source = summarize_email_for_grid(email_input)
+        if summary_source:
+            summary_text = _grid_text(summary_source)
+            existing = str(inputs_payload.get("summary", ""))
+            if summary_text != existing:
+                inputs_payload["summary"] = summary_text
+                changed = True
 
-            if force_inputs is not None:
-                update_payload["inputs"] = _grid_text(force_inputs)
-            else:
-                needs_inputs = (
-                    not isinstance(current_inputs, str)
-                    or not current_inputs.strip()
-                    or current_inputs.strip().startswith("{")
-                    or current_inputs.strip().startswith("[")
-                )
-                if needs_inputs:
-                    if tool_name:
-                        summary = summarize_tool_call_for_grid(tool_name, tool_args or {})
-                    elif llm_payload is not None:
-                        summary = summarize_llm_for_grid(llm_payload)
-                    else:
-                        summary = summarize_email_for_grid(email_input or {})
-                    update_payload["inputs"] = _grid_text(summary)
+    if outputs is not None:
+        if isinstance(outputs, Mapping):
+            outputs_payload.update(dict(outputs))
+        elif isinstance(outputs, str):
+            outputs_payload["summary"] = _grid_text(outputs)
+        else:
+            outputs_payload["summary"] = _grid_text(strip_markdown_to_text(outputs))
+        changed = True
+    elif llm_payload is not None and "summary" not in outputs_payload:
+        summary_text = _grid_text(summarize_llm_for_grid(llm_payload))
+        existing = str(outputs_payload.get("summary", ""))
+        if summary_text != existing:
+            outputs_payload["summary"] = summary_text
+            changed = True
 
-            if outputs is not None:
-                if isinstance(outputs, str):
-                    update_payload["outputs"] = _grid_text(outputs)
-                else:
-                    update_payload["outputs"] = _grid_text(strip_markdown_to_text(outputs))
-            else:
-                needs_outputs = (
-                    not isinstance(current_outputs, str)
-                    or current_outputs.strip() in {"", "{}", "[]"}
-                )
-                if needs_outputs and llm_payload is not None:
-                    update_payload["outputs"] = _grid_text(summarize_llm_for_grid(llm_payload))
+    if metadata and update_metadata:
+        metadata_payload.update(metadata)
+        changed = True
 
-            if metadata and update_metadata:
-                merged_metadata = {}
-                try:
-                    if isinstance(root.metadata, Mapping):
-                        merged_metadata.update(root.metadata)
-                except Exception:
-                    pass
-                merged_metadata.update(metadata)
-                update_payload["metadata"] = merged_metadata
+    if extra and update_extra:
+        extra_payload.update(extra)
+        changed = True
 
-            if extra and update_extra:
-                merged_extra = {}
-                try:
-                    if isinstance(root.extra, Mapping):
-                        merged_extra.update(root.extra)
-                except Exception:
-                    pass
-                merged_extra.update(extra)
-                update_payload["extra"] = merged_extra
+    if tags is not None:
+        base_tags = list(getattr(run_tree_obj, "tags", []) or [])
+        candidate = list(tags)
+        if append_tags:
+            candidate = base_tags + candidate
+        deduped = _dedupe_preserve_order(str(tag) for tag in candidate if tag)
+        if deduped != base_tags:
+            run_tree_obj.tags = deduped
+            changed = True
 
-            if name:
-                update_payload["name"] = str(name)
+    if metadata_payload:
+        extra_payload["metadata"] = metadata_payload
 
-            if tags is not None:
-                try:
-                    existing = list(getattr(root, "tags", None) or [])
-                except Exception:
-                    existing = []
-                if append_tags:
-                    candidate = list(existing)
-                    candidate.extend(tags)
-                else:
-                    candidate = list(tags)
-                update_payload["tags"] = _dedupe_preserve_order(str(tag) for tag in candidate if tag)
+    if outputs_payload:
+        run_tree_obj.outputs = outputs_payload
 
-            if not update_payload:
-                _debug_log(f"maybe_update_run_io: nothing to update for run {root_id}")
-                return False
+    if inputs_payload:
+        run_tree_obj.inputs = inputs_payload
 
-            client.update_run(root_id, **update_payload)
-            return True
-        except Exception as exc:
-            _debug_log(f"maybe_update_run_io: update failed ({exc}) on attempt {attempt}")
-            if attempt >= retries:
-                return False
-            time.sleep(jitter + random.random() * jitter)
-    return False
+    if extra_payload:
+        run_tree_obj.extra = extra_payload
+
+    if name:
+        run_tree_obj.name = str(name)
+
+    return changed
 
 
 def prime_parent_run(
@@ -617,7 +732,7 @@ class TraceRunHandle:
             else:
                 kwargs: dict[str, Any] = {}
                 if self._outputs_summary is not None:
-                    kwargs["outputs"] = _grid_text(self._outputs_summary)
+                    kwargs["outputs"] = {"summary": _grid_text(self._outputs_summary)}
                 self._run.end(**kwargs)
         except Exception:
             pass
@@ -652,7 +767,7 @@ def trace_stage(
     Yields a :class:`TraceRunHandle` when tracing is active; otherwise ``None``.
     """
 
-    if RunTree is None or get_current_run_tree is None:
+    if (_TRACE_CONTEXT is None and RunTree is None) or get_current_run_tree is None:
         yield None
         return
 
@@ -665,22 +780,23 @@ def trace_stage(
         yield None
         return
 
-    try:
-        stage_tags = default_trace_tags(tags)
-        child = parent.create_child(
-            name=name,
-            run_type=run_type,
-            inputs=_grid_text(inputs_summary),
-            metadata=dict(metadata or {}),
-            extra=dict(extra or {}),
-            tags=stage_tags,
-        )
-        run = child.__enter__()
-    except Exception:
+    stage_tags = default_trace_tags(tags)
+
+    ctx, run = _start_langsmith_run(
+        name,
+        run_type=run_type,
+        inputs_summary=inputs_summary,
+        metadata=metadata,
+        extra=extra,
+        tags=stage_tags,
+        parent=parent,
+    )
+
+    if ctx is None or run is None:
         yield None
         return
 
-    handle = TraceRunHandle(child, run)
+    handle = TraceRunHandle(ctx, run)
     try:
         yield handle
     except Exception as exc:
@@ -699,7 +815,15 @@ def _get_latest_child_run(run_type: str | None = None):
         return None
     if not tree:
         return None
-    children = getattr(tree, "children", None) or []
+    root = tree
+    while getattr(root, "parent_run", None) is not None:
+        root = getattr(root, "parent_run")
+
+    children = getattr(root, "children", None)
+    if not children:
+        children = getattr(root, "child_runs", None)
+    if not children:
+        return None
     for child in reversed(children):
         child_type = str(
             getattr(child, "run_type", "")
@@ -721,7 +845,18 @@ def log_tool_child_run(
 
     child = _get_latest_child_run("tool")
     if child is None:
-        return False
+        fallback = None
+        if get_current_run_tree is not None:
+            try:
+                fallback = get_current_run_tree()
+            except Exception:
+                fallback = None
+        if fallback is None:
+            return False
+        run_type = str(getattr(fallback, "run_type", "")).lower()
+        if run_type != "tool":
+            return False
+        child = fallback
 
     run_id = getattr(child, "id", None)
     if not run_id:
@@ -784,20 +919,25 @@ def invoke_with_root_run(
     metadata: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
     output_transform: Callable[[Any], str | None] | None = None,
+    project_name: str | None = None,
 ) -> Any:
     """Execute ``func`` inside a manually managed LangSmith root run."""
 
-    if RunTree is None:
+    tags = default_trace_tags()
+
+    ctx, run = _start_langsmith_run(
+        root_name,
+        run_type="chain",
+        inputs_summary=input_summary,
+        metadata=metadata,
+        extra=extra,
+        tags=tags,
+        project_name=project_name,
+    )
+
+    if ctx is None or run is None:
         return func()
 
-    root = RunTree(
-        name=root_name,
-        run_type="chain",
-        inputs=_grid_text(input_summary),
-        metadata=dict(metadata or {}),
-        extra=dict(extra or {}),
-    )
-    run = root.__enter__()
     try:
         result = func()
         outputs_summary = None
@@ -815,7 +955,7 @@ def invoke_with_root_run(
         run.end(error=_grid_text(str(exc)))
         raise
     finally:
-        root.__exit__(None, None, None)
+        ctx.__exit__(None, None, None)
 
 
 def format_final_output(state: Mapping[str, Any]) -> str:

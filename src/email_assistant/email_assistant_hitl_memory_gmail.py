@@ -1464,7 +1464,7 @@ agent_builder.add_edge("mark_as_read_node", END)
 response_agent = agent_builder.compile()
 
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, input=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
