@@ -1,31 +1,194 @@
-# Ticket: Improve LangSmith Trace Readability
+# LangSmith Trace Readability — Unified Implementation Plan
 
-## Overview
-LangSmith traces for the Gmail HITL + memory workflow remain difficult to scan. Runs surface raw email JSON in the input column and a lowercase `ai:` summary line in the output column, making it hard for reviewers to understand a case without expanding nested messages. Our current wiring follows default tracing behaviour, but it skips a few LangGraph best practices for metadata and summary presentation.
+**Status:** P1 • **Owners:** Eng • **Areas:** LangGraph, LangSmith, Tool wrappers, Evaluators  
+**Summary:** Eliminate raw JSON and visible markdown tokens from the Runs table. Inputs and Outputs must always be short, plain‑text strings (never dicts). Keep rich markdown and raw payloads only in metadata/extra. Apply the same policy to parent and child runs (LLM + tools) across AGENT, JUDGE, Studio, tests, and live.
 
-## Proposed Work
-- **Tracing helpers**: Introduce `email_assistant/tracing.py` to expose shared `slugify_for_traces(...)` and `truncate_markdown(...)` utilities. Copy the inline slugify helper from `tests/conftest.py:33-55` verbatim so pytest project names remain unchanged, then update `tests/conftest.py` (and any other prior users) to import the shared helper so we only maintain one implementation. The truncation helper should cap markdown produced by `format_gmail_markdown(...)` to ~4096 characters (including the trailing `…`), trimming on a Unicode-aware whitespace boundary (use `re` from the stdlib) and appending that literal ellipsis when shortened. Accept `None`/empty input and return `""`.
-- **Config metadata & naming**: Before `email_assistant.invoke`, enrich the LangGraph `config` with `run_name`, `tags`, and metadata via the shared helper. Run names must use the agent module name (`email_assistant_hitl_memory_gmail`, etc.) as a fixed prefix combined with the slugified case identifier (prefer the dataset `email_name`; fall back to subject, then sender, and finally the first eight hex characters of `str(config["configurable"]["thread_id"])` when both subject and sender are empty). Apply a 32-character cap to the case slug and sanitize with the shared helper (ASCII-only: lowercase alphanumerics, non-ASCII stripped, all other chars collapsed to `-`). Tags should mirror the launcher channel: `["pytest", agent_module, case_slug]` in tests; `scripts/run_real_outputs.py` should emit `["cli", agent_module, case_slug]`; reminder evaluation should use `["cli", agent_module, case_slug_from_filename]`; future non-interactive batch runners can adopt `["script", agent_module, case_slug]`; Studio launches should prefer `["studio", agent_module, case_slug]` (note: a lightweight Studio adapter will be required once we wire up Studio triggering). Metadata should include `{"dataset_case": email_name or None, "email_subject": subject or None, "email_sender": sender or None, "thread_uuid_prefix": thread_uuid[:8] or None}`, normalising blanks to `None` so LangSmith filters stay useful.
-- **Runtime coverage**: Mirror the same config enrichment in non-pytest launchers (`scripts/run_real_outputs.py`, `scripts/run_reminder_evaluation.py`, `src/email_assistant/eval/evaluate_triage.py`). Each entrypoint that loops over emails must clone the base config inside the loop so every run gets a fresh thread id, run name, tags, and metadata derived from the helper; avoid reusing a single thread config across examples. Reminder evaluation should derive its `case_slug` from the JSON filename (e.g., `01_create_reminder.txt` → `create_reminder`). The triage evaluator should generate a fresh UUID-backed config for every dataset row because LangSmith experiments do not inject their own thread IDs.
-- **Readable inputs**: When calling `_safe_log_inputs`, keep the existing minimal dict but also add an `email_markdown` snapshot generated via `format_gmail_markdown(...)`. Pass the markdown through the shared truncation helper before logging to LangSmith. The helper must accept `None`/empty values and return `""` so logging remains a no-op when inputs are missing. Preserve the original dict structure alongside the new field, and note in comments that `format_email_markdown` is the future fallback if new providers land.
-- **Summary via assistant_reply**: Update `mark_as_read_node` in `email_assistant_hitl_memory_gmail.py` to stop appending a synthetic `AIMessage`. Emit the final summary solely through the structured `assistant_reply` field while continuing to populate `tool_trace` and `email_markdown`.
-- **Documentation**: Extend `README_LOCAL.md` with a “LangSmith Tracing” subsection that links to LangGraph’s “Enable LangSmith Tracing” guide, describes the shared helper module (including the tests fixture import), details the run-name/tag convention (launcher-specific tag prefixes plus the Studio adapter note), reiterates the 4 KB markdown guard with the Unicode-aware whitespace trim, and calls out that non-pytest launchers must clone configs per email.
+---
 
-## Clarifications & Constraints
-- Every curated dataset in this repo exposes `subject` and sender metadata, so the case-slug helper will normally resolve before falling back to the `thread_id` prefix; document that fallback for arbitrary inbox inputs.
-- `format_gmail_markdown(...)` already handles both Gmail exports and the simplified dataset schema; note in the README entry that we will swap to `format_email_markdown(...)` if non-Gmail providers arrive.
-- Tests and downstream consumers read `assistant_reply`/`tool_trace` rather than the terminal `AIMessage`, so removing the synthetic summary from `mark_as_read_node` is safe.
+## Motivation
+
+- AGENT runs sometimes show the original email dict in **Input**.
+- JUDGE runs show `{"email_markdown": "…"}` (still JSON) and literal `**` in grid cells.
+- Some **Outputs** still surface raw `function_call` JSON or markdown tokens.
+- Parent Input/Output can look duplicative for devs scanning traces.
+
+**Goal:** Fast, consistent at‑a‑glance review in the Runs list without expanding nodes.
+
+---
+
+## Design Decisions (non‑negotiable)
+
+1. **First‑write‑is‑pretty:** The very first value we send to LangSmith for `run.inputs` (parent or child) is already the **human‑readable string**. No post‑hoc conversion for Inputs.
+2. **String, not dict:** Grid cells show **strings only**. Dicts render as JSON—do not use them for Inputs/Outputs.
+3. **Plain text in grid; markdown in metadata:** Strip formatting tokens for the grid; store the rich markdown copy in `metadata.email_markdown` (capped).
+4. **Pre‑map dataset examples:** Convert AGENT/JUDGE examples to the display string **before** tracing starts.
+5. **Child‑run parity:** Apply the same summarization to tool + LLM child runs; never log raw `arguments`/message arrays in child `inputs`.
+6. **Action‑focused Outputs:** A two‑line, plain‑text summary: outcome token + short rationale/snippet. No `ai:` prefix, no JSON, no `**`.
+7. **Fallback updater stays:** A `finally`‑path, retrying updater patches any stragglers (both inputs and outputs) but should rarely trigger.
+8. **Guardrails in CI:** Hide inputs in CI while rolling out.
+
+---
+
+## Work Items
+
+### 1) Shared helpers (`src/email_assistant/tracing.py`)
+Create/extend a single module used **everywhere** (runners, nodes, tests, Studio):
+
+- `strip_markdown_to_text(md: str) -> str`  
+  Remove `** _ # >` etc.; preserve newlines; collapse long whitespace.
+- `summarize_email_for_grid(email) -> str`  
+  Returns: `Subject — From → To\n<first ~800 chars of body snippet>`.  
+  - Must be **plain text** (use `strip_markdown_to_text`).  
+  - Hard cap ~800 chars with ellipsis; no code fences; no braces if possible.
+- `summarize_tool_call_for_grid(name: str, args: Mapping) -> str`  
+  Example: `[tool] send_email(to=alice@…, subject="Quarterly…", attachments=2)`  
+  - Selective fields + counts only. Never embed raw `args` JSON.
+- `summarize_llm_for_grid(messages|prompt) -> str`  
+  Example: `4 msgs | last user: "please draft a reply about…"`.
+- `truncate_markdown(md: str, max_chars=4096) -> str`  
+  Keep rich copy for the Run detail view. Unicode‑aware trim with ellipsis.
+- (Keep existing slug/tag/name helpers; export them here for single‑source usage.)
+
+> Note: The grid strings must be **type `str`**. Anything structured belongs in `metadata`/`extra`.
+
+---
+
+### 2) Parent run priming (every entrypoint)
+- When starting the top‑level run, set **`inputs` to the string** from `summarize_email_for_grid`.
+- Save **raw input** under `extra.raw_input` (or a reference) and **markdown** under `metadata.email_markdown = truncate_markdown(...)`.
+- Keep run naming/tags/metadata conventions you already implemented; ensure they’re produced via the shared helpers to avoid drift.
+
+---
+
+### 3) Dataset input mapping (AGENT + JUDGE + evaluators + tests)
+- Before any tracing, map each example into the display **string** via `summarize_email_for_grid`.
+- Pass that string as `inputs` when creating/starting the run.
+- Stash the original example under `metadata.example_raw` (not in `inputs`).
+- Apply in:
+  - `scripts/run_real_outputs.py`
+  - `scripts/run_reminder_evaluation.py`
+  - `src/email_assistant/eval/evaluate_triage.py`
+  - Pytest harnesses (`tests/test_response.py`, fixtures)
+- Ensure each loop iteration clones a fresh config (unique thread id + run name + tags + metadata).
+
+---
+
+### 4) Child runs (tools + LLM)
+- **Tool wrappers (e.g., Gmail):** The tool run’s `inputs` must be a **single string** from `summarize_tool_call_for_grid`. Put raw payload in `metadata.tool_raw`.
+- **Function/tool args emitted by LLM:** Replace raw `arguments` dict with a one‑liner string (selected fields + counts). The raw dict goes to metadata only.
+- **LLM runs:** `inputs` is `summarize_llm_for_grid`; do not log full message arrays as a child run input.
+
+---
+
+### 5) Output policy (developer‑friendly)
+- Outputs are concise, plain‑text strings:
+  - Line 1: Outcome token — e.g., `[reply]`, `[no_action]`, `[tool_call] send_email`.
+  - Line 2: Short justification or first ~160–240 chars of reply.
+- No `ai:` prefix, no markdown tokens, no raw tool JSON.
+- Keep full reply + tool trace in `outputs.details`/`metadata` as needed.
+
+---
+
+### 6) Fallback updater (`maybe_update_run_io`)
+- Run in a `finally` block on all paths.
+- If Inputs/Outputs are not strings or contain raw JSON braces, patch both to summarized strings.
+- Retry 2–3 times with jitter; ensure you target the **root** run id.
+- Optional: patch relevant child runs if a framework emitted early (goal is to avoid this).
+
+---
+
+### 7) CI guardrails
+- In CI/pytest set:
+  - `LANGSMITH_HIDE_INPUTS=true`
+  - (Optional) `LANGSMITH_HIDE_OUTPUTS=true`
+- Keep visible in dev/prod once green.
+
+---
+
+## Examples
+
+**Input (grid string):**
+Quick question about API documentation — Alice Smith alice@company.com
+ → Lance Martin lance@company.com
+
+Hi Lance, I was reviewing the API documentation for the new authentication service...
+
+
+**Output (grid string):**
+[reply] Drafted clarification email via template A
+Explained /auth/refresh and /auth/validate, asked if endpoints were intentionally omitted; offered to update docs upon confirmation.
+
+
+**Tool child run (grid string):**
+
+---
 
 ## Acceptance Criteria
-- New LangSmith runs (manual or pytest-driven) display the configured run name (module prefix + sanitized case slug), tags, and metadata, exposing dataset/subject/sender/thread UUID details per the shared fallback order, and each email processed in a loop produces a unique run config.
-- Reminder evaluation and triage experiments show the normalized run name/tag/metadata convention with unique configs per email (slug from dataset name or filename, UUID-derived thread prefix).
-- The Input column renders the formatted markdown email context capped at ~4 KB via the shared truncation helper; raw dicts are no longer exposed by default.
-- The Output column shows the summary text without an `ai:` prefix, and the existing automated suite (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) still passes.
-- The shared tracing helper is consumed by both tests (e.g., `tests/conftest.py`) and runtime logging paths for slugification and markdown truncation so Studio, pytest, and scripts produce consistent traces.
-- Repository documentation reflects the tracing best practices, the Gmail-specific assumptions, the helper module, the assistant-reply-only summary approach, and guidance for non-pytest launchers to adopt per-email metadata enrichment.
 
-## References
-- Team guidance on run naming/tags and metadata fallbacks (internal notes, June 2025).
-- Relevant code: `tests/agent_test_utils.py:99-149`, `tests/test_response.py:60-140`, `tests/conftest.py:33-55`, `scripts/run_real_outputs.py:70-140`, `scripts/run_reminder_evaluation.py:60-104`, `src/email_assistant/eval/evaluate_triage.py:1-140`, `src/email_assistant/email_assistant_hitl_memory_gmail.py:1180-1232`.
-- New helper location: `src/email_assistant/tracing.py` (to be introduced).
-- LangGraph docs: “Enable LangSmith Tracing” how-to (`/langchain-ai/langgraph` → tracing topic).
+1. **Inputs (all environments)**  
+   - Runs list shows a **plain string** (no JSON braces, no markdown tokens).  
+   - ≤ ~800 chars; includes `Subject — From → To` + body snippet.
+2. **Outputs**  
+   - Plain‑text, 1–2 lines; includes outcome token; no `ai:`/JSON/markdown tokens.
+3. **Child runs**  
+   - Tool + LLM child `inputs` are plain strings; no raw `arguments` or full message arrays in grid.
+4. **Metadata**  
+   - `metadata.email_markdown` contains a ≤4 KB rich snapshot.  
+   - Raw payloads live in `metadata`/`extra` only.
+5. **Dataset runners**  
+   - AGENT + JUDGE always pre‑map examples to string inputs; unique per‑email config per run.
+6. **Stability**  
+   - Fallback updater corrects any regressions (both inputs and outputs), with retries.
+
+---
+
+## Test Plan
+
+**Unit**
+- `strip_markdown_to_text` removes tokens, preserves newlines.
+- `summarize_email_for_grid` returns string ≤ 800 chars, no braces, no markdown.
+- `summarize_tool_call_for_grid` exposes selected fields + counts only.
+
+**Integration (pytest)**
+- AGENT + JUDGE suites: assert `type(run.inputs) is str`, **no `{`** and **no `**`** in Inputs/Outputs.
+- Tool path vs. no‑tool path produce clean Outputs.
+- Error paths still end with tidy Inputs/Outputs (updater verified).
+
+**Manual**
+- In LangSmith Runs (AGENT/JUDGE/Studio/live), scan that all rows meet criteria; expand a run to confirm markdown + raw are present in metadata, not grid.
+
+---
+
+## Rollout Steps
+
+1. Land helpers + parent priming.
+2. Convert dataset runners to **pre‑trace mapping**.
+3. Wrap tool + LLM child runs.
+4. Keep updater with retries; enable CI hide‑inputs during rollout.
+5. Remove CI hide‑inputs once validated across suites.
+
+---
+
+## Risks & Mitigations
+
+- **Loss of debug detail in grid** → Full markdown + raw payloads live in metadata/extra and in the detailed run view.  
+- **Framework double‑logging/races** → First‑write‑is‑pretty + finally‑path updater with retries.  
+- **Perf of markdown stripping** → Lightweight regex; early caps on string length.
+
+---
+
+## File/Code Touchpoints
+
+- `src/email_assistant/tracing.py` — add/export summarizers + strip/trim helpers (single source of truth).  
+- Tool wrappers (Gmail, etc.) — use `summarize_tool_call_for_grid` for child `inputs`, stash raw in metadata.  
+- LLM wrappers — summarize prompts; never log full message arrays in child `inputs`.  
+- Runners: `scripts/run_real_outputs.py`, `scripts/run_reminder_evaluation.py`, `src/email_assistant/eval/evaluate_triage.py` — pre‑trace mapping + fresh per‑email configs.  
+- Tests/fixtures — import helpers; add assertions listed in **Test Plan**.
+
+---
+
+## Notes
+
+- Keep your existing run naming/tagging conventions; just ensure all entrypoints import the same helpers.  
+- The plan intentionally separates **developer‑scan strings** (grid) from **rich debugging artifacts** (metadata/extra).
+
