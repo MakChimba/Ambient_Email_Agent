@@ -1,4 +1,5 @@
-from typing import Literal
+from typing import Any, Literal
+from collections.abc import Mapping
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,7 @@ from email_assistant.tracing import (
     log_llm_child_run,
     log_tool_child_run,
     format_final_output,
+    trace_stage,
 )
 from email_assistant.tools.reminders import get_default_store
 from dotenv import load_dotenv
@@ -54,6 +56,9 @@ tools = get_tools([
     "Done",
 ], include_gmail=True)
 tools_by_name = get_tools_by_name(tools)
+
+TRACE_AGENT_LABEL = "email_assistant_hitl_memory_gmail"
+TRACE_AGENT_TAGS = ["gmail", "hitl", "memory"]
 
 
 def _eval_mode_enabled() -> bool:
@@ -187,6 +192,33 @@ llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_o
 llm_with_tools = get_llm(temperature=0.0, model=TOOL_MODEL_NAME).bind_tools(tools, tool_choice="any")
 
 
+def _resolve_thread_id(state: State) -> str | None:
+    """Best-effort extraction of thread identifiers from the LangGraph state."""
+
+    candidates: list[Any] = []
+
+    if isinstance(state, Mapping):
+        candidates.append(state.get("thread_id"))
+        config = state.get("config")
+        if isinstance(config, Mapping):
+            candidates.append(config.get("thread_id"))
+            configurable = config.get("configurable")
+            if isinstance(configurable, Mapping):
+                candidates.append(configurable.get("thread_id"))
+
+    config_attr = getattr(state, "config", None)
+    if isinstance(config_attr, Mapping):
+        candidates.append(config_attr.get("thread_id"))
+        configurable = config_attr.get("configurable")
+        if isinstance(configurable, Mapping):
+            candidates.append(configurable.get("thread_id"))
+
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return None
+
+
 def get_memory(store, namespace, default_content=None):
     """Get memory from the store or initialize with default if it doesn't exist."""
     user_preferences = store.get(namespace, "user_preferences")
@@ -229,22 +261,18 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
     email_input = state["email_input"]
     author, to, subject, email_thread, email_id = parse_gmail(email_input)
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+    thread_id = _resolve_thread_id(state)
 
     prime_parent_run(
         email_input=email_input,
         email_markdown=email_markdown,
         extra_update={"email_id": email_id},
+        agent_label=TRACE_AGENT_LABEL,
+        tags=TRACE_AGENT_TAGS,
+        thread_id=thread_id,
+        run_label=email_id,
+        metadata_update={"router_model": ROUTER_MODEL_NAME},
     )
-
-    # --- Reminder Logic: Part 1: Cancel on detected reply ---
-    reply_detected = False
-    user_email = os.getenv("REMINDER_NOTIFY_EMAIL")
-    # Check if the author of the current email contains the user's email.
-    if user_email and user_email in author:
-        cancelled_count = reminder_store.cancel_reminder(thread_id=email_id)
-        if cancelled_count > 0:
-            print(f"🔔 Reminder cancelled for thread {email_id} because a reply from '{user_email}' was detected in the From header.")
-            reply_detected = True
 
     user_prompt = triage_user_prompt.format(author=author, to=to, subject=subject, email_thread=email_thread)
     triage_instructions = get_memory(store, ("email_assistant", "triage_preferences"), default_triage_instructions)
@@ -255,52 +283,90 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
         {"role": "user", "content": user_prompt},
     ]
 
-    # Try LLM triage; fall back to respond on failure
-    try:
-        result = llm_router.invoke(router_prompt)
-        response_payload = (
-            result.model_dump(exclude_none=True)
-            if hasattr(result, "model_dump")
-            else getattr(result, "__dict__", result)
-        )
-        log_llm_child_run(prompt=router_prompt, response=response_payload)
-        classification = getattr(result, "classification", "respond")
-    except Exception as e:
-        print(f"[triage] Router failed, defaulting to respond: {e}")
-        classification = "respond"
+    stage_inputs = f"triage {subject or '(no subject)'}"
+    classification = "respond"
+    goto: str = "response_agent"
+    update: dict[str, Any] = {
+        "classification_decision": "respond",
+        "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+    }
 
-    # --- Reminder Logic: Part 2: Create on Triage Decision ---
-    if classification in {"respond", "notify"}:
-        print(f"🔔 Classification: {classification.upper()} - This email requires attention.")
-        # If a reply was detected and we cancelled an existing reminder, do NOT create a new one.
-        if not reply_detected:
-            default_hours = int(os.getenv("REMINDER_DEFAULT_HOURS", 48))
-            due_at = datetime.now(timezone.utc) + timedelta(hours=default_hours)
-            reminder_store.add_reminder(
-                thread_id=email_id,
-                subject=subject,
-                due_at=due_at,
-                reason=f"Triaged as '{classification}'"
+    with trace_stage(
+        "triage_router",
+        run_type="chain",
+        inputs_summary=stage_inputs,
+        tags=["triage", "router"],
+        metadata={"email_id": email_id, "thread_id": thread_id},
+        extra={
+            "router_prompt": router_prompt,
+            "triage_instructions": triage_instructions,
+            "email_markdown": email_markdown,
+        },
+    ) as trace:
+        # --- Reminder Logic: Part 1: Cancel on detected reply ---
+        reply_detected = False
+        user_email = os.getenv("REMINDER_NOTIFY_EMAIL")
+        if user_email and user_email in author:
+            cancelled_count = reminder_store.cancel_reminder(thread_id=email_id)
+            if cancelled_count > 0:
+                print(
+                    f"🔔 Reminder cancelled for thread {email_id} because a reply from '{user_email}' was detected in the From header."
+                )
+                reply_detected = True
+
+        # Try LLM triage; fall back to respond on failure
+        try:
+            result = llm_router.invoke(router_prompt)
+            response_payload = (
+                result.model_dump(exclude_none=True)
+                if hasattr(result, "model_dump")
+                else getattr(result, "__dict__", result)
             )
-            print(f"INFO: Reminder set for thread {email_id} due at {due_at.isoformat()}")
-        
-        if classification == "respond":
-            goto = "response_agent"
-            update = {"classification_decision": classification, "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}]}
-        else: # notify
-            goto = "triage_interrupt_handler"
-            update = {"classification_decision": classification}
+            log_llm_child_run(prompt=router_prompt, response=response_payload)
+            classification = getattr(result, "classification", "respond")
+        except Exception as exc:
+            print(f"[triage] Router failed, defaulting to respond: {exc}")
+            classification = "respond"
 
-    elif classification == "ignore":
-        print(f"🚫 Classification: IGNORE - This email can be safely ignored")
-        goto = END
-        update = {"classification_decision": classification}
-    else:
-        # Default to respond for unexpected outputs to keep flow moving
-        print(f"[triage] Unexpected classification '{classification}', defaulting to respond")
-        goto = "response_agent"
-        update = {"classification_decision": "respond", "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}]}
-    
+        # --- Reminder Logic: Part 2: Create on Triage Decision ---
+        if classification in {"respond", "notify"}:
+            print(f"🔔 Classification: {classification.upper()} - This email requires attention.")
+            if not reply_detected:
+                default_hours = int(os.getenv("REMINDER_DEFAULT_HOURS", 48))
+                due_at = datetime.now(timezone.utc) + timedelta(hours=default_hours)
+                reminder_store.add_reminder(
+                    thread_id=email_id,
+                    subject=subject,
+                    due_at=due_at,
+                    reason=f"Triaged as '{classification}'",
+                )
+                print(f"INFO: Reminder set for thread {email_id} due at {due_at.isoformat()}")
+
+            if classification == "respond":
+                goto = "response_agent"
+                update = {
+                    "classification_decision": classification,
+                    "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+                }
+            else:
+                goto = "triage_interrupt_handler"
+                update = {"classification_decision": classification}
+
+        elif classification == "ignore":
+            print(f"🚫 Classification: IGNORE - This email can be safely ignored")
+            goto = END
+            update = {"classification_decision": classification}
+        else:
+            print(f"[triage] Unexpected classification '{classification}', defaulting to respond")
+            goto = "response_agent"
+            update = {
+                "classification_decision": "respond",
+                "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+            }
+
+        if trace:
+            trace.set_outputs(f"classification={classification}; goto={goto}")
+
     return Command(goto=goto, update=update)
 
 
@@ -314,23 +380,40 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
         "config": {"allow_ignore": True, "allow_respond": True, "allow_edit": False, "allow_accept": False},
         "description": email_markdown,
     }
-    response = _maybe_interrupt([request])[0]
+    thread_id = _resolve_thread_id(state)
+    goto: str = END
 
-    if response["type"] == "response":
-        user_input = response["args"]
-        messages.append({"role": "user", "content": f"User wants to reply to the email. Use this feedback to respond: {user_input}"})
-        update_memory(store, ("email_assistant", "triage_preferences"), [{"role": "user", "content": "The user decided to respond to the email, so update the triage preferences to capture this."}] + messages)
-        goto = "response_agent"
-    elif response["type"] == "ignore":
-        messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
-        update_memory(store, ("email_assistant", "triage_preferences"), messages)
-        goto = END
-    elif response["type"] == "accept":
-        # Accepting a notification ends the workflow without further action
-        print("INFO: User accepted notification. Ending workflow.")
-        goto = END
-    else:
-        raise ValueError(f"Invalid response: {response}")
+    with trace_stage(
+        "triage_interrupt_handler",
+        run_type="chain",
+        inputs_summary=f"triage notify -> {state['classification_decision']}",
+        tags=["triage", "hitl"],
+        metadata={"email_id": email_id, "thread_id": thread_id},
+        extra={"request": request},
+    ) as trace:
+        response = _maybe_interrupt([request])[0]
+
+        if response["type"] == "response":
+            user_input = response["args"]
+            messages.append({"role": "user", "content": f"User wants to reply to the email. Use this feedback to respond: {user_input}"})
+            update_memory(
+                store,
+                ("email_assistant", "triage_preferences"),
+                [{"role": "user", "content": "The user decided to respond to the email, so update the triage preferences to capture this."}] + messages,
+            )
+            goto = "response_agent"
+        elif response["type"] == "ignore":
+            messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
+            update_memory(store, ("email_assistant", "triage_preferences"), messages)
+            goto = END
+        elif response["type"] == "accept":
+            print("INFO: User accepted notification. Ending workflow.")
+            goto = END
+        else:
+            raise ValueError(f"Invalid response: {response}")
+
+        if trace:
+            trace.set_outputs(f"goto={goto}; response={response['type']}")
 
     return Command(goto=goto, update={"messages": messages})
 
@@ -358,6 +441,7 @@ def llm_call(state: State, store: BaseStore):
         author, to, subject, email_thread, email_id = parse_gmail(state.get("email_input", {}))
     except Exception:
         author = to = subject = email_thread = email_id = ""
+    thread_id = _resolve_thread_id(state)
 
     def extract_email(addr: str) -> str:
         if not addr:
@@ -741,30 +825,53 @@ def llm_call(state: State, store: BaseStore):
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
 
         return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
-    try:
-        msg = llm_with_tools.invoke(prompt)
-        response_payload = (
-            msg.model_dump(exclude_none=True)
-            if hasattr(msg, "model_dump")
-            else getattr(msg, "__dict__", msg)
-        )
-        log_llm_child_run(prompt=prompt, response=response_payload)
-    except Exception:
-        msg = None
-    if not getattr(msg, "tool_calls", None):
-        retry = [{"role": "system", "content": "Your next output must be exactly one tool call with arguments, no assistant text."}] + prompt
+    msg = None
+    with trace_stage(
+        "response_agent.llm",
+        run_type="llm",
+        inputs_summary=f"prompt_messages={len(prompt)}",
+        tags=["response_agent", "llm"],
+        metadata={"email_id": email_id, "thread_id": thread_id},
+    ) as trace:
         try:
-            msg_retry = llm_with_tools.invoke(retry)
-            response_payload_retry = (
-                msg_retry.model_dump(exclude_none=True)
-                if hasattr(msg_retry, "model_dump")
-                else getattr(msg_retry, "__dict__", msg_retry)
+            msg = llm_with_tools.invoke(prompt)
+            response_payload = (
+                msg.model_dump(exclude_none=True)
+                if hasattr(msg, "model_dump")
+                else getattr(msg, "__dict__", msg)
             )
-            log_llm_child_run(prompt=retry, response=response_payload_retry)
-            if getattr(msg_retry, "tool_calls", None):
-                msg = msg_retry
+            log_llm_child_run(prompt=prompt, response=response_payload)
         except Exception:
             msg = None
+
+        if not getattr(msg, "tool_calls", None):
+            retry = [
+                {
+                    "role": "system",
+                    "content": "Your next output must be exactly one tool call with arguments, no assistant text.",
+                }
+            ] + prompt
+            try:
+                msg_retry = llm_with_tools.invoke(retry)
+                response_payload_retry = (
+                    msg_retry.model_dump(exclude_none=True)
+                    if hasattr(msg_retry, "model_dump")
+                    else getattr(msg_retry, "__dict__", msg_retry)
+                )
+                log_llm_child_run(prompt=retry, response=response_payload_retry)
+                if getattr(msg_retry, "tool_calls", None):
+                    msg = msg_retry
+            except Exception:
+                msg = None
+
+        if trace:
+            tool_names: list[str] = []
+            try:
+                tool_names = [tc.get("name") for tc in getattr(msg, "tool_calls", []) or []]
+            except Exception:
+                tool_names = []
+            summary = "tool_plan=" + (",".join(name for name in tool_names if name) if tool_names else "none")
+            trace.set_outputs(summary)
     # Post-process LLM tool plan: enforce intent-specific plans and termination
     if getattr(msg, "tool_calls", None):
         text = text_for_heuristic
@@ -1016,148 +1123,167 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
     ai_message = state["messages"][-1]
     result = [ai_message]
     goto = "llm_call"
-    for tool_call in ai_message.tool_calls:
-        if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question", "mark_as_spam_tool"]:
-            observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
-            result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
-            if tool_call["name"] == "Done":
-                goto = "mark_as_read_node"
-            continue
-        email_input = state["email_input"]
-        author, to, subject, email_thread, email_id = parse_gmail(email_input)
-        original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-        email_body_lower = (email_thread or "").lower()
-        doc_review_context = (
-            "review" in email_body_lower and ("friday" in email_body_lower or "deadline" in email_body_lower)
-        )
-        swim_context = any(keyword in email_body_lower for keyword in ["swimming", "swim", "register", "class", "daughter"])
+    try:
+        tool_names_summary = [tc.get("name") for tc in ai_message.tool_calls]
+    except Exception:
+        tool_names_summary = []
+    email_input_cached = state.get("email_input", {})
+    thread_id = _resolve_thread_id(state)
+    try:
+        _author_meta, _to_meta, _subject_meta, _body_meta, email_id_meta = parse_gmail(email_input_cached)
+    except Exception:
+        email_id_meta = None
 
-        # Build a Gmail-aware display for send_email_tool so HITL shows the real recipient
-        tool_display = None
-        if tool_call["name"] == "send_email_tool":
-            args = tool_call.get("args", {})
-            response_text = args.get("response_text") or ""
-            response_lower = response_text.lower()
-            if doc_review_context:
-                additions = []
-                if not any(keyword in response_lower for keyword in ["review", "technical"]):
-                    additions.append("I'll review the technical specifications in detail.")
-                if not any(keyword in response_lower for keyword in ["friday", "deadline"]):
-                    additions.append("Expect my feedback before Friday.")
-                if additions:
+    with trace_stage(
+        "response_agent.interrupt_handler",
+        run_type="chain",
+        inputs_summary=f"tool_calls={len(tool_names_summary)}",
+        tags=["response_agent", "hitl"],
+        metadata={"email_id": email_id_meta, "thread_id": thread_id},
+        extra={"tool_names": tool_names_summary},
+    ) as trace:
+        for tool_call in ai_message.tool_calls:
+            if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question", "mark_as_spam_tool"]:
+                observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
+                result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+                if tool_call["name"] == "Done":
+                    goto = "mark_as_read_node"
+                continue
+            email_input = state["email_input"]
+            author, to, subject, email_thread, email_id = parse_gmail(email_input)
+            original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+            email_body_lower = (email_thread or "").lower()
+            doc_review_context = (
+                "review" in email_body_lower and ("friday" in email_body_lower or "deadline" in email_body_lower)
+            )
+            swim_context = any(keyword in email_body_lower for keyword in ["swimming", "swim", "register", "class", "daughter"])
+    
+            # Build a Gmail-aware display for send_email_tool so HITL shows the real recipient
+            tool_display = None
+            if tool_call["name"] == "send_email_tool":
+                args = tool_call.get("args", {})
+                response_text = args.get("response_text") or ""
+                response_lower = response_text.lower()
+                if doc_review_context:
+                    additions = []
+                    if not any(keyword in response_lower for keyword in ["review", "technical"]):
+                        additions.append("I'll review the technical specifications in detail.")
+                    if not any(keyword in response_lower for keyword in ["friday", "deadline"]):
+                        additions.append("Expect my feedback before Friday.")
+                    if additions:
+                        trimmed = response_text.rstrip()
+                        if trimmed and trimmed[-1] not in ".!?":
+                            trimmed += "."
+                        updated_text = (trimmed + " " + " ".join(additions)).strip()
+                        args["response_text"] = updated_text
+                    response_text = updated_text
+                    response_lower = response_text.lower()
+                if any(keyword in email_body_lower for keyword in ["45-minute", "45 minute"]) and not any(
+                    keyword in response_lower for keyword in ["45-minute", "45 minute"]
+                ):
                     trimmed = response_text.rstrip()
                     if trimmed and trimmed[-1] not in ".!?":
                         trimmed += "."
-                    updated_text = (trimmed + " " + " ".join(additions)).strip()
+                    updated_text = (
+                        trimmed
+                        + " I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly."
+                    ).strip()
                     args["response_text"] = updated_text
-                response_text = updated_text
-                response_lower = response_text.lower()
-            if any(keyword in email_body_lower for keyword in ["45-minute", "45 minute"]) and not any(
-                keyword in response_lower for keyword in ["45-minute", "45 minute"]
-            ):
-                trimmed = response_text.rstrip()
-                if trimmed and trimmed[-1] not in ".!?":
-                    trimmed += "."
-                updated_text = (
-                    trimmed
-                    + " I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly."
-                ).strip()
-                args["response_text"] = updated_text
-                response_text = updated_text
-                response_lower = response_text.lower()
-            requested_days = []
-            for day in ["tuesday", "thursday"]:
-                if day in email_body_lower and day not in response_lower:
-                    requested_days.append(day.capitalize())
-            if requested_days:
-                trimmed = response_text.rstrip()
-                if trimmed and trimmed[-1] not in ".!?":
-                    trimmed += "."
-                if len(requested_days) == 2:
-                    day_sentence = "Tuesday or Thursday afternoon both work for me."
-                else:
-                    day_sentence = f"{requested_days[0]} afternoon works for me."
-                updated_text = (trimmed + " " + day_sentence).strip()
-                args["response_text"] = updated_text
-                response_text = updated_text
-                response_lower = response_text.lower()
-            if swim_context and not any(keyword in response_lower for keyword in ["reserve", "register"]):
-                trimmed = response_text.rstrip()
-                if trimmed and trimmed[-1] not in ".!?":
-                    trimmed += "."
-                updated_text = (trimmed + " Please reserve a spot for my daughter in the intermediate class.").strip()
-                args["response_text"] = updated_text
-                response_text = updated_text
-                response_lower = response_text.lower()
-            def _extract_email(addr: str) -> str:
-                if not addr:
-                    return ""
-                if "<" in addr and ">" in addr:
-                    return addr.split("<")[-1].split(">")[0].strip()
-                return addr.strip()
-
-            reply_to_addr = _extract_email(author)  # reply target is the original sender
-            from_addr = _extract_email(to)         # we send from the account in the To header
-            subj = subject or "Response"
-            if not subj.lower().startswith("re:"):
-                subj = f"Re: {subj}"
-            response_text = tool_call["args"].get("response_text") or ""
-            tool_display = f"""# Email Draft (Gmail)
-
-**To**: {reply_to_addr}
-**From**: {from_addr}
-**Subject**: {subj}
-
-{response_text}
-"""
-        else:
-            tool_display = format_for_display(tool_call)
-        description = original_email_markdown + tool_display
-        config = {}
-        if tool_call["name"] == "send_email_tool" or tool_call["name"] == "schedule_meeting_tool":
-            config = {"allow_ignore": True, "allow_respond": True, "allow_edit": True, "allow_accept": True}
-        elif tool_call["name"] == "Question":
-            config = {"allow_ignore": True, "allow_respond": True, "allow_edit": False, "allow_accept": False}
-        elif tool_call["name"] == "mark_as_spam_tool":
-            config = {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}
-        else:
-            raise ValueError(f"Invalid tool call: {tool_call['name']}")
-
-        request = {"action_request": {"action": tool_call["name"], "args": tool_call["args"]}, "config": config, "description": description}
-        response = _maybe_interrupt([request])[0]
-
-        if response["type"] == "accept":
-            observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
-            result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
-        elif response["type"] == "edit":
-            edited_args = response["args"]["args"]
-            current_id = tool_call["id"]
-            updated_tool_calls = [tc for tc in ai_message.tool_calls if tc["id"] != current_id] + [{"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}]
-            result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
-            observation = _safe_tool_invoke(tool_call["name"], edited_args)
-            result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-            if tool_call["name"] == "send_email_tool":
-                update_memory(store, ("email_assistant", "response_preferences"), [{"role": "user", "content": f"User edited the email response. Here is the initial email generated by the assistant: {tool_call['args']}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-            elif tool_call["name"] == "schedule_meeting_tool":
-                update_memory(store, ("email_assistant", "cal_preferences"), [{"role": "user", "content": f"User edited the calendar invitation. Here is the initial calendar invitation generated by the assistant: {tool_call['args']}. Here is the edited calendar invitation: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-        elif response["type"] == "ignore":
-            result.append({"role": "tool", "content": f"User ignored this {tool_call['name']} draft. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
-            goto = END
-            update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": f"The user ignored the draft. Update triage preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-        elif response["type"] == "response":
-            user_feedback = response["args"]
-            if tool_call["name"] == "Question":
-                if any(k in str(user_feedback).lower() for k in ["spam", "phish", "junk"]):
-                    email_input = state["email_input"]
-                    author, to, subject, email_thread, email_id = parse_gmail(email_input)
-                    original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-                    confirm = {"action_request": {"action": "mark_as_spam_tool", "args": {"email_id": email_id}}, "config": {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}, "description": original_email_markdown + "\n\nUser flagged as spam. Move this thread to Spam?"}
-                    followup = _maybe_interrupt([confirm])[0]
-                    if followup["type"] == "accept":
-                        # Emit a synthetic tool_call so logs/tests register the action
-                        from langchain_core.messages import AIMessage
-                        spam_call = {
-                            "name": "mark_as_spam_tool",
+                    response_text = updated_text
+                    response_lower = response_text.lower()
+                requested_days = []
+                for day in ["tuesday", "thursday"]:
+                    if day in email_body_lower and day not in response_lower:
+                        requested_days.append(day.capitalize())
+                if requested_days:
+                    trimmed = response_text.rstrip()
+                    if trimmed and trimmed[-1] not in ".!?":
+                        trimmed += "."
+                    if len(requested_days) == 2:
+                        day_sentence = "Tuesday or Thursday afternoon both work for me."
+                    else:
+                        day_sentence = f"{requested_days[0]} afternoon works for me."
+                    updated_text = (trimmed + " " + day_sentence).strip()
+                    args["response_text"] = updated_text
+                    response_text = updated_text
+                    response_lower = response_text.lower()
+                if swim_context and not any(keyword in response_lower for keyword in ["reserve", "register"]):
+                    trimmed = response_text.rstrip()
+                    if trimmed and trimmed[-1] not in ".!?":
+                        trimmed += "."
+                    updated_text = (trimmed + " Please reserve a spot for my daughter in the intermediate class.").strip()
+                    args["response_text"] = updated_text
+                    response_text = updated_text
+                    response_lower = response_text.lower()
+                def _extract_email(addr: str) -> str:
+                    if not addr:
+                        return ""
+                    if "<" in addr and ">" in addr:
+                        return addr.split("<")[-1].split(">")[0].strip()
+                    return addr.strip()
+    
+                reply_to_addr = _extract_email(author)  # reply target is the original sender
+                from_addr = _extract_email(to)         # we send from the account in the To header
+                subj = subject or "Response"
+                if not subj.lower().startswith("re:"):
+                    subj = f"Re: {subj}"
+                response_text = tool_call["args"].get("response_text") or ""
+                tool_display = f"""# Email Draft (Gmail)
+    
+    **To**: {reply_to_addr}
+    **From**: {from_addr}
+    **Subject**: {subj}
+    
+    {response_text}
+    """
+            else:
+                tool_display = format_for_display(tool_call)
+            description = original_email_markdown + tool_display
+            config = {}
+            if tool_call["name"] == "send_email_tool" or tool_call["name"] == "schedule_meeting_tool":
+                config = {"allow_ignore": True, "allow_respond": True, "allow_edit": True, "allow_accept": True}
+            elif tool_call["name"] == "Question":
+                config = {"allow_ignore": True, "allow_respond": True, "allow_edit": False, "allow_accept": False}
+            elif tool_call["name"] == "mark_as_spam_tool":
+                config = {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}
+            else:
+                raise ValueError(f"Invalid tool call: {tool_call['name']}")
+    
+            request = {"action_request": {"action": tool_call["name"], "args": tool_call["args"]}, "config": config, "description": description}
+            response = _maybe_interrupt([request])[0]
+    
+            if response["type"] == "accept":
+                observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
+                result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+            elif response["type"] == "edit":
+                edited_args = response["args"]["args"]
+                current_id = tool_call["id"]
+                updated_tool_calls = [tc for tc in ai_message.tool_calls if tc["id"] != current_id] + [{"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}]
+                result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
+                observation = _safe_tool_invoke(tool_call["name"], edited_args)
+                result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
+                if tool_call["name"] == "send_email_tool":
+                    update_memory(store, ("email_assistant", "response_preferences"), [{"role": "user", "content": f"User edited the email response. Here is the initial email generated by the assistant: {tool_call['args']}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
+                elif tool_call["name"] == "schedule_meeting_tool":
+                    update_memory(store, ("email_assistant", "cal_preferences"), [{"role": "user", "content": f"User edited the calendar invitation. Here is the initial calendar invitation generated by the assistant: {tool_call['args']}. Here is the edited calendar invitation: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
+            elif response["type"] == "ignore":
+                result.append({"role": "tool", "content": f"User ignored this {tool_call['name']} draft. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
+                goto = END
+                update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": f"The user ignored the draft. Update triage preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
+            elif response["type"] == "response":
+                user_feedback = response["args"]
+                if tool_call["name"] == "Question":
+                    if any(k in str(user_feedback).lower() for k in ["spam", "phish", "junk"]):
+                        email_input = state["email_input"]
+                        author, to, subject, email_thread, email_id = parse_gmail(email_input)
+                        original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+                        confirm = {"action_request": {"action": "mark_as_spam_tool", "args": {"email_id": email_id}}, "config": {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}, "description": original_email_markdown + "\n\nUser flagged as spam. Move this thread to Spam?"}
+                        followup = _maybe_interrupt([confirm])[0]
+                        if followup["type"] == "accept":
+                            # Emit a synthetic tool_call so logs/tests register the action
+                            from langchain_core.messages import AIMessage
+                            spam_call = {
+                                "name": "mark_as_spam_tool",
                             "args": {"email_id": email_id},
                             "id": "mark_spam",
                         }
@@ -1177,39 +1303,68 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                 elif tool_call["name"] == "schedule_meeting_tool":
                     update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
 
+        if trace:
+            handled = max(len(result) - 1, 0)
+            trace.set_outputs(f"goto={goto}; handled={handled}")
+
     return Command(goto=goto, update={"messages": result})
 
 
 def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handler", "mark_as_read_node", "llm_call"]:
     """Route to tool handler, or end if Done tool called"""
-    if state["messages"][-1].tool_calls:
-        if any(tc["name"] == "Done" for tc in state["messages"][-1].tool_calls):
-            # Special case: system/no-reply notifications should not draft emails.
-            # If the sender is a no-reply address or the email content says "do not reply",
-            # allow Done to terminate even if no send_email_tool was used.
-            try:
-                email_input = state.get("email_input", {})
-                author, to, subject, email_thread, _email_id = parse_gmail(email_input)
+    email_input = state.get("email_input", {})
+    try:
+        author, to, subject, email_thread, email_id = parse_gmail(email_input)
+    except Exception:
+        author = to = subject = email_thread = ""
+        email_id = None
+    thread_id = _resolve_thread_id(state)
+
+    decision: Literal["interrupt_handler", "mark_as_read_node", "llm_call"] = "mark_as_read_node"
+    last_message = state["messages"][-1]
+    try:
+        tool_names = [call.get("name") for call in getattr(last_message, "tool_calls", []) or []]
+    except Exception:
+        tool_names = []
+
+    with trace_stage(
+        "response_agent.should_continue",
+        run_type="chain",
+        inputs_summary="evaluate next step",
+        tags=["response_agent", "router"],
+        metadata={"email_id": email_id, "thread_id": thread_id},
+        extra={"last_tool_names": tool_names},
+    ) as trace:
+        if getattr(last_message, "tool_calls", None):
+            if "Done" in tool_names:
                 author_l = (author or "").lower()
                 thread_l = (email_thread or "").lower()
-                is_no_reply = ("no-reply" in author_l) or ("do not reply" in thread_l) or ("please do not reply" in thread_l)
+                is_no_reply = (
+                    ("no-reply" in author_l)
+                    or ("do not reply" in thread_l)
+                    or ("please do not reply" in thread_l)
+                )
                 if is_no_reply:
-                    return "mark_as_read_node"
-            except Exception:
-                pass
-            # If Done was called before drafting the reply, loop back to llm_call
-            all_tool_names: list[str] = []
-            for m in state.get("messages", []):
-                if getattr(m, "tool_calls", None):
-                    try:
-                        all_tool_names.extend([tc.get("name") for tc in m.tool_calls])
-                    except Exception:
-                        pass
-            if "send_email_tool" not in all_tool_names:
-                return "llm_call"
-            return "mark_as_read_node"
-        return "interrupt_handler"
-    return "mark_as_read_node"
+                    decision = "mark_as_read_node"
+                else:
+                    all_tool_names: list[str] = []
+                    for message in state.get("messages", []):
+                        if getattr(message, "tool_calls", None):
+                            try:
+                                all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
+                            except Exception:
+                                pass
+                    decision = "llm_call" if "send_email_tool" not in all_tool_names else "mark_as_read_node"
+            else:
+                decision = "interrupt_handler"
+        else:
+            decision = "mark_as_read_node"
+
+        if trace:
+            summary = f"next={decision}; tools={','.join(name for name in tool_names if name) or 'none'}"
+            trace.set_outputs(summary)
+
+    return decision
 
 
 def mark_as_read_node(state: State):
@@ -1221,64 +1376,73 @@ def mark_as_read_node(state: State):
     skip = os.getenv("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "").lower() in ("1", "true", "yes")
     email_input = state["email_input"]
     author, to, subject, email_thread, email_id = parse_gmail(email_input)
-    if skip:
-        print(f"[gmail] Skipping mark_as_read for {email_id or 'UNKNOWN_ID'} (toggle enabled)")
-    else:
-        try:
-            mark_as_read(email_id)
-        except Exception as e:
-            print(f"[gmail] mark_as_read failed for {email_id}: {e}")
+    thread_id = _resolve_thread_id(state)
 
-    # Build supporting fields for external evaluators (StructuredPrompt):
-    # - assistant_reply: short textual reply summary
-    # - tool_trace: normalized conversation + tool-call trace
-    # - email_markdown: canonical email block for context
-    email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-    tool_trace = format_messages_string(state.get("messages", []))
-    output_text = format_final_output(state)
-    prime_parent_run(
-        email_input=state.get("email_input", {}),
-        email_markdown=email_markdown,
-        outputs=output_text,
-        extra_update={"email_id": email_id},
-    )
+    result_payload: dict[str, Any]
 
-    # Build a concise summary from the last send_email_tool call if present
-    from langchain_core.messages import AIMessage
-    summary = None
-    try:
-        # Walk messages from the end to find the last tool call
-        for m in reversed(state.get("messages", [])):
-            tool_calls = getattr(m, "tool_calls", None)
-            if not tool_calls:
-                continue
-            # Find last send_email_tool call in this message
-            for tc in reversed(tool_calls):
-                if tc.get("name") in ("send_email_tool", "write_email"):
-                    args = tc.get("args", {})
-                    response_text = args.get("response_text") or args.get("content") or "(no content)"
-                    summary = f"Email sent to reply to '{subject}': {response_text}"
-                    break
-            if summary:
-                break
-    except Exception:
+    with trace_stage(
+        "mark_as_read_node",
+        run_type="chain",
+        inputs_summary=f"finalise thread {email_id or 'UNKNOWN'}",
+        tags=["finalize"],
+        metadata={"email_id": email_id, "thread_id": thread_id},
+    ) as trace:
+        if skip:
+            print(f"[gmail] Skipping mark_as_read for {email_id or 'UNKNOWN_ID'} (toggle enabled)")
+        else:
+            try:
+                mark_as_read(email_id)
+            except Exception as e:
+                print(f"[gmail] mark_as_read failed for {email_id}: {e}")
+
+        email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+        tool_trace = format_messages_string(state.get("messages", []))
+        output_text = format_final_output(state)
+        prime_parent_run(
+            email_input=state.get("email_input", {}),
+            email_markdown=email_markdown,
+            outputs=output_text,
+            extra_update={"email_id": email_id},
+        )
+
+        from langchain_core.messages import AIMessage
         summary = None
+        try:
+            for m in reversed(state.get("messages", [])):
+                tool_calls = getattr(m, "tool_calls", None)
+                if not tool_calls:
+                    continue
+                for tc in reversed(tool_calls):
+                    if tc.get("name") in ("send_email_tool", "write_email"):
+                        args = tc.get("args", {})
+                        response_text = args.get("response_text") or args.get("content") or "(no content)"
+                        summary = f"Email sent to reply to '{subject}': {response_text}"
+                        break
+                if summary:
+                    break
+        except Exception:
+            summary = None
 
-    if summary:
-        return {
-            "messages": [{"role": "assistant", "content": summary}],
-            "assistant_reply": summary,
-            "tool_trace": tool_trace,
-            "email_markdown": email_markdown,
-            "output_text": output_text,
-        }
-    # Even if no summary was constructed, return trace and markdown for downstream usage
-    return {
-        "assistant_reply": "",
-        "tool_trace": tool_trace,
-        "email_markdown": email_markdown,
-        "output_text": output_text,
-    }
+        if summary:
+            result_payload = {
+                "messages": [{"role": "assistant", "content": summary}],
+                "assistant_reply": summary,
+                "tool_trace": tool_trace,
+                "email_markdown": email_markdown,
+                "output_text": output_text,
+            }
+        else:
+            result_payload = {
+                "assistant_reply": "",
+                "tool_trace": tool_trace,
+                "email_markdown": email_markdown,
+                "output_text": output_text,
+            }
+
+        if trace:
+            trace.set_outputs(output_text or "workflow complete")
+
+    return result_payload
 
 
 # Build workflow

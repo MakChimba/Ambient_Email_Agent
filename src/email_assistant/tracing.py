@@ -6,9 +6,12 @@ import random
 import re
 import time
 from collections.abc import Mapping, Sequence
-from typing import Any, Callable, Iterable, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable, Mapping, Sequence as SeqType
 
 from email_assistant.utils import extract_message_content, parse_gmail
+from email_assistant import version as EMAIL_ASSISTANT_VERSION
 
 try:  # Optional runtime dependency
     from langsmith.run_helpers import RunTree, get_current_run_tree  # type: ignore
@@ -54,6 +57,90 @@ def _grid_text(text: str | None) -> str:
 
     value = (text or "").strip()
     return value if value else "[n/a]"
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes")
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in items:
+        if not item:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def default_trace_tags(extra: SeqType[str] | None = None) -> list[str]:
+    """Return default tags describing the runtime environment."""
+
+    tags: list[str] = []
+    tags.append("eval" if _env_flag("EMAIL_ASSISTANT_EVAL_MODE") else "live")
+
+    model = (
+        os.getenv("EMAIL_ASSISTANT_MODEL")
+        or os.getenv("GEMINI_MODEL")
+        or os.getenv("GEMINI_MODEL_AGENT")
+    )
+    if model:
+        tags.append(model)
+
+    stage = os.getenv("EMAIL_ASSISTANT_TRACE_STAGE")
+    if stage:
+        tags.append(stage)
+
+    extra_tokens = []
+    if extra:
+        extra_tokens.extend(extra)
+    env_extra = os.getenv("EMAIL_ASSISTANT_TRACE_TAGS")
+    if env_extra:
+        extra_tokens.extend(part.strip() for part in env_extra.split(","))
+
+    if extra_tokens:
+        tags.extend(extra_tokens)
+
+    return _dedupe_preserve_order(str(tag) for tag in tags if tag)
+
+
+def default_root_metadata(
+    *,
+    agent_label: str | None = None,
+    thread_id: str | None = None,
+    run_label: str | None = None,
+) -> dict[str, Any]:
+    """Base metadata emitted on the root run for filtering/search."""
+
+    metadata: dict[str, Any] = {
+        "agent_version": EMAIL_ASSISTANT_VERSION,
+        "eval_mode": _env_flag("EMAIL_ASSISTANT_EVAL_MODE"),
+        "hitl_auto_accept": _env_flag("HITL_AUTO_ACCEPT"),
+    }
+
+    if agent_label:
+        metadata["agent_label"] = agent_label
+    if thread_id:
+        metadata["thread_id"] = thread_id
+    if run_label:
+        metadata["run_label"] = run_label
+
+    model = (
+        os.getenv("EMAIL_ASSISTANT_MODEL")
+        or os.getenv("GEMINI_MODEL")
+        or os.getenv("GEMINI_MODEL_AGENT")
+    )
+    if model:
+        metadata.setdefault("default_model", model)
+
+    experiment = os.getenv("EMAIL_ASSISTANT_EXPERIMENT")
+    if experiment:
+        metadata["experiment"] = experiment
+
+    return metadata
 
 
 _markdown_tokens = re.compile(r"[`*_]{1,}|__")
@@ -292,6 +379,9 @@ def maybe_update_run_io(
     force_inputs: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
+    name: str | None = None,
+    tags: SeqType[str] | None = None,
+    append_tags: bool = False,
     update_metadata: bool = False,
     update_extra: bool = False,
     retries: int = 3,
@@ -386,6 +476,21 @@ def maybe_update_run_io(
                 merged_extra.update(extra)
                 update_payload["extra"] = merged_extra
 
+            if name:
+                update_payload["name"] = str(name)
+
+            if tags is not None:
+                try:
+                    existing = list(getattr(root, "tags", None) or [])
+                except Exception:
+                    existing = []
+                if append_tags:
+                    candidate = list(existing)
+                    candidate.extend(tags)
+                else:
+                    candidate = list(tags)
+                update_payload["tags"] = _dedupe_preserve_order(str(tag) for tag in candidate if tag)
+
             if not update_payload:
                 return False
 
@@ -405,6 +510,10 @@ def prime_parent_run(
     metadata_update: Mapping[str, Any] | None = None,
     extra_update: Mapping[str, Any] | None = None,
     outputs: Any | None = None,
+    agent_label: str | None = None,
+    tags: SeqType[str] | None = None,
+    thread_id: str | None = None,
+    run_label: str | None = None,
 ) -> bool:
     """Prime the root LangSmith run with readable inputs/metadata."""
 
@@ -423,7 +532,14 @@ def prime_parent_run(
     if not run_id:
         return False
 
-    metadata_payload = dict(metadata_update or {})
+    base_metadata = default_root_metadata(
+        agent_label=agent_label,
+        thread_id=thread_id,
+        run_label=run_label,
+    )
+    metadata_payload = dict(base_metadata)
+    if metadata_update:
+        metadata_payload.update(metadata_update)
     if email_markdown is not None:
         metadata_payload.setdefault("email_markdown", truncate_markdown(email_markdown))
 
@@ -441,9 +557,110 @@ def prime_parent_run(
         force_inputs=summary,
         metadata=metadata_payload,
         extra=extra_payload,
+        name=agent_label,
+        tags=default_trace_tags(tags),
+        append_tags=True,
         update_metadata=True,
         update_extra=True,
     )
+
+
+@dataclass
+class TraceRunHandle:
+    """Helper allowing nodes to summarise outputs and attach artefacts."""
+
+    _tree: Any
+    _run: Any
+    _outputs_summary: str | None = None
+    _attachments: list[tuple[str, Any]] = field(default_factory=list)
+    _closed: bool = False
+
+    def set_outputs(self, summary: str | None) -> None:
+        self._outputs_summary = summary
+
+    def add_attachment(self, name: str, data: Any) -> None:
+        self._attachments.append((str(name), data))
+
+    def _finish(self, *, error: str | None = None) -> None:
+        if self._closed:
+            return
+        try:
+            if error:
+                self._run.end(error=_grid_text(error))
+            else:
+                kwargs: dict[str, Any] = {}
+                if self._outputs_summary is not None:
+                    kwargs["outputs"] = _grid_text(self._outputs_summary)
+                self._run.end(**kwargs)
+        except Exception:
+            pass
+
+        for name, data in self._attachments:
+            try:
+                add_attachment = getattr(self._tree, "add_attachment", None)
+                if callable(add_attachment):
+                    add_attachment(name=name, data=data)
+            except Exception:
+                pass
+
+        try:
+            self._tree.__exit__(None, None, None)
+        except Exception:
+            pass
+        self._closed = True
+
+
+@contextmanager
+def trace_stage(
+    name: str,
+    *,
+    run_type: str = "chain",
+    inputs_summary: str | None = None,
+    tags: SeqType[str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+):
+    """Create a LangSmith child run for a logical stage.
+
+    Yields a :class:`TraceRunHandle` when tracing is active; otherwise ``None``.
+    """
+
+    if RunTree is None or get_current_run_tree is None:
+        yield None
+        return
+
+    try:
+        parent = get_current_run_tree()
+    except Exception:
+        parent = None
+
+    if not parent:
+        yield None
+        return
+
+    try:
+        stage_tags = default_trace_tags(tags)
+        child = parent.create_child(
+            name=name,
+            run_type=run_type,
+            inputs=_grid_text(inputs_summary),
+            metadata=dict(metadata or {}),
+            extra=dict(extra or {}),
+            tags=stage_tags,
+        )
+        run = child.__enter__()
+    except Exception:
+        yield None
+        return
+
+    handle = TraceRunHandle(child, run)
+    try:
+        yield handle
+    except Exception as exc:
+        handle._finish(error=str(exc))
+        raise
+    else:
+        handle._finish()
 
 
 def _get_latest_child_run(run_type: str | None = None):
@@ -628,6 +845,8 @@ __all__ = [
     "AGENT_PROJECT",
     "JUDGE_PROJECT",
     "init_project",
+    "default_trace_tags",
+    "default_root_metadata",
     "strip_markdown_to_text",
     "summarize_email_for_grid",
     "summarize_tool_call_for_grid",
@@ -639,4 +858,6 @@ __all__ = [
     "log_llm_child_run",
     "invoke_with_root_run",
     "format_final_output",
+    "trace_stage",
+    "TraceRunHandle",
 ]
