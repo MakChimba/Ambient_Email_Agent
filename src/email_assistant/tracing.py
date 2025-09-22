@@ -10,6 +10,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence as SeqType
 
+from datetime import datetime, timezone
+
 from email_assistant.utils import extract_message_content, parse_gmail
 from email_assistant import version as EMAIL_ASSISTANT_VERSION
 
@@ -27,8 +29,16 @@ def _debug_log(message: str) -> None:
     if _TRACE_DEBUG:
         print(f"[trace-debug] {message}")
 
-AGENT_PROJECT = "email-assistant:agent"
-JUDGE_PROJECT = "email-assistant:judge"
+def _project_with_date(base: str) -> str:
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    prefix, sep, suffix = base.partition(":")
+    if sep:
+        return f"{prefix}:{suffix.upper()}-{today}"
+    return f"{base}-{today}"
+
+
+AGENT_PROJECT = _project_with_date("email-assistant:agent")
+JUDGE_PROJECT = _project_with_date("email-assistant:judge")
 
 _HIDDEN_FLAGS = (
     "LANGSMITH_HIDE_INPUTS",
