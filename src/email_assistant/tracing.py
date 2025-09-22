@@ -56,6 +56,8 @@ def init_project(project: str | None) -> None:
 
     os.environ.setdefault("LANGSMITH_PROJECT", project)
     os.environ.setdefault("LANGCHAIN_PROJECT", project)
+    # Quiet Gemini gRPC client noise (ALTS creds warnings) unless user overrides.
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 
     for flag in _HIDDEN_FLAGS:
         if os.environ.get(flag):
