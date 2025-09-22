@@ -19,6 +19,14 @@ except Exception:  # pragma: no cover - unavailable when LangSmith not installed
     get_current_run_tree = None  # type: ignore
     RunTree = None  # type: ignore
 
+
+_TRACE_DEBUG = os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes")
+
+
+def _debug_log(message: str) -> None:
+    if _TRACE_DEBUG:
+        print(f"[trace-debug] {message}")
+
 AGENT_PROJECT = "email-assistant:agent"
 JUDGE_PROJECT = "email-assistant:judge"
 
@@ -390,6 +398,7 @@ def maybe_update_run_io(
     """Best-effort patch to ensure LangSmith grid cells contain readable text."""
 
     if not run_id:
+        _debug_log("maybe_update_run_io: no run_id available")
         return False
 
     try:
@@ -404,6 +413,7 @@ def maybe_update_run_io(
         try:
             run = client.read_run(run_id)
             if run is None:
+                _debug_log(f"maybe_update_run_io: run {run_id} not found")
                 return False
 
             # Walk up the parent chain to normalise updates on the root run.
@@ -492,11 +502,13 @@ def maybe_update_run_io(
                 update_payload["tags"] = _dedupe_preserve_order(str(tag) for tag in candidate if tag)
 
             if not update_payload:
+                _debug_log(f"maybe_update_run_io: nothing to update for run {root_id}")
                 return False
 
             client.update_run(root_id, **update_payload)
             return True
-        except Exception:
+        except Exception as exc:
+            _debug_log(f"maybe_update_run_io: update failed ({exc}) on attempt {attempt}")
             if attempt >= retries:
                 return False
             time.sleep(jitter + random.random() * jitter)
@@ -550,7 +562,7 @@ def prime_parent_run(
 
     summary = summarize_email_for_grid(email_input)
 
-    return maybe_update_run_io(
+    updated = maybe_update_run_io(
         run_id=str(run_id),
         email_input=email_input,
         outputs=outputs,
@@ -563,6 +575,9 @@ def prime_parent_run(
         update_metadata=True,
         update_extra=True,
     )
+    if not updated:
+        _debug_log("prime_parent_run: maybe_update_run_io returned False")
+    return updated
 
 
 @dataclass
