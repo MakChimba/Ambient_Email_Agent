@@ -23,6 +23,13 @@ from typing import Any, Dict, List, Tuple
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 
+from email_assistant.tracing import (
+    AGENT_PROJECT,
+    init_project,
+    invoke_with_root_run,
+    summarize_email_for_grid,
+)
+
 
 def _load_dataset(agent_module: str):
     """Load the appropriate dataset based on agent module name."""
@@ -69,6 +76,8 @@ def main():
     ap.add_argument("--auto-accept", action="store_true", help="Auto-accept HITL prompts")
     args = ap.parse_args()
 
+    init_project(AGENT_PROJECT)
+
     if args.auto_accept:
         os.environ.setdefault("HITL_AUTO_ACCEPT", "1")
 
@@ -93,8 +102,18 @@ def main():
         if args.respond_only and str(triage).lower() != "respond":
             continue
         print(f"\n=== [{i}] {name} | triage={triage} ===")
+        payload = {"email_input": inp}
+        summary = summarize_email_for_grid(inp)
+
+        def _invoke_agent():
+            return agent.invoke(payload, config=thread_config)
+
         try:
-            result = agent.invoke({"email_input": inp}, config=thread_config)
+            result = invoke_with_root_run(
+                _invoke_agent,
+                root_name=f"agent:{args.agent_module}",
+                input_summary=summary,
+            )
         except Exception as e:
             print(f"ERROR during invoke: {e}")
             continue
@@ -142,4 +161,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

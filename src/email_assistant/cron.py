@@ -5,6 +5,7 @@ from typing import Dict, Any, TypedDict
 from dataclasses import dataclass, field
 from langgraph.graph import StateGraph, START, END
 from email_assistant.tools.gmail.run_ingest import fetch_and_process_emails
+from email_assistant.tracing import AGENT_PROJECT, init_project
 
 @dataclass(kw_only=True)
 class JobKickoff:
@@ -20,6 +21,7 @@ class JobKickoff:
 
 async def main(state: JobKickoff):
     """Run the email ingestion process"""
+    init_project(AGENT_PROJECT)
     print(f"Kicking off job to fetch emails from the past {state.minutes_since} minutes")
     print(f"Email: {state.email}")
     print(f"URL: {state.url}")

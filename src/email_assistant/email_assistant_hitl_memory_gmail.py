@@ -30,10 +30,19 @@ from email_assistant.utils import (
     format_messages_string,
     extract_message_content,
 )
+from email_assistant.tracing import (
+    AGENT_PROJECT,
+    init_project,
+    prime_parent_run,
+    log_llm_child_run,
+    log_tool_child_run,
+    format_final_output,
+)
 from email_assistant.tools.reminders import get_default_store
 from dotenv import load_dotenv
 
 load_dotenv(".env")
+init_project(AGENT_PROJECT)
 
 # Get tools with Gmail tools
 tools = get_tools([
@@ -92,9 +101,13 @@ def _safe_tool_invoke(name: str, args):
         tool = tools_by_name.get(name)
         if tool is None:
             raise KeyError(name)
-        return tool.invoke(args)
+        result = tool.invoke(args)
+        log_tool_child_run(name=name, args=args, result=result)
+        return result
     except Exception as e:
-        return f"Error executing {name}: {str(e)}"
+        error = f"Error executing {name}: {str(e)}"
+        log_tool_child_run(name=name, args=args, result=error, metadata_update={"error": True})
+        return error
 
 
 def _build_manual_scheduling_reply(text: str) -> str:
@@ -212,8 +225,16 @@ def update_memory(store, namespace, messages):
 # Nodes
 def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content; create/cancel reminders and route next step."""
-    
-    author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
+
+    email_input = state["email_input"]
+    author, to, subject, email_thread, email_id = parse_gmail(email_input)
+    email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+
+    prime_parent_run(
+        email_input=email_input,
+        email_markdown=email_markdown,
+        extra_update={"email_id": email_id},
+    )
 
     # --- Reminder Logic: Part 1: Cancel on detected reply ---
     reply_detected = False
@@ -226,16 +247,23 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
             reply_detected = True
 
     user_prompt = triage_user_prompt.format(author=author, to=to, subject=subject, email_thread=email_thread)
-    email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
     triage_instructions = get_memory(store, ("email_assistant", "triage_preferences"), default_triage_instructions)
     system_prompt = triage_system_prompt.format(background=default_background, triage_instructions=triage_instructions)
 
+    router_prompt = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
     # Try LLM triage; fall back to respond on failure
     try:
-        result = llm_router.invoke([
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ])
+        result = llm_router.invoke(router_prompt)
+        response_payload = (
+            result.model_dump(exclude_none=True)
+            if hasattr(result, "model_dump")
+            else getattr(result, "__dict__", result)
+        )
+        log_llm_child_run(prompt=router_prompt, response=response_payload)
         classification = getattr(result, "classification", "respond")
     except Exception as e:
         print(f"[triage] Router failed, defaulting to respond: {e}")
@@ -715,12 +743,24 @@ def llm_call(state: State, store: BaseStore):
         return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
     try:
         msg = llm_with_tools.invoke(prompt)
+        response_payload = (
+            msg.model_dump(exclude_none=True)
+            if hasattr(msg, "model_dump")
+            else getattr(msg, "__dict__", msg)
+        )
+        log_llm_child_run(prompt=prompt, response=response_payload)
     except Exception:
         msg = None
     if not getattr(msg, "tool_calls", None):
         retry = [{"role": "system", "content": "Your next output must be exactly one tool call with arguments, no assistant text."}] + prompt
         try:
             msg_retry = llm_with_tools.invoke(retry)
+            response_payload_retry = (
+                msg_retry.model_dump(exclude_none=True)
+                if hasattr(msg_retry, "model_dump")
+                else getattr(msg_retry, "__dict__", msg_retry)
+            )
+            log_llm_child_run(prompt=retry, response=response_payload_retry)
             if getattr(msg_retry, "tool_calls", None):
                 msg = msg_retry
         except Exception:
@@ -1195,6 +1235,13 @@ def mark_as_read_node(state: State):
     # - email_markdown: canonical email block for context
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
     tool_trace = format_messages_string(state.get("messages", []))
+    output_text = format_final_output(state)
+    prime_parent_run(
+        email_input=state.get("email_input", {}),
+        email_markdown=email_markdown,
+        outputs=output_text,
+        extra_update={"email_id": email_id},
+    )
 
     # Build a concise summary from the last send_email_tool call if present
     from langchain_core.messages import AIMessage
@@ -1219,16 +1266,18 @@ def mark_as_read_node(state: State):
 
     if summary:
         return {
-            "messages": [AIMessage(content=summary)],
+            "messages": [{"role": "assistant", "content": summary}],
             "assistant_reply": summary,
             "tool_trace": tool_trace,
             "email_markdown": email_markdown,
+            "output_text": output_text,
         }
     # Even if no summary was constructed, return trace and markdown for downstream usage
     return {
         "assistant_reply": "",
         "tool_trace": tool_trace,
         "email_markdown": email_markdown,
+        "output_text": output_text,
     }
 
 

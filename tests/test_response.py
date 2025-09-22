@@ -9,6 +9,7 @@ from langgraph.types import Command
 from langgraph.store.memory import InMemoryStore
 
 from email_assistant.utils import extract_tool_calls, format_messages_string
+from email_assistant.tracing import invoke_with_root_run, summarize_email_for_grid
 from tests.trace_utils import configure_tracing_project, configure_judge_project
 from tests.agent_test_utils import (
     compile_agent,
@@ -300,7 +301,17 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
     # Run the agent
     if AGENT_MODULE in ["email_assistant", "email_assistant_hitl_memory_gmail"]:
         # Workflow agent takes email_input directly
-        email_assistant.invoke({"email_input": email_input}, config=thread_config)
+        payload = {"email_input": email_input}
+        summary = summarize_email_for_grid(email_input)
+
+        def _invoke_agent():
+            return email_assistant.invoke(payload, config=thread_config)
+
+        invoke_with_root_run(
+            _invoke_agent,
+            root_name=f"agent:{AGENT_MODULE}",
+            input_summary=summary,
+        )
     else:
         raise ValueError(f"Unsupported agent module: {AGENT_MODULE}. Only 'email_assistant' is supported in automated testing.")
 

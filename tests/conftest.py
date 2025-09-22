@@ -1,12 +1,9 @@
 #!/usr/bin/env python
 
 import os
-import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
-from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -15,57 +12,17 @@ src_path = project_root / "src"
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(src_path))
 
-
-TRACING_ENABLED_VALUES = {"1", "true", "yes", "on"}
+from email_assistant.tracing import AGENT_PROJECT, JUDGE_PROJECT, init_project
 
 
 @pytest.fixture(autouse=True)
-def configure_langsmith_projects(monkeypatch, request):
-    """Assign per-test LangSmith projects when tracing is enabled."""
+def configure_langsmith_projects(monkeypatch):
+    """Ensure tracing projects default to the shared agent/judge names."""
 
-    tracing_flag = os.getenv("LANGSMITH_TRACING", "").lower()
-    if tracing_flag not in TRACING_ENABLED_VALUES:
-        return
-
-    sydney_tz = ZoneInfo("Australia/Sydney")
-    date_stamp = datetime.now(tz=sydney_tz).strftime("%Y%m%d")
-
-    def slugify(text: str, limit: int, fallback: str) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-        if len(slug) > limit:
-            slug = slug[:limit].rstrip("-")
-        return slug or fallback
-
-    node_id = request.node.nodeid
-    module_part, *_ = node_id.split("::", 1)
-    module_slug = slugify(Path(module_part).stem, 28, "module")
-
-    func_name = getattr(request.node, "originalname", request.node.name)
-    func_slug = slugify(func_name, 32, "test")
-
-    param_id = getattr(getattr(request.node, "callspec", None), "id", "")
-    param_slug = slugify(param_id, 32, "param") if param_id else ""
-
-    base_parts = [module_slug, func_slug]
-    judge_base = "-".join(part for part in base_parts if part) or "test"
-
-    if param_slug:
-        base_parts.append(param_slug)
-    base_slug = "-".join(part for part in base_parts if part) or judge_base
-
-    project_name = f"AGENT-{base_slug}-{date_stamp}"
-    judge_project = f"JUDGE-{judge_base}-{date_stamp}"
-
-    monkeypatch.setenv("LANGSMITH_PROJECT", project_name)
-    monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", judge_project)
-
-    try:
-        from langsmith import utils as langsmith_utils
-    except ImportError:
-        langsmith_utils = None
-
-    if langsmith_utils is not None and hasattr(langsmith_utils.get_env_var, "cache_clear"):
-        langsmith_utils.get_env_var.cache_clear()
+    monkeypatch.setenv("LANGSMITH_PROJECT", AGENT_PROJECT)
+    monkeypatch.setenv("LANGCHAIN_PROJECT", AGENT_PROJECT)
+    monkeypatch.setenv("EMAIL_ASSISTANT_JUDGE_PROJECT", JUDGE_PROJECT)
+    init_project(AGENT_PROJECT)
 
 
 def pytest_addoption(parser):

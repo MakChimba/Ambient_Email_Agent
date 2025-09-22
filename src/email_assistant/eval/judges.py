@@ -25,6 +25,7 @@ from langsmith.run_helpers import get_current_run_tree, traceable
 from langsmith.schemas import Example, Run
 
 from email_assistant.utils import extract_message_content, format_messages_string
+from email_assistant.tracing import invoke_with_root_run, strip_markdown_to_text
 
 __all__ = [
     "JudgeResult",
@@ -158,8 +159,47 @@ def run_correctness_judge(
         invoke_fn = _invoke
 
     try:
+        judge_summary = "Judge review"
+        reply_snippet = _truncate_text(strip_markdown_to_text(assistant_reply), limit=120)
+        if reply_snippet:
+            judge_summary = f"{judge_summary} | reply: {reply_snippet}"
+        tools_snippet = (
+            _truncate_text(strip_markdown_to_text(tool_calls_summary), limit=80)
+            if tool_calls_summary
+            else ""
+        )
+        if tools_snippet:
+            judge_summary = f"{judge_summary} | tools: {tools_snippet}"
+
+        def _summarize_output(raw_result: object) -> str | None:
+            verdict = None
+            score = None
+            if isinstance(raw_result, JudgeResult):
+                verdict = raw_result.verdict
+                score = raw_result.overall_correctness
+            elif isinstance(raw_result, dict):
+                verdict = raw_result.get("verdict")
+                score = raw_result.get("overall_correctness")
+            if verdict is None and score is None:
+                return "[judge]"
+            details: list[str] = ["[judge]"]
+            if verdict:
+                details.append(f"verdict={verdict}")
+            if score is not None:
+                try:
+                    details.append(f"score={float(score):.2f}")
+                except Exception:
+                    details.append(f"score={score}")
+            return " ".join(details)
+
         try:
-            raw = invoke_fn(payload)
+            raw = invoke_with_root_run(
+                lambda: invoke_fn(payload),
+                root_name="judge:gemini_correctness",
+                input_summary=judge_summary,
+                metadata={"payload_keys": list(payload.keys())},
+                output_transform=_summarize_output,
+            )
         except OutputParserException as exc:
             llm_output = getattr(exc, "llm_output", None)
             snippet = (llm_output or "").strip().splitlines()[0][:160] if llm_output else ""

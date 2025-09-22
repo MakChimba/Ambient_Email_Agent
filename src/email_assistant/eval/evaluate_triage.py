@@ -8,8 +8,15 @@ from datetime import datetime
 from email_assistant.eval.email_dataset import examples_triage
 
 from email_assistant.email_assistant import email_assistant
+from email_assistant.tracing import (
+    AGENT_PROJECT,
+    init_project,
+    invoke_with_root_run,
+    summarize_email_for_grid,
+)
 
 # Client 
+init_project(AGENT_PROJECT)
 client = Client()
 
 # Dataset name
@@ -38,7 +45,15 @@ def target_email_assistant(inputs: dict) -> dict:
         A formatted dictionary with the assistant's response messages
     """
     try:
-        response = email_assistant.invoke({"email_input": inputs["email_input"]})
+        email_input = inputs["email_input"]
+        def _call():
+            return email_assistant.invoke({"email_input": email_input})
+
+        response = invoke_with_root_run(
+            _call,
+            root_name="agent:triage_evaluation",
+            input_summary=summarize_email_for_grid(email_input),
+        )
         if "classification_decision" in response:
             return {"classification_decision": response['classification_decision']}
         else:

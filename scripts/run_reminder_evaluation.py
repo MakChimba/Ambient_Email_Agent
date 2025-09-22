@@ -15,6 +15,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 from email_assistant.email_assistant_hitl_memory_gmail import overall_workflow
 from email_assistant.tools.reminders import SqliteReminderStore
+from email_assistant.tracing import (
+    AGENT_PROJECT,
+    init_project,
+    invoke_with_root_run,
+    summarize_email_for_grid,
+)
 
 
 def _normalize_email_input(d: dict) -> dict:
@@ -33,6 +39,7 @@ def _normalize_email_input(d: dict) -> dict:
 @patch('email_assistant.tools.gmail.gmail_tools.send_calendar_invite', return_value=True)
 def main(mock_schedule, mock_check, mock_send):
     """Runs the end-to-end reminder evaluation suite."""
+    init_project(AGENT_PROJECT)
     load_dotenv()
     db_path = os.getenv("REMINDER_DB_PATH", ".local/reminders.db")
     eval_dir = "tests/evaluation_data/reminders"
@@ -81,7 +88,17 @@ def main(mock_schedule, mock_check, mock_send):
             email_data = _normalize_email_input(email_data)
             config = {"configurable": {"thread_id": str(uuid.uuid4())}}
             # Run the agent
-            final_state = agent.invoke({"email_input": email_data}, config)
+            payload = {"email_input": email_data}
+            summary = summarize_email_for_grid(email_data)
+
+            def _invoke_agent():
+                return agent.invoke(payload, config)
+
+            final_state = invoke_with_root_run(
+                _invoke_agent,
+                root_name="agent:reminder_evaluation",
+                input_summary=summary,
+            )
             classification = final_state.get("classification_decision", "")
 
             # Check the outcome

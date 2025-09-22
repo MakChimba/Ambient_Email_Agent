@@ -16,6 +16,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 's
 from email_assistant.email_assistant_hitl_memory_gmail import overall_workflow
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
+from email_assistant.tracing import invoke_with_root_run, summarize_email_for_grid
 
 EVAL_MODE_ENABLED = os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
 HAS_GOOGLE_KEY = bool(os.getenv("GOOGLE_API_KEY"))
@@ -87,7 +88,16 @@ def test_reminder_scenarios_on_langsmith(example: Example, gmail_service):
     agent = overall_workflow.compile(checkpointer=checkpointer, store=store)
 
     config = {"configurable": {"thread_id": str(uuid.uuid4())}}
-    result = agent.invoke(example.inputs, config)
+    summary = summarize_email_for_grid(example.inputs.get("email_input", {}))
+
+    def _invoke_agent():
+        return agent.invoke(example.inputs, config)
+
+    result = invoke_with_root_run(
+        _invoke_agent,
+        root_name="agent:reminders",
+        input_summary=summary,
+    )
 
     # Basic assertion to ensure the run didn't crash
     assert result is not None

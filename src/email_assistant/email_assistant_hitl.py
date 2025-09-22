@@ -10,9 +10,18 @@ from email_assistant.prompts import triage_system_prompt, triage_user_prompt, ag
 from email_assistant.configuration import get_llm
 from email_assistant.schemas import State, RouterSchema, StateInput
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
+from email_assistant.tracing import (
+    AGENT_PROJECT,
+    init_project,
+    prime_parent_run,
+    log_llm_child_run,
+    log_tool_child_run,
+    format_final_output,
+)
 from dotenv import load_dotenv
 
 load_dotenv(".env")
+init_project(AGENT_PROJECT)
 
 # Get tools
 tools = get_tools(["write_email", "schedule_meeting", "check_calendar_availability", "Question", "Done"])
@@ -44,13 +53,15 @@ def triage_router(state: State) -> Command[Literal["triage_interrupt_handler", "
     """
 
     # Parse the email input
-    author, to, subject, email_thread = parse_email(state["email_input"])
+    email_input = state["email_input"]
+    author, to, subject, email_thread = parse_email(email_input)
     user_prompt = triage_user_prompt.format(
         author=author, to=to, subject=subject, email_thread=email_thread
     )
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
+    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
 
     # Format system prompt with background and triage instructions
     system_prompt = triage_system_prompt.format(
@@ -90,6 +101,10 @@ def triage_router(state: State) -> Command[Literal["triage_interrupt_handler", "
         update = {
             "classification_decision": classification,
         }
+        summary_state = dict(state)
+        summary_state["classification_decision"] = classification
+        output_text = format_final_output(summary_state)
+        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
 
     elif classification == "notify":
         print("🔔 Classification: NOTIFY - This email contains important information") 
@@ -167,21 +182,27 @@ def triage_interrupt_handler(state: State) -> Command[Literal["response_agent", 
 def llm_call(state: State):
     """LLM decides whether to call a tool or not"""
 
-    return {
-        "messages": [
-            llm_with_tools.invoke(
-                [
-                    {"role": "system", "content": agent_system_prompt_hitl.format(
-                        tools_prompt=HITL_TOOLS_PROMPT,
-                        background=default_background,
-                        response_preferences=default_response_preferences, 
-                        cal_preferences=default_cal_preferences
-                    )}
-                ]
-                + state["messages"]
-            )
-        ]
-    }
+    prompt = [
+        {
+            "role": "system",
+            "content": agent_system_prompt_hitl.format(
+                tools_prompt=HITL_TOOLS_PROMPT,
+                background=default_background,
+                response_preferences=default_response_preferences,
+                cal_preferences=default_cal_preferences,
+            ),
+        }
+    ] + state["messages"]
+
+    msg = llm_with_tools.invoke(prompt)
+    response_payload = (
+        msg.model_dump(exclude_none=True)
+        if hasattr(msg, "model_dump")
+        else getattr(msg, "__dict__", msg)
+    )
+    log_llm_child_run(prompt=prompt, response=response_payload)
+
+    return {"messages": [msg]}
 
 def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
@@ -204,6 +225,7 @@ def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
             # Execute search_memory and other tools without interruption
             tool = tools_by_name[tool_call["name"]]
             observation = tool.invoke(tool_call["args"])
+            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
             continue
             
@@ -260,6 +282,7 @@ def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
             # Execute the tool with original args
             tool = tools_by_name[tool_call["name"]]
             observation = tool.invoke(tool_call["args"])
+            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
                         
         elif response["type"] == "edit":
@@ -286,22 +309,24 @@ def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
 
             # Update the write_email tool call with the edited content from Agent Inbox
             if tool_call["name"] == "write_email":
-                
+
                 # Execute the tool with edited args
                 observation = tool.invoke(edited_args)
-                
+
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-            
+                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
+
             # Update the schedule_meeting tool call with the edited content from Agent Inbox
             elif tool_call["name"] == "schedule_meeting":
-                
-                
+
+
                 # Execute the tool with edited args
                 observation = tool.invoke(edited_args)
-                
+
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
+                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
             
             # Catch all other tool calls
             else:
@@ -360,8 +385,24 @@ def should_continue(state: State) -> Literal["interrupt_handler", "__end__"]:
     if last_message.tool_calls:
         names = [tc.get("name") for tc in last_message.tool_calls]
         if "Done" in names:
+            summary_state = dict(state)
+            summary_state.setdefault("classification_decision", "respond")
+            output_text = format_final_output(summary_state)
+            prime_parent_run(
+                email_input=state.get("email_input", {}),
+                email_markdown=None,
+                outputs=output_text,
+            )
             return END
         return "interrupt_handler"
+    summary_state = dict(state)
+    output_text = format_final_output(summary_state)
+    prime_parent_run(
+        email_input=state.get("email_input", {}),
+        email_markdown=None,
+        outputs=output_text,
+    )
+    return END
 
 # Build workflow
 agent_builder = StateGraph(State)

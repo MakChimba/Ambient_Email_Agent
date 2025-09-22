@@ -5,7 +5,10 @@ import sys
 import argparse
 from pathlib import Path
 
+from email_assistant.tracing import AGENT_PROJECT, init_project
+
 def main():
+    init_project(AGENT_PROJECT)
     # LangSmith suite / project name
     langsmith_project = "E-mail Tool Calling and Response Evaluation"
 

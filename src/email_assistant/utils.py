@@ -1,6 +1,11 @@
 from typing import List, Any
 import json
-import html2text
+import re
+
+try:
+    import html2text  # type: ignore
+except ImportError:
+    html2text = None
 
 def format_email_markdown(subject, author, to, email_thread, email_id=None):
     """Format email details into a nicely formatted markdown string for display
@@ -42,12 +47,14 @@ def format_gmail_markdown(subject, author, to, email_thread, email_id=None):
     if email_thread and (email_thread.strip().startswith("<!DOCTYPE") or 
                           email_thread.strip().startswith("<html") or
                           "<body" in email_thread):
-        # Convert HTML to markdown text
-        h = html2text.HTML2Text()
-        h.ignore_links = False
-        h.ignore_images = True
-        h.body_width = 0  # Don't wrap text
-        email_thread = h.handle(email_thread)
+        if html2text is not None:
+            h = html2text.HTML2Text()
+            h.ignore_links = False
+            h.ignore_images = True
+            h.body_width = 0  # Don't wrap text
+            email_thread = h.handle(email_thread)
+        else:
+            email_thread = re.sub(r"<[^>]+>", " ", email_thread)
     
     return f"""
 

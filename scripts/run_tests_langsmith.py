@@ -18,6 +18,8 @@ import sys
 import subprocess
 from pathlib import Path
 
+from email_assistant.tracing import AGENT_PROJECT, init_project
+
 try:
     from dotenv import load_dotenv, find_dotenv  # type: ignore
 except Exception:
@@ -30,6 +32,8 @@ except Exception:
 def main(argv: list[str]) -> int:
     # Try to load .env as a convenience, but prefer pre-set env for plugin
     load_dotenv(find_dotenv(), override=False)
+
+    init_project(AGENT_PROJECT)
 
     # Ensure plugin isn't disabled
     os.environ.pop("PYTEST_DISABLE_PLUGIN_AUTOLOAD", None)

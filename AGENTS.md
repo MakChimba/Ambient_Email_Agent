@@ -141,7 +141,9 @@ pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -
 ```
 For deterministic/offline runs, set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionally `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1` when updating the smoke snapshots).
 
-With `LANGSMITH_TRACING=true`, pytest now assigns a fresh LangSmith assistant project per test (`AGENT-<module>-<test>[-<params>]-<YYYYMMDD Sydney>`). Judge traces for that test share a stable project named `JUDGE-<module>-<test>-<YYYYMMDD Sydney>`, making it easy to compare parametrised runs side-by-side while keeping the date context aligned with Australia/Sydney reviewers.
+With `LANGSMITH_TRACING=true`, traces land in shared LangSmith projects: `email-assistant:agent` for assistant runs and `email-assistant:judge` for judge feedback. Override the assistant grouping with `EMAIL_ASSISTANT_TRACE_PROJECT` and judge grouping with `EMAIL_ASSISTANT_JUDGE_PROJECT` (or the per-run override envs) when you need ad-hoc buckets.
+
+Grid cells stay human-readable: the tracing helpers summarise email inputs, LLM/tool child runs, and final outputs as short strings (line 1 tokens like `[reply]`, line 2 rationale). Raw arguments and context sit in `metadata`/`extra` so LangSmith tables remain tidy.
 Use `EMAIL_ASSISTANT_TRACE_PROJECT` to override the project name for ad-hoc runs.
 
 ### Quality Evaluation

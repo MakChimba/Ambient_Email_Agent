@@ -6,6 +6,7 @@ from typing import Dict, List
 import pytest
 
 from email_assistant.utils import extract_tool_calls
+from email_assistant.tracing import invoke_with_root_run, summarize_email_for_grid
 from tests.agent_test_utils import (
     compile_agent,
     get_last_tool_args,
@@ -88,7 +89,17 @@ def test_live_smoke_cases(agent_module_name, gmail_service):
     for case_name, expected_sequence in SMOKE_CASES.items():
         email_input = cases[case_name]
         email_assistant, thread_config, _, _ = compile_agent(agent_module_name)
-        email_assistant.invoke({"email_input": email_input}, config=thread_config)
+        payload = {"email_input": email_input}
+        summary = summarize_email_for_grid(email_input)
+
+        def _invoke_agent():
+            return email_assistant.invoke(payload, config=thread_config)
+
+        invoke_with_root_run(
+            _invoke_agent,
+            root_name=f"agent:{case_name}",
+            input_summary=summary,
+        )
         state = email_assistant.get_state(thread_config)
         values = _extract_values(state)
 

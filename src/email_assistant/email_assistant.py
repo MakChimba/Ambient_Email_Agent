@@ -2,6 +2,14 @@ from typing import Literal
 import os
 
 from email_assistant.configuration import get_llm
+from email_assistant.tracing import (
+    AGENT_PROJECT,
+    init_project,
+    prime_parent_run,
+    log_llm_child_run,
+    log_tool_child_run,
+    format_final_output,
+)
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import AGENT_TOOLS_PROMPT
@@ -13,6 +21,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=True)
+init_project(AGENT_PROJECT)
 
 # Get tools
 tools = get_tools()
@@ -198,10 +207,22 @@ def llm_call(state: State):
 
     prompt = prompt_msgs + state["messages"]
     msg = llm_with_tools.invoke(prompt)
+    response_payload = (
+        msg.model_dump(exclude_none=True)
+        if hasattr(msg, "model_dump")
+        else getattr(msg, "__dict__", msg)
+    )
+    log_llm_child_run(prompt=prompt, response=response_payload)
     if not getattr(msg, "tool_calls", None):
         # One-time re-ask with strict instruction to emit a single tool call
         retry_msgs = prompt_msgs + [{"role": "system", "content": "Your next output must be exactly one tool call with arguments, no assistant text."}] + state["messages"]
         msg_retry = llm_with_tools.invoke(retry_msgs)
+        response_payload_retry = (
+            msg_retry.model_dump(exclude_none=True)
+            if hasattr(msg_retry, "model_dump")
+            else getattr(msg_retry, "__dict__", msg_retry)
+        )
+        log_llm_child_run(prompt=retry_msgs, response=response_payload_retry)
         if getattr(msg_retry, "tool_calls", None):
             msg = msg_retry
         else:
@@ -216,6 +237,7 @@ def tool_node(state: State):
     for tool_call in state["messages"][-1].tool_calls:
         tool = tools_by_name[tool_call["name"]]
         observation = tool.invoke(tool_call["args"])
+        log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
         result.append({"role": "tool", "content" : observation, "tool_call_id": tool_call["id"]})
     return {"messages": result}
 
@@ -227,9 +249,24 @@ def should_continue(state: State) -> Literal["Action", "__end__"]:
     if getattr(last_message, "tool_calls", None):
         names = [tc.get("name") for tc in last_message.tool_calls]
         if "Done" in names:
+            summary_state = dict(state)
+            summary_state.setdefault("classification_decision", "respond")
+            output_text = format_final_output(summary_state)
+            prime_parent_run(
+                email_input=state.get("email_input", {}),
+                email_markdown=None,
+                outputs=output_text,
+            )
             return END
         return "Action"
     # No tool call produced; terminate gracefully
+    summary_state = dict(state)
+    output_text = format_final_output(summary_state)
+    prime_parent_run(
+        email_input=state.get("email_input", {}),
+        email_markdown=None,
+        outputs=output_text,
+    )
     return END
 
 # Build workflow
@@ -263,7 +300,8 @@ def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]
     - Company-wide announcements
     - Messages meant for other teams
     """
-    author, to, subject, email_thread = parse_email(state["email_input"])
+    email_input = state["email_input"]
+    author, to, subject, email_thread = parse_email(email_input)
     system_prompt = triage_system_prompt.format(
         background=default_background,
         triage_instructions=default_triage_instructions
@@ -275,6 +313,7 @@ def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
+    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
 
     # Run the router LLM with structured output (fallback to heuristic on failure)
     classification: str | None = None
@@ -318,6 +357,10 @@ def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]
         update =  {
             "classification_decision": classification,
         }
+        summary_state = dict(state)
+        summary_state["classification_decision"] = classification
+        output_text = format_final_output(summary_state)
+        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
         goto = END
     elif classification == "notify":
         # If real life, this would do something else
@@ -325,6 +368,10 @@ def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]
         update = {
             "classification_decision": classification,
         }
+        summary_state = dict(state)
+        summary_state["classification_decision"] = classification
+        output_text = format_final_output(summary_state)
+        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
         goto = END
     else:
         raise ValueError(f"Invalid classification: {classification}")
