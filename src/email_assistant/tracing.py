@@ -1,6 +1,7 @@
 """Utilities for consistent LangSmith tracing output."""
 from __future__ import annotations
 
+import contextvars
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -55,6 +56,10 @@ else:
 
 
 _TRACE_DEBUG = os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes")
+
+_ROOT_RUN_TREE: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
+    "email_assistant_root_run_tree", default=None
+)
 
 
 def _debug_log(message: str) -> None:
@@ -559,6 +564,15 @@ def maybe_update_run_io(
                 run_tree_obj = _find_run_tree(root, target_str)
 
     if run_tree_obj is None:
+        try:
+            cached_root = _ROOT_RUN_TREE.get()
+        except LookupError:
+            cached_root = None
+        if cached_root is not None:
+            run_tree_obj = _find_run_tree(cached_root, str(run_id))
+
+    if run_tree_obj is None:
+        _debug_log(f"maybe_update_run_io: run tree not found for {run_id}")
         return False
 
     def _as_dict(value: Any) -> dict[str, Any]:
@@ -570,6 +584,11 @@ def maybe_update_run_io(
     outputs_payload = _as_dict(getattr(run_tree_obj, "outputs", {}))
     extra_payload = _as_dict(getattr(run_tree_obj, "extra", {}))
     metadata_payload = _as_dict(extra_payload.get("metadata", {}))
+
+    _debug_log(
+        "maybe_update_run_io: preparing update for "
+        f"{getattr(run_tree_obj, 'name', '<unknown>')} ({getattr(run_tree_obj, 'id', '<no-id>')})"
+    )
 
     changed = False
 
@@ -667,7 +686,27 @@ def prime_parent_run(
     if not run_tree:
         return False
 
-    run_id = getattr(run_tree, "id", None)
+    parent = getattr(run_tree, "parent_run", None)
+    _debug_log(
+        "prime_parent_run: current run="
+        f"{getattr(run_tree, 'name', '<unknown>')} ({getattr(run_tree, 'id', '<no-id>')})"
+        f" parent={getattr(parent, 'name', None)}"
+    )
+
+    root_tree = run_tree
+    while getattr(root_tree, "parent_run", None) is not None:
+        root_tree = getattr(root_tree, "parent_run")
+
+    if getattr(root_tree, "parent_run", None) is None:
+        try:
+            cached_root = _ROOT_RUN_TREE.get()
+        except LookupError:
+            cached_root = None
+        else:
+            if cached_root is not None:
+                root_tree = cached_root
+
+    run_id = getattr(root_tree, "id", None)
     if not run_id:
         return False
 
@@ -938,6 +977,8 @@ def invoke_with_root_run(
     if ctx is None or run is None:
         return func()
 
+    root_token = _ROOT_RUN_TREE.set(run)
+
     try:
         result = func()
         outputs_summary = None
@@ -947,7 +988,7 @@ def invoke_with_root_run(
             except Exception:
                 outputs_summary = None
         if outputs_summary is not None:
-            run.end(outputs=_grid_text(outputs_summary))
+            run.end(outputs={"summary": _grid_text(outputs_summary)})
         else:
             run.end()
         return result
@@ -955,6 +996,7 @@ def invoke_with_root_run(
         run.end(error=_grid_text(str(exc)))
         raise
     finally:
+        _ROOT_RUN_TREE.reset(root_token)
         ctx.__exit__(None, None, None)
 
 
@@ -974,11 +1016,13 @@ def format_final_output(state: Mapping[str, Any]) -> str:
         if not tool_calls:
             continue
         for tc in reversed(tool_calls):
+            name = str(tc.get("name", "")).lower()
+            if name in {"done", "finalize", "finish"}:
+                continue
             last_tool = tc
             break
         if last_tool:
             break
-
     if last_tool:
         name = str(last_tool.get("name", "")).lower()
         args = last_tool.get("args") or {}

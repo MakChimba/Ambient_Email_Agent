@@ -315,25 +315,31 @@ def llm_call(state: State, store: BaseStore):
 
     # Invoke with a retry and fallback to Done to avoid stalls
     try:
-    msg = llm_with_tools.invoke(prompt)
-    response_payload = (
-        msg.model_dump(exclude_none=True)
-        if hasattr(msg, "model_dump")
-        else getattr(msg, "__dict__", msg)
-    )
-    log_llm_child_run(prompt=prompt, response=response_payload)
+        msg = llm_with_tools.invoke(prompt)
+        response_payload = (
+            msg.model_dump(exclude_none=True)
+            if hasattr(msg, "model_dump")
+            else getattr(msg, "__dict__", msg)
+        )
+        log_llm_child_run(prompt=prompt, response=response_payload)
     except Exception:
         msg = None
+
     if not getattr(msg, "tool_calls", None):
-        retry = [{"role": "system", "content": "Your next output must be exactly one tool call with arguments, no assistant text."}] + prompt
+        retry = [
+            {
+                "role": "system",
+                "content": "Your next output must be exactly one tool call with arguments, no assistant text.",
+            }
+        ] + prompt
         try:
-        msg_retry = llm_with_tools.invoke(retry)
-        response_payload_retry = (
-            msg_retry.model_dump(exclude_none=True)
-            if hasattr(msg_retry, "model_dump")
-            else getattr(msg_retry, "__dict__", msg_retry)
-        )
-        log_llm_child_run(prompt=retry, response=response_payload_retry)
+            msg_retry = llm_with_tools.invoke(retry)
+            response_payload_retry = (
+                msg_retry.model_dump(exclude_none=True)
+                if hasattr(msg_retry, "model_dump")
+                else getattr(msg_retry, "__dict__", msg_retry)
+            )
+            log_llm_child_run(prompt=retry, response=response_payload_retry)
             if getattr(msg_retry, "tool_calls", None):
                 msg = msg_retry
         except Exception:

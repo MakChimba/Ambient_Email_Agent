@@ -9,6 +9,7 @@ locally (during pytest runs) and in LangSmith datasets/experiments.
 from __future__ import annotations
 
 import json
+import contextvars
 import os
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
@@ -192,15 +193,26 @@ def run_correctness_judge(
                     details.append(f"score={score}")
             return " ".join(details)
 
+        root_token = None
         try:
-            raw = invoke_with_root_run(
-                lambda: invoke_fn(payload),
-                root_name="judge:gemini_correctness",
-                input_summary=judge_summary,
-                metadata={"payload_keys": list(payload.keys())},
-                output_transform=_summarize_output,
-                project_name=trace_project,
-            )
+            active = False
+            try:
+                active = _JUDGE_ROOT_ACTIVE.get()
+            except LookupError:
+                active = False
+
+            if not active and not _inside_judge_root():
+                root_token = _JUDGE_ROOT_ACTIVE.set(True)
+                raw = invoke_with_root_run(
+                    lambda: invoke_fn(payload),
+                    root_name="judge:gemini_correctness",
+                    input_summary=judge_summary,
+                    metadata={"payload_keys": list(payload.keys())},
+                    output_transform=_summarize_output,
+                    project_name=trace_project,
+                )
+            else:
+                raw = invoke_fn(payload)
         except OutputParserException as exc:
             llm_output = getattr(exc, "llm_output", None)
             snippet = (llm_output or "").strip().splitlines()[0][:160] if llm_output else ""
@@ -212,6 +224,9 @@ def run_correctness_judge(
             if snippet:
                 message += f" First line: {snippet}"
             raise JudgeUnavailableError(message) from exc
+        finally:
+            if root_token is not None:
+                _JUDGE_ROOT_ACTIVE.reset(root_token)
 
         if isinstance(raw, JudgeResult):
             result = raw
@@ -420,115 +435,158 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
     """Attach judge feedback to the current LangSmith run if possible."""
 
     try:
-        run_id = parent_run_id
-        if not run_id:
+        base_run_id = parent_run_id
+        if not base_run_id:
             run_tree = get_current_run_tree()
             if not run_tree:
                 return
-            run_id = run_tree.id
-        run_id = str(run_id)
+            base_run_id = run_tree.id
+        base_run_id = str(base_run_id)
         client = Client()
+
+        def _resolve_agent_run(start_id: str, depth: int = 0) -> str:
+            if depth > 3:
+                return start_id
+            try:
+                current = client.read_run(start_id)
+            except Exception:
+                return start_id
+
+            name = str(getattr(current, "name", "") or "")
+            normalised = name.lower()
+            if normalised.startswith("agent:") or normalised.startswith("email_assistant"):
+                return start_id
+
+            try:
+                children = list(
+                    client.list_runs(parent_run_id=start_id, limit=50, order="asc")
+                )
+            except Exception:
+                children = []
+
+            for child in children:
+                child_name = str(getattr(child, "name", "") or "")
+                child_norm = child_name.lower()
+                if child_norm.startswith("agent:") or child_norm.startswith("email_assistant"):
+                    return str(child.id)
+
+            for child in children:
+                resolved = _resolve_agent_run(str(child.id), depth + 1)
+                if resolved != str(child.id):
+                    return resolved
+
+            return start_id
+
+        target_run_id = _resolve_agent_run(base_run_id)
+        run_ids: list[str] = []
+        for candidate in (base_run_id, target_run_id):
+            if candidate and candidate not in run_ids:
+                run_ids.append(candidate)
 
         # Emit feedback in reverse priority so UI (newest-first) shows verdict → notes → evidence → metrics → diagnostics.
 
-        # Diagnostics first (lowest priority)
-        if result.missing_tools:
-            try:
-                client.create_feedback(
-                    run_id=run_id,
-                    key="missing_tools",
-                    value=", ".join(result.missing_tools),
-                    comment="Tools the agent failed to invoke",
-                )
-            except Exception:
-                pass
-
-        if result.incorrect_tool_uses:
-            for issue in result.incorrect_tool_uses:
+        def _attach_feedback(run_id: str) -> None:
+            # Diagnostics first (lowest priority)
+            if result.missing_tools:
                 try:
                     client.create_feedback(
                         run_id=run_id,
-                        key="tool",
-                        value=issue.tool or "(unknown)",
-                        comment=issue.why or "Incorrect tool usage detected",
+                        key="missing_tools",
+                        value=", ".join(result.missing_tools),
+                        comment="Tools the agent failed to invoke",
                     )
+                except Exception:
+                    pass
+
+            if result.incorrect_tool_uses:
+                for issue in result.incorrect_tool_uses:
+                    try:
+                        client.create_feedback(
+                            run_id=run_id,
+                            key="tool",
+                            value=issue.tool or "(unknown)",
+                            comment=issue.why or "Incorrect tool usage detected",
+                        )
+                        client.create_feedback(
+                            run_id=run_id,
+                            key="why",
+                            value=issue.why or "See comment",
+                            comment=(
+                                f"Tool '{issue.tool}' flagged by judge"
+                                if issue.tool
+                                else "Incorrect tool usage details"
+                            ),
+                        )
+                    except Exception:
+                        continue
+
+            # Metrics next
+            metric_entries = [
+                (
+                    "tool_usage",
+                    result.tool_usage,
+                    "Tool usage score (0-5)",
+                ),
+                (
+                    "content_alignment",
+                    result.content_alignment,
+                    "Content alignment score (0-5)",
+                ),
+                (
+                    "overall_correctness",
+                    result.overall_correctness,
+                    "Weighted correctness (0..1)",
+                ),
+            ]
+            for key, value, comment in metric_entries:
+                try:
                     client.create_feedback(
                         run_id=run_id,
-                        key="why",
-                        value=issue.why or "See comment",
-                        comment=(
-                            f"Tool '{issue.tool}' flagged by judge"
-                            if issue.tool
-                            else "Incorrect tool usage details"
-                        ),
+                        key=key,
+                        score=float(value),
+                        value=str(value),
+                        comment=comment,
                     )
                 except Exception:
                     continue
 
-        # Metrics next
-        metric_entries = [
-            (
-                "tool_usage",
-                result.tool_usage,
-                "Tool usage score (0-5)",
-            ),
-            (
-                "content_alignment",
-                result.content_alignment,
-                "Content alignment score (0-5)",
-            ),
-            (
-                "overall_correctness",
-                result.overall_correctness,
-                "Weighted correctness (0..1)",
-            ),
-        ]
-        for key, value, comment in metric_entries:
-            try:
-                client.create_feedback(
-                    run_id=run_id,
-                    key=key,
-                    score=float(value),
-                    value=str(value),
-                    comment=comment,
-                )
-            except Exception:
-                continue
+            # Evidence bundle (if any)
+            if result.evidence:
+                try:
+                    client.create_feedback(
+                        run_id=run_id,
+                        key="evidence",
+                        value=" | ".join(result.evidence),
+                        comment="Judge evidence snippets",
+                    )
+                except Exception:
+                    pass
 
-        # Evidence bundle (if any)
-        if result.evidence:
+            # Notes
             try:
                 client.create_feedback(
                     run_id=run_id,
-                    key="evidence",
-                    value=" | ".join(result.evidence),
-                    comment="Judge evidence snippets",
+                    key="notes",
+                    value=result.notes,
+                    comment="Judge guidance",
                 )
             except Exception:
                 pass
 
-        # Notes
-        try:
-            client.create_feedback(
-                run_id=run_id,
-                key="notes",
-                value=result.notes,
-                comment="Judge guidance",
-            )
-        except Exception:
-            pass
+            # Verdict last (highest priority for display)
+            try:
+                client.create_feedback(
+                    run_id=run_id,
+                    key="verdict",
+                    value=result.verdict,
+                    comment=f"Pass when overall_correctness ≥ 0.70 (scored {result.overall_correctness:.2f})",
+                    extra=result.model_dump(),
+                )
+            except Exception:
+                pass
 
-        # Verdict last (highest priority for display)
-        try:
-            client.create_feedback(
-                run_id=run_id,
-                key="verdict",
-                value=result.verdict,
-                comment=f"Pass when overall_correctness ≥ 0.70 (scored {result.overall_correctness:.2f})",
-                extra=result.model_dump(),
-            )
-        except Exception:
-            pass
+        for rid in run_ids:
+            _attach_feedback(rid)
 
     except Exception:
         # Feedback attachment is best-effort; ignore failures so tests keep running.
@@ -616,3 +674,25 @@ def create_langsmith_correctness_evaluator(
         model_name=model_name, temperature=temperature
     )
     return LangChainStringEvaluator(evaluator=evaluator)
+
+_JUDGE_ROOT_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "email_assistant_judge_root_active", default=False
+)
+
+
+def _inside_judge_root() -> bool:
+    """Return True when the current LangSmith root run is already the judge."""
+
+    try:
+        tree = get_current_run_tree()
+    except Exception:
+        return False
+    if not tree:
+        return False
+
+    root = tree
+    while getattr(root, "parent_run", None) is not None:
+        root = getattr(root, "parent_run")
+
+    name = str(getattr(root, "name", "")).strip().lower()
+    return name == "judge:gemini_correctness"

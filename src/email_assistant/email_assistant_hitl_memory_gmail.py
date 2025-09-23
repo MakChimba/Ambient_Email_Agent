@@ -1380,6 +1380,10 @@ def mark_as_read_node(state: State):
 
     result_payload: dict[str, Any]
 
+    email_markdown = ""
+    tool_trace = ""
+    output_text = ""
+
     with trace_stage(
         "mark_as_read_node",
         run_type="chain",
@@ -1398,12 +1402,6 @@ def mark_as_read_node(state: State):
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
         tool_trace = format_messages_string(state.get("messages", []))
         output_text = format_final_output(state)
-        prime_parent_run(
-            email_input=state.get("email_input", {}),
-            email_markdown=email_markdown,
-            outputs=output_text,
-            extra_update={"email_id": email_id},
-        )
 
         from langchain_core.messages import AIMessage
         summary = None
@@ -1441,6 +1439,13 @@ def mark_as_read_node(state: State):
 
         if trace:
             trace.set_outputs(output_text or "workflow complete")
+
+    prime_parent_run(
+        email_input=state.get("email_input", {}),
+        email_markdown=email_markdown,
+        outputs=output_text,
+        extra_update={"email_id": email_id},
+    )
 
     return result_payload
 
