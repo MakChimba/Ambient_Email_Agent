@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import contextvars
 import os
+import time
 from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -27,6 +28,8 @@ from langsmith.schemas import Example, Run
 
 from email_assistant.utils import extract_message_content, format_messages_string
 from email_assistant.tracing import invoke_with_root_run, strip_markdown_to_text
+
+_FEEDBACK_PRIORITY_DELAY = float(os.getenv("EMAIL_ASSISTANT_FEEDBACK_DELAY", "0.05"))
 
 __all__ = [
     "JudgeResult",
@@ -444,6 +447,27 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
         base_run_id = str(base_run_id)
         client = Client()
 
+        def _ancestor_chain(start_id: str, max_depth: int = 6) -> List[Tuple[str, str]]:
+            chain: List[Tuple[str, str]] = []
+            current_id = start_id
+            visited: set[str] = set()
+            for _ in range(max_depth):
+                if not current_id or current_id in visited:
+                    break
+                visited.add(current_id)
+                try:
+                    current = client.read_run(current_id)
+                except Exception:
+                    chain.append((current_id, ""))
+                    break
+                name = str(getattr(current, "name", "") or "")
+                chain.append((str(current.id), name))
+                parent_id = getattr(current, "parent_run_id", None)
+                if not parent_id:
+                    break
+                current_id = str(parent_id)
+            return chain
+
         def _resolve_agent_run(start_id: str, depth: int = 0) -> str:
             if depth > 3:
                 return start_id
@@ -478,49 +502,54 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
             return start_id
 
         target_run_id = _resolve_agent_run(base_run_id)
+        ancestors = _ancestor_chain(base_run_id)
+        agent_ancestor_id: Optional[str] = None
+        for ancestor_id, name in ancestors:
+            if name.lower().startswith("agent:") or name.lower().startswith(
+                "email_assistant"
+            ):
+                agent_ancestor_id = ancestor_id
+                break
         run_ids: list[str] = []
-        for candidate in (base_run_id, target_run_id):
+        for candidate in (base_run_id, target_run_id, agent_ancestor_id):
             if candidate and candidate not in run_ids:
                 run_ids.append(candidate)
 
-        # Emit feedback in reverse priority so UI (newest-first) shows verdict → notes → evidence → metrics → diagnostics.
-
         def _attach_feedback(run_id: str) -> None:
-            # Diagnostics first (lowest priority)
-            if result.missing_tools:
+            def _safe_feedback(**kwargs: Any) -> None:
                 try:
-                    client.create_feedback(
-                        run_id=run_id,
-                        key="missing_tools",
-                        value=", ".join(result.missing_tools),
-                        comment="Tools the agent failed to invoke",
-                    )
+                    client.create_feedback(run_id=run_id, **kwargs)
+                    if _FEEDBACK_PRIORITY_DELAY > 0:
+                        time.sleep(_FEEDBACK_PRIORITY_DELAY)
                 except Exception:
                     pass
 
+            # Diagnostics lowest priority so they appear at the bottom of the UI.
+            if result.missing_tools:
+                _safe_feedback(
+                    key="missing_tools",
+                    value=", ".join(result.missing_tools),
+                    comment="Tools the agent failed to invoke",
+                )
+
             if result.incorrect_tool_uses:
                 for issue in result.incorrect_tool_uses:
-                    try:
-                        client.create_feedback(
-                            run_id=run_id,
-                            key="tool",
-                            value=issue.tool or "(unknown)",
-                            comment=issue.why or "Incorrect tool usage detected",
-                        )
-                        client.create_feedback(
-                            run_id=run_id,
-                            key="why",
-                            value=issue.why or "See comment",
-                            comment=(
-                                f"Tool '{issue.tool}' flagged by judge"
-                                if issue.tool
-                                else "Incorrect tool usage details"
-                            ),
-                        )
-                    except Exception:
-                        continue
+                    _safe_feedback(
+                        key="tool",
+                        value=issue.tool or "(unknown)",
+                        comment=issue.why or "Incorrect tool usage detected",
+                    )
+                    _safe_feedback(
+                        key="why",
+                        value=issue.why or "See comment",
+                        comment=(
+                            f"Tool '{issue.tool}' flagged by judge"
+                            if issue.tool
+                            else "Incorrect tool usage details"
+                        ),
+                    )
 
-            # Metrics next
+            # Metrics next.
             metric_entries = [
                 (
                     "tool_usage",
@@ -539,51 +568,39 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                 ),
             ]
             for key, value, comment in metric_entries:
-                try:
-                    client.create_feedback(
-                        run_id=run_id,
-                        key=key,
-                        score=float(value),
-                        value=str(value),
-                        comment=comment,
-                    )
-                except Exception:
+                if value is None:
                     continue
+                _safe_feedback(
+                    key=key,
+                    score=float(value),
+                    value=str(value),
+                    comment=comment,
+                )
 
-            # Evidence bundle (if any)
+            # Evidence bundle.
             if result.evidence:
-                try:
-                    client.create_feedback(
-                        run_id=run_id,
-                        key="evidence",
-                        value=" | ".join(result.evidence),
-                        comment="Judge evidence snippets",
-                    )
-                except Exception:
-                    pass
+                _safe_feedback(
+                    key="evidence",
+                    value=" | ".join(result.evidence),
+                    comment="Judge evidence snippets",
+                )
 
-            # Notes
-            try:
-                client.create_feedback(
-                    run_id=run_id,
+            # Notes ahead of verdict.
+            if result.notes:
+                _safe_feedback(
                     key="notes",
                     value=result.notes,
                     comment="Judge guidance",
                 )
-            except Exception:
-                pass
 
-            # Verdict last (highest priority for display)
-            try:
-                client.create_feedback(
-                    run_id=run_id,
+            # Verdict last so newest-first ordering shows it at the top.
+            if result.verdict:
+                _safe_feedback(
                     key="verdict",
                     value=result.verdict,
                     comment=f"Pass when overall_correctness ≥ 0.70 (scored {result.overall_correctness:.2f})",
                     extra=result.model_dump(),
                 )
-            except Exception:
-                pass
 
         for rid in run_ids:
             _attach_feedback(rid)

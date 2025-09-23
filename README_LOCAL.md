@@ -49,8 +49,8 @@ This repo supports both offline-friendly tests and live model evaluation.
 ### Defaults
 
 - The default agent for test runs is the Gmail HITL+memory agent: `email_assistant_hitl_memory_gmail`.
-- Live testing (default): provide `GOOGLE_API_KEY` and leave `EMAIL_ASSISTANT_EVAL_MODE` unset/`0` to exercise the real Gemini model.
-- Deterministic/offline runs: set the following toggles when you need to avoid live calls:
+- **Live-first policy:** production prep and cloud Codex agents should run with real Gemini calls. Provide `GOOGLE_API_KEY` and leave `EMAIL_ASSISTANT_EVAL_MODE` unset/`0`. The offline toggles below are only for CI fallbacks or when credentials are unavailable.
+- Deterministic/offline runs (use sparingly): set the following toggles when you need to avoid live calls:
   - `HITL_AUTO_ACCEPT=1`
   - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
   - `EMAIL_ASSISTANT_EVAL_MODE=1` (synthesize tool calls without a live LLM)
@@ -71,7 +71,7 @@ This repo supports both offline-friendly tests and live model evaluation.
   - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
     - Exercises the Question → `mark_as_spam_tool` HITL path end-to-end. Works live by default; set `EMAIL_ASSISTANT_EVAL_MODE=1` for offline CI paths.
 - When `LANGSMITH_TRACING=true`, traces default to date-scoped projects `email-assistant:AGENT-YYYYMMDD` and `email-assistant:JUDGE-YYYYMMDD`. Override the assistant grouping with `EMAIL_ASSISTANT_TRACE_PROJECT` and judge grouping with `EMAIL_ASSISTANT_JUDGE_PROJECT` (or `EMAIL_ASSISTANT_JUDGE_PROJECT_OVERRIDE`). Use `EMAIL_ASSISTANT_TRACE_STAGE` / `EMAIL_ASSISTANT_TRACE_TAGS` to add extra tags (e.g. `pytest`, `tool_calls`). The runtime now also sets `GRPC_VERBOSITY=ERROR` automatically (unless you override it) so Gemini’s gRPC client doesn’t spam the console with ALTS warnings.
-- Parent and child runs now log plain-text grid cells: inputs use a single-line email summary, outputs follow the two-line policy (`[reply]` etc.), and raw payloads live under metadata/extra (`tool_raw`, `email_markdown`).
+- Parent and child runs now log plain-text grid cells: inputs use a single-line email summary, outputs follow the two-line policy (`[reply]` etc.), and raw payloads live under metadata/extra (`tool_raw`, `email_markdown`). The formatter skips terminal `Done` tool calls so the LangSmith Output column highlights the final reply or tool action instead of the noop wrapper.
 - LLM-as-judge (optional, Gemini 2.5 Flash):
   - `EMAIL_ASSISTANT_LLM_JUDGE=1` adds a post-test review powered by the Gemini judge for every `test_response.py` case. The prompt now makes the model list any missing or incorrect tool usages explicitly and clamps scores when issues exist, so flaky high scores are avoided.
   - Add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail the test immediately when the judge's verdict is `fail`.
@@ -90,6 +90,7 @@ This repo supports both offline-friendly tests and live model evaluation.
     judge = create_langsmith_correctness_evaluator()
     client.evaluate(target_fn, data="my_dataset", evaluators=[judge])
     ```
+  - Feedback ordering: LangSmith displays the newest feedback first. Our judge logger posts low-priority diagnostics first and waits `EMAIL_ASSISTANT_FEEDBACK_DELAY` seconds (default `0.05`) between writes so verdict → notes → evidence appear at the top of the parent run. Set the env var to `0` to disable the pause if you do not mind LangSmith occasionally merging entries into a single timestamp.
 
 Judge output structure example:
 ```
