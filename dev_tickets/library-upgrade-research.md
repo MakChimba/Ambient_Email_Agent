@@ -88,10 +88,10 @@
    - Validate SQLite saver integration (run memory + reminder tests).
    - Exercise HITL flows manually or via `tests/test_live_hitl_spam.py` to ensure interrupts/resumes serialize correctly.
 
-3. **Adopt new features (optional follow-up)**
-   - Evaluate `langsmith.Client.get_experiment_results()` to replace bespoke pagination in `src/email_assistant/eval/judges.py`.
-   - Investigate `HumanInterrupt` helper to standardize Agent Inbox payloads and reduce manual dict shaping.
-   - Consider wrapping high-side-effect nodes in `@task` for better durable replay semantics.
+3. **Adopt new features (optional follow-up)** — ❗️Completed (see `dev_tickets/adopt-new-features.md` for full notes)
+   - `Client.get_experiment_results()` now powers judge pagination and `_record_feedback` fallbacks.
+   - HITL requests use `HumanInterrupt`; tool/LLM nodes run through `@task` helpers for durable execution.
+   - Remaining follow-ups: enhance deterministic fallback planners and re-run live suites with Gmail creds.
 
 4. **Documentation & tooling**
    - Update README/AGENTS docs with new env expectations (`OTEL_ONLY`, org-scoped keys, durability option).
