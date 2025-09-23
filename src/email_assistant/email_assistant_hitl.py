@@ -10,6 +10,7 @@ from email_assistant.prompts import triage_system_prompt, triage_user_prompt, ag
 from email_assistant.configuration import get_llm
 from email_assistant.schemas import State, RouterSchema, StateInput
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
+from email_assistant.checkpointing import new_memory_checkpointer
 from email_assistant.tracing import (
     AGENT_PROJECT,
     init_project,
@@ -427,7 +428,7 @@ response_agent = agent_builder.compile()
 
 # Build overall workflow
 overall_workflow = (
-    StateGraph(State, input=StateInput)
+    StateGraph(State, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
@@ -435,4 +436,9 @@ overall_workflow = (
     
 )
 
-email_assistant = overall_workflow.compile()
+_DEFAULT_CHECKPOINTER = new_memory_checkpointer()
+email_assistant = (
+    overall_workflow
+    .compile(checkpointer=_DEFAULT_CHECKPOINTER)
+    .with_config(durability="sync")
+)

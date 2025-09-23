@@ -32,6 +32,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 
 ## Recent Changes and Improvements
 
+- LangGraph 0.6 upgrade: default graphs compile with SQLite-backed checkpoints/stores (`EMAIL_ASSISTANT_CHECKPOINT_PATH`, `EMAIL_ASSISTANT_STORE_PATH` override the default `~/.langgraph/` location) so HITL interrupts survive process restarts.
 - Gemini 2.5 compatibility: tool binding now uses `tool_choice="any"` for HITL agents (`email_assistant_hitl`, `email_assistant_hitl_memory`) to avoid the Gemini 400 error about `allowed_function_names`.
 - Robust triage routing: If the router’s structured output is missing/invalid, defaults to `respond` to prevent stalls. The HITL + memory agent also incorporates `response_preferences` into triage so preference rules (e.g., “don’t reply to direct action”) influence notify vs respond.
 - HITL auto-accept: Both memory agents support `HITL_AUTO_ACCEPT=1` to accept interrupt actions automatically (useful for demos/tests). Unset the env var to use Agent Inbox interactively.

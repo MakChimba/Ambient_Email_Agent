@@ -25,15 +25,21 @@
   - [x] Update `pyproject.toml` / `uv.lock` to `langsmith==0.4.30`, `langchain==0.3.27` (keep LangGraph at 0.4.8 temporarily).
   - [x] Run `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` with live Gemini configuration.
   - [x] Verify LangSmith queue env vars (`LANGSMITH_MAX_BATCH_SIZE`, `run_ops_buffer_size`, `run_ops_buffer_timeout_ms`, `max_batch_size_bytes`) interact correctly and that `_record_feedback` flushes in staging when `LANGSMITH_RUN_ENDPOINTS` is overridden.
-- [ ] **Phase 2 – LangGraph 0.6 upgrade**
-  - [ ] Bump LangGraph to 0.6.x and replace deprecated `checkpoint_during` usage with explicit `durability` arguments where persistence before HITL is required.
-  - [ ] Confirm interrupt payload consumers ignore removed `ns` / `resumable` fields (update Agent Inbox serializers/tests as needed).
-  - [ ] Validate `SqliteSaver` integration (memory agent + reminder worker) following 0.6 guidance on context manager usage.
-  - [ ] Exercise HITL flows via `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail` (live) and deterministic eval mode (`EMAIL_ASSISTANT_EVAL_MODE=1`, `HITL_AUTO_ACCEPT=1`).
+- [x] **Phase 2 – LangGraph 0.6 upgrade**
+  - [x] Bump LangGraph to 0.6.x and replace deprecated `checkpoint_during` usage with explicit `durability` arguments where persistence before HITL is required.
+  - [x] Confirm interrupt payload consumers ignore removed `ns` / `resumable` fields (update Agent Inbox serializers/tests as needed).
+  - [x] Validate `SqliteSaver` integration (memory agent + reminder worker) following 0.6 guidance on context manager usage.
+  - [x] Exercise HITL flows via `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail` (live) and deterministic eval mode (`EMAIL_ASSISTANT_EVAL_MODE=1`, `HITL_AUTO_ACCEPT=1`).
 - [ ] **Phase 3 – Optional enhancements**
   - [ ] Assess adoption of `langsmith.Client.get_experiment_results()` for judge pagination in `src/email_assistant/eval/judges.py`.
   - [ ] Evaluate replacing manual HITL payload dicts with `langgraph.prebuilt.interrupt.HumanInterrupt`.
   - [ ] Consider wrapping high side-effect nodes with `@task` decorators for better durable replay semantics.
+
+### Phase 3 Handover Notes
+- Fresh instance setup: ensure `GOOGLE_API_KEY`, `GEMINI_MODEL=gemini-2.5-pro`, and LangSmith tracing envs are configured before running live pytest suites (`tests/test_live_smoke.py`, `tests/test_response.py -k tool_calls`, `tests/test_live_hitl_spam.py`).
+- Optional judge pagination work requires reviewing `src/email_assistant/eval/judges.py` and aligning with LangSmith 0.4.30's `get_experiment_results()` API; capture any new dependencies in `pyproject.toml` before regenerating `uv.lock`.
+- HumanInterrupt adoption will touch the HITL nodes in `email_assistant_hitl.py`, `email_assistant_hitl_memory.py`, and `email_assistant_hitl_memory_gmail.py`; plan to refresh snapshot tests once payload shapes change.
+- If exploring `@task` decorators for high-impact nodes, focus on tool-execution stages (`llm_call`, `interrupt_handler`) and re-run both live and eval-mode test matrices to confirm durability semantics remain intact.
 - [ ] **Documentation & Communication**
   - [ ] Update README / agent docs with new env toggles (`OTEL_ENABLED`, `OTEL_ONLY`, durability usage, org-scoped LangSmith keys, reminder worker notes).
   - [ ] Capture testing matrix (live vs eval modes, env var combinations) for regression reference.

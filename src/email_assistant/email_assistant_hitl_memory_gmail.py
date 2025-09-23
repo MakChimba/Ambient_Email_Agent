@@ -41,6 +41,7 @@ from email_assistant.tracing import (
     trace_stage,
 )
 from email_assistant.tools.reminders import get_default_store
+from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from dotenv import load_dotenv
 
 load_dotenv(".env")
@@ -1469,7 +1470,7 @@ agent_builder.add_edge("mark_as_read_node", END)
 response_agent = agent_builder.compile()
 
 overall_workflow = (
-    StateGraph(State, input=StateInput)
+    StateGraph(State, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
@@ -1478,4 +1479,14 @@ overall_workflow = (
     .add_edge("mark_as_read_node", END)
 )
 
-email_assistant = overall_workflow.compile()
+_DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
+_DEFAULT_STORE = get_sqlite_store()
+
+email_assistant = (
+    overall_workflow
+    .compile(
+        checkpointer=_DEFAULT_CHECKPOINTER,
+        store=_DEFAULT_STORE,
+    )
+    .with_config(durability="sync")
+)

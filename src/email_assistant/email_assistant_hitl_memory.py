@@ -10,6 +10,7 @@ from email_assistant.prompts import triage_system_prompt, triage_user_prompt, ag
 from email_assistant.configuration import get_llm
 from email_assistant.schemas import State, RouterSchema, StateInput, UserPreferences
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
+from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from email_assistant.tracing import (
     AGENT_PROJECT,
     init_project,
@@ -613,11 +614,21 @@ response_agent = agent_builder.compile()
 
 # Build overall workflow with store and checkpointer
 overall_workflow = (
-    StateGraph(State, input=StateInput)
+    StateGraph(State, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
 )
 
-email_assistant = overall_workflow.compile()
+_DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
+_DEFAULT_STORE = get_sqlite_store()
+
+email_assistant = (
+    overall_workflow
+    .compile(
+        checkpointer=_DEFAULT_CHECKPOINTER,
+        store=_DEFAULT_STORE,
+    )
+    .with_config(durability="sync")
+)
