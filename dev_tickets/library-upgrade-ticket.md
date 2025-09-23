@@ -21,10 +21,10 @@
 - Broad refactors to agent logic.
 
 ## Implementation Plan
-- [ ] **Phase 1 – Library pin bump**
-  - [ ] Update `pyproject.toml` / `uv.lock` to `langsmith==0.4.30`, `langchain==0.3.27` (keep LangGraph at 0.4.8 temporarily).
-  - [ ] Run `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` with live Gemini configuration.
-  - [ ] Verify LangSmith queue env vars (`LANGSMITH_MAX_BATCH_SIZE`, `run_ops_buffer_size`, `run_ops_buffer_timeout_ms`, `max_batch_size_bytes`) interact correctly and that `_record_feedback` flushes in staging when `LANGSMITH_RUN_ENDPOINTS` is overridden.
+- [x] **Phase 1 – Library pin bump**
+  - [x] Update `pyproject.toml` / `uv.lock` to `langsmith==0.4.30`, `langchain==0.3.27` (keep LangGraph at 0.4.8 temporarily).
+  - [x] Run `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` with live Gemini configuration.
+  - [x] Verify LangSmith queue env vars (`LANGSMITH_MAX_BATCH_SIZE`, `run_ops_buffer_size`, `run_ops_buffer_timeout_ms`, `max_batch_size_bytes`) interact correctly and that `_record_feedback` flushes in staging when `LANGSMITH_RUN_ENDPOINTS` is overridden.
 - [ ] **Phase 2 – LangGraph 0.6 upgrade**
   - [ ] Bump LangGraph to 0.6.x and replace deprecated `checkpoint_during` usage with explicit `durability` arguments where persistence before HITL is required.
   - [ ] Confirm interrupt payload consumers ignore removed `ns` / `resumable` fields (update Agent Inbox serializers/tests as needed).

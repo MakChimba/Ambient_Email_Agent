@@ -2,6 +2,12 @@
 
 This document contains recipes and notes for running the Email Assistant components in a local development environment, particularly under WSL.
 
+## Dependency Pins
+
+- Core libraries are currently pinned to `langchain==0.3.27`, `langsmith[pytest]==0.4.30`, and `langgraph==0.4.8` (Phase 1 of the library upgrade ticket).
+- After adjusting pins, run `uv lock` so the resolver captures the new versions and transitive updates (for example, `yarl` and `vcrpy` now appear through the LangSmith pytest extras).
+- Live-mode pytest (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) may surface LangSmith queue telemetry without Gmail credentials; these warnings are expected when Gmail APIs are not configured locally.
+
 ## Running the Reminder Worker
 
 The reminder worker is a standalone script that should run as a persistent background process to check for due reminders.
