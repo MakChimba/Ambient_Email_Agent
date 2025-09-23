@@ -8,6 +8,8 @@ This document contains recipes and notes for running the Email Assistant compone
 - After adjusting pins, run `uv lock` so the resolver captures the new versions and transitive updates (for example, `yarl` and `vcrpy` now appear through the LangSmith pytest extras).
 - Live-mode pytest (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) may surface LangSmith queue telemetry without Gmail credentials; these warnings are expected when Gmail APIs are not configured locally.
 - LangGraph 0.6 agents now load a SQLite checkpointer/store by default. Override paths with `EMAIL_ASSISTANT_CHECKPOINT_PATH` / `EMAIL_ASSISTANT_STORE_PATH` if you want the on-disk artefacts somewhere other than `~/.langgraph/`.
+- HITL flows now emit interrupts via `langgraph.prebuilt.interrupt.HumanInterrupt`, and the LLM/tool nodes are wrapped with `@task` so durable replays persist side effects.
+- LangSmith experiment pagination is handled through `iter_experiment_runs()` (see `src/email_assistant/eval/judges.py`), which leverages `Client.get_experiment_results()` to stream more than 100 judge records when reviewing datasets locally.
 
 ## Running the Reminder Worker
 

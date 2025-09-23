@@ -13,7 +13,8 @@ import contextvars
 import os
 import time
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Literal, Optional, Tuple
+from uuid import UUID
 
 from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import JsonOutputParser
@@ -39,6 +40,7 @@ __all__ = [
     "run_correctness_judge",
     "serialise_messages",
     "create_langsmith_correctness_evaluator",
+    "iter_experiment_runs",
 ]
 
 
@@ -499,6 +501,23 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                 if resolved != str(child.id):
                     return resolved
 
+            session_id = getattr(current, "session_id", None)
+            if session_id:
+                try:
+                    for candidate_run in iter_experiment_runs(
+                        client=client,
+                        project_id=session_id,
+                        preview=True,
+                        limit=200,
+                    ):
+                        candidate_name = str(getattr(candidate_run, "name", "") or "").lower()
+                        if candidate_name.startswith("agent:") or candidate_name.startswith(
+                            "email_assistant"
+                        ):
+                            return str(candidate_run.id)
+                except Exception:
+                    pass
+
             return start_id
 
         target_run_id = _resolve_agent_run(base_run_id)
@@ -695,6 +714,59 @@ def create_langsmith_correctness_evaluator(
 _JUDGE_ROOT_ACTIVE: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "email_assistant_judge_root_active", default=False
 )
+
+
+def iter_experiment_runs(
+    *,
+    experiment_name: Optional[str] = None,
+    project_id: Optional[UUID | str] = None,
+    client: Optional[Client] = None,
+    preview: bool = True,
+    limit: Optional[int] = None,
+) -> Iterator[Run]:
+    """Yield runs from a LangSmith experiment using the streaming results API.
+
+    Args:
+        experiment_name: Optional experiment name when you prefer lookup by name.
+        project_id: Experiment session ID (UUID or string form).
+        client: Existing LangSmith client (defaults to constructing a new one).
+        preview: When True, request lightweight previews instead of full payloads.
+        limit: Optional cap on total runs to yield.
+
+    Returns:
+        Iterator of LangSmith ``Run`` objects in dataset order.
+    """
+
+    resolved_client = client or Client()
+    kwargs: Dict[str, Any] = {"preview": preview}
+    if experiment_name:
+        kwargs["name"] = experiment_name
+    if limit is not None:
+        kwargs["limit"] = limit
+    if project_id:
+        try:
+            project_uuid = project_id if isinstance(project_id, UUID) else UUID(str(project_id))
+        except Exception as exc:  # pragma: no cover - defensive conversion guard
+            raise ValueError(f"Invalid project_id supplied: {project_id}") from exc
+        kwargs["project_id"] = project_uuid
+
+    try:
+        results = resolved_client.get_experiment_results(**kwargs)
+    except Exception:
+        return
+
+    examples = results.get("examples_with_runs") if isinstance(results, dict) else getattr(results, "examples_with_runs", None)
+    if examples is None:
+        return
+
+    total_yielded = 0
+    for example in examples:
+        runs = getattr(example, "runs", None) or []
+        for run in runs:
+            yield run
+            total_yielded += 1
+            if limit is not None and total_yielded >= limit:
+                return
 
 
 def _inside_judge_root() -> bool:

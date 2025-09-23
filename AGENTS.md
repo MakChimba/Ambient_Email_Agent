@@ -33,6 +33,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 ## Recent Changes and Improvements
 
 - LangGraph 0.6 upgrade: default graphs compile with SQLite-backed checkpoints/stores (`EMAIL_ASSISTANT_CHECKPOINT_PATH`, `EMAIL_ASSISTANT_STORE_PATH` override the default `~/.langgraph/` location) so HITL interrupts survive process restarts.
+- HITL payloads now use the typed `HumanInterrupt` helper and the tool/LLM nodes are wrapped with `@task` to follow LangGraph’s durable execution guidance.
 - Gemini 2.5 compatibility: tool binding now uses `tool_choice="any"` for HITL agents (`email_assistant_hitl`, `email_assistant_hitl_memory`) to avoid the Gemini 400 error about `allowed_function_names`.
 - Robust triage routing: If the router’s structured output is missing/invalid, defaults to `respond` to prevent stalls. The HITL + memory agent also incorporates `response_preferences` into triage so preference rules (e.g., “don’t reply to direct action”) influence notify vs respond.
 - HITL auto-accept: Both memory agents support `HITL_AUTO_ACCEPT=1` to accept interrupt actions automatically (useful for demos/tests). Unset the env var to use Agent Inbox interactively.
@@ -48,9 +49,10 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
  - Auto‑HITL Question handling: In auto‑accept demos/tests, `Question` prompts receive a minimal synthetic response so flows proceed without manual input. In live HITL, true interrupts are preserved.
  - Gmail HITL card improvements: For `send_email_tool`, the Agent Inbox card now clearly shows the resolved recipient (original sender) as `To`, your account as `From`, and a normalized `Subject` (adds `Re:` if missing) alongside the drafted body. This makes approvals unambiguous.
  - StructuredPrompt outputs (Gmail): The Gmail agent now returns additional top-level fields in the final state to support external evaluators:
-   - `assistant_reply`: concise summary of the sent reply
-   - `tool_trace`: normalized conversation + tool-call trace
-   - `email_markdown`: canonical email context block
+ - `assistant_reply`: concise summary of the sent reply
+ - `tool_trace`: normalized conversation + tool-call trace
+ - `email_markdown`: canonical email context block
+- Judge + dataset reviews can iterate large LangSmith experiments via `iter_experiment_runs()` (in `email_assistant.eval.judges`), which uses `Client.get_experiment_results()` to page through results without manual offsets.
  - Tool-arg compatibility toggle: Some evaluators expect `send_email_tool.email_address` to contain the reply recipient (the other party). By default (live mode), `email_address` remains your address (correct for Gmail). For compatibility in evals/demos, set `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (this is also implied when `EMAIL_ASSISTANT_EVAL_MODE=1`).
   - Timezone defaults: The Gmail agent uses Australia/Melbourne by default for prompts and scheduling tools unless an explicit timezone is provided.
 

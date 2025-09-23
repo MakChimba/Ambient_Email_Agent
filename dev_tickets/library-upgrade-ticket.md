@@ -30,20 +30,20 @@
   - [x] Confirm interrupt payload consumers ignore removed `ns` / `resumable` fields (update Agent Inbox serializers/tests as needed).
   - [x] Validate `SqliteSaver` integration (memory agent + reminder worker) following 0.6 guidance on context manager usage.
   - [x] Exercise HITL flows via `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail` (live) and deterministic eval mode (`EMAIL_ASSISTANT_EVAL_MODE=1`, `HITL_AUTO_ACCEPT=1`).
-- [ ] **Phase 3 – Optional enhancements**
-  - [ ] Assess adoption of `langsmith.Client.get_experiment_results()` for judge pagination in `src/email_assistant/eval/judges.py`.
-  - [ ] Evaluate replacing manual HITL payload dicts with `langgraph.prebuilt.interrupt.HumanInterrupt`.
-  - [ ] Consider wrapping high side-effect nodes with `@task` decorators for better durable replay semantics.
+- [x] **Phase 3 – Optional enhancements**
+  - [x] Assess adoption of `langsmith.Client.get_experiment_results()` for judge pagination in `src/email_assistant/eval/judges.py`.
+  - [x] Evaluate replacing manual HITL payload dicts with `langgraph.prebuilt.interrupt.HumanInterrupt`.
+  - [x] Consider wrapping high side-effect nodes with `@task` decorators for better durable replay semantics.
 
 ### Phase 3 Handover Notes
 - Fresh instance setup: ensure `GOOGLE_API_KEY`, `GEMINI_MODEL=gemini-2.5-pro`, and LangSmith tracing envs are configured before running live pytest suites (`tests/test_live_smoke.py`, `tests/test_response.py -k tool_calls`, `tests/test_live_hitl_spam.py`).
-- Optional judge pagination work requires reviewing `src/email_assistant/eval/judges.py` and aligning with LangSmith 0.4.30's `get_experiment_results()` API; capture any new dependencies in `pyproject.toml` before regenerating `uv.lock`.
-- HumanInterrupt adoption will touch the HITL nodes in `email_assistant_hitl.py`, `email_assistant_hitl_memory.py`, and `email_assistant_hitl_memory_gmail.py`; plan to refresh snapshot tests once payload shapes change.
-- If exploring `@task` decorators for high-impact nodes, focus on tool-execution stages (`llm_call`, `interrupt_handler`) and re-run both live and eval-mode test matrices to confirm durability semantics remain intact.
-- [ ] **Documentation & Communication**
-  - [ ] Update README / agent docs with new env toggles (`OTEL_ENABLED`, `OTEL_ONLY`, durability usage, org-scoped LangSmith keys, reminder worker notes).
-  - [ ] Capture testing matrix (live vs eval modes, env var combinations) for regression reference.
-  - [ ] Announce migration steps + rollback plan to the team once Phase 2 is validated.
+- Judge pagination now relies on `get_experiment_results()` via the new `iter_experiment_runs()` helper; future tweaks should build on that abstraction rather than reintroducing manual offsets.
+- HITL requests across all agents now flow through `HumanInterrupt`, so any new interrupt types should use the same helper (and update the Agent Inbox schema docs if additional config flags appear).
+- Side-effect nodes (`llm_call`, `interrupt_handler`, Gmail `mark_as_read_node`, etc.) are wrapped with `@task`—keep using the decorator for new tool/LLM stages so durability remains deterministic.
+- [x] **Documentation & Communication**
+  - [x] Update README / agent docs with new env toggles (`OTEL_ENABLED`, `OTEL_ONLY`, durability usage, org-scoped LangSmith keys, reminder worker notes).
+  - [x] Capture testing matrix (live vs eval modes, env var combinations) for regression reference.
+  - [x] Announce migration steps + rollback plan to the team once Phase 2 is validated.
 
 ## Acceptance Criteria
 - All automated suites (`tests/test_response.py -k tool_calls`, `tests/test_live_smoke.py`, `tests/test_live_hitl_spam.py`) pass in live mode post-upgrade.

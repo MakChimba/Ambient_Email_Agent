@@ -17,6 +17,7 @@ from email_assistant.prompts import triage_system_prompt, triage_user_prompt, ag
 from email_assistant.schemas import State, RouterSchema, StateInput
 from email_assistant.utils import parse_email, format_email_markdown
 
+from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command
 from dotenv import load_dotenv, find_dotenv
@@ -168,7 +169,8 @@ def _heuristic_triage(email_input: dict) -> Literal["ignore", "respond", "notify
 
     # Default to respond
     return "respond"
-def llm_call(state: State):
+@task
+def llm_call_task(state: State):
     """LLM decides whether to call a tool or not, with a 'Done' nudge."""
     # Base system prompt
     system_msg = {
@@ -230,7 +232,14 @@ def llm_call(state: State):
             msg = _fallback_tool_plan(state.get("email_input", {}))
     return {"messages": [msg]}
 
-def tool_node(state: State):
+
+def llm_call(state: State):
+    """Wrapper that synchronously waits for the llm_call task."""
+
+    return llm_call_task(state).result()
+
+@task
+def tool_node_task(state: State):
     """Performs the tool call"""
 
     result = []
@@ -240,6 +249,12 @@ def tool_node(state: State):
         log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
         result.append({"role": "tool", "content" : observation, "tool_call_id": tool_call["id"]})
     return {"messages": result}
+
+
+def tool_node(state: State):
+    """Execute tool_node task and return its resolved result."""
+
+    return tool_node_task(state).result()
 
 # Conditional edge function
 def should_continue(state: State) -> Literal["Action", "__end__"]:
@@ -292,7 +307,8 @@ agent_builder.add_edge("environment", "llm_call")
 # Compile the agent
 agent = agent_builder.compile()
 
-def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]:
+@task
+def triage_router_task(state: State) -> Command[Literal["response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -376,6 +392,12 @@ def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]
     else:
         raise ValueError(f"Invalid classification: {classification}")
     return Command(goto=goto, update=update)
+
+
+def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]:
+    """Synchronously wait for the triage router task to finish."""
+
+    return triage_router_task(state).result()
 
 # Build workflow
 overall_workflow = (

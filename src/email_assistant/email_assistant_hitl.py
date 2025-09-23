@@ -1,7 +1,13 @@
 from typing import Literal
 import os
 
+from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt.interrupt import (
+    ActionRequest,
+    HumanInterrupt,
+    HumanInterruptConfig,
+)
 from langgraph.types import interrupt, Command
 
 from email_assistant.tools import get_tools, get_tools_by_name
@@ -44,7 +50,8 @@ llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_o
 llm_with_tools = get_llm(temperature=0.0, model=TOOL_MODEL_NAME).bind_tools(tools, tool_choice="any")
 
 # Nodes 
-def triage_router(state: State) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+@task
+def triage_router_task(state: State) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -121,7 +128,14 @@ def triage_router(state: State) -> Command[Literal["triage_interrupt_handler", "
         raise ValueError(f"Invalid classification: {classification}")
     return Command(goto=goto, update=update)
 
-def triage_interrupt_handler(state: State) -> Command[Literal["response_agent", "__end__"]]:
+
+def triage_router(state: State) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+    """Synchronously execute the triage router task."""
+
+    return triage_router_task(state).result()
+
+@task
+def triage_interrupt_handler_task(state: State) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     
     # Parse the email input
@@ -136,20 +150,19 @@ def triage_interrupt_handler(state: State) -> Command[Literal["response_agent", 
                 }]
 
     # Create interrupt for Agent Inbox
-    request = {
-        "action_request": {
-            "action": f"Email Assistant: {state['classification_decision']}",
-            "args": {}
-        },
-        "config": {
-            "allow_ignore": True,  
-            "allow_respond": True, 
-            "allow_edit": False, 
-            "allow_accept": False,  
-        },
-        # Email to show in Agent Inbox
-        "description": email_markdown,
-    }
+    request: HumanInterrupt = HumanInterrupt(
+        action_request=ActionRequest(
+            action=f"Email Assistant: {state['classification_decision']}",
+            args={},
+        ),
+        config=HumanInterruptConfig(
+            allow_ignore=True,
+            allow_respond=True,
+            allow_edit=False,
+            allow_accept=False,
+        ),
+        description=email_markdown,
+    )
 
     # Agent Inbox responds with a list  
     response = interrupt([request])[0]
@@ -180,7 +193,14 @@ def triage_interrupt_handler(state: State) -> Command[Literal["response_agent", 
 
     return Command(goto=goto, update=update)
 
-def llm_call(state: State):
+
+def triage_interrupt_handler(state: State) -> Command[Literal["response_agent", "__end__"]]:
+    """Synchronously execute the triage interrupt handler task."""
+
+    return triage_interrupt_handler_task(state).result()
+
+@task
+def llm_call_task(state: State):
     """LLM decides whether to call a tool or not"""
 
     prompt = [
@@ -205,7 +225,14 @@ def llm_call(state: State):
 
     return {"messages": [msg]}
 
-def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
+
+def llm_call(state: State):
+    """Synchronously execute the llm_call task."""
+
+    return llm_call_task(state).result()
+
+@task
+def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
     
     # Store messages
@@ -241,38 +268,38 @@ def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
 
         # Configure what actions are allowed in Agent Inbox
         if tool_call["name"] == "write_email":
-            config = {
-                "allow_ignore": True,
-                "allow_respond": True,
-                "allow_edit": True,
-                "allow_accept": True,
-            }
+            config = HumanInterruptConfig(
+                allow_ignore=True,
+                allow_respond=True,
+                allow_edit=True,
+                allow_accept=True,
+            )
         elif tool_call["name"] == "schedule_meeting":
-            config = {
-                "allow_ignore": True,
-                "allow_respond": True,
-                "allow_edit": True,
-                "allow_accept": True,
-            }
+            config = HumanInterruptConfig(
+                allow_ignore=True,
+                allow_respond=True,
+                allow_edit=True,
+                allow_accept=True,
+            )
         elif tool_call["name"] == "Question":
-            config = {
-                "allow_ignore": True,
-                "allow_respond": True,
-                "allow_edit": False,
-                "allow_accept": False,
-            }
+            config = HumanInterruptConfig(
+                allow_ignore=True,
+                allow_respond=True,
+                allow_edit=False,
+                allow_accept=False,
+            )
         else:
             raise ValueError(f"Invalid tool call: {tool_call['name']}")
 
         # Create the interrupt request
-        request = {
-            "action_request": {
-                "action": tool_call["name"],
-                "args": tool_call["args"]
-            },
-            "config": config,
-            "description": description,
-        }
+        request: HumanInterrupt = HumanInterrupt(
+            action_request=ActionRequest(
+                action=tool_call["name"],
+                args=tool_call["args"],
+            ),
+            config=config,
+            description=description,
+        )
 
         # Send to Agent Inbox and wait for response
         response = interrupt([request])[0]
@@ -377,6 +404,12 @@ def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
     }
 
     return Command(goto=goto, update=update)
+
+
+def interrupt_handler(state: State) -> Command[Literal["llm_call", "__end__"]]:
+    """Synchronously execute the interrupt handler task."""
+
+    return interrupt_handler_task(state).result()
 
 # Conditional edge function
 def should_continue(state: State) -> Literal["interrupt_handler", "__end__"]:

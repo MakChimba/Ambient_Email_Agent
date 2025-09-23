@@ -4,7 +4,13 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
+from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt.interrupt import (
+    ActionRequest,
+    HumanInterrupt,
+    HumanInterruptConfig,
+)
 from langgraph.store.base import BaseStore
 from langgraph.types import interrupt, Command
 
@@ -256,7 +262,8 @@ def update_memory(store, namespace, messages):
 
 
 # Nodes
-def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+@task
+def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content; create/cancel reminders and route next step."""
 
     email_input = state["email_input"]
@@ -371,16 +378,30 @@ def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_int
     return Command(goto=goto, update=update)
 
 
-def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+    """Synchronously execute the triage router task."""
+
+    return triage_router_task(state).result()
+
+@task
+def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
     messages = [{"role": "user", "content": f"Email to notify user about: {email_markdown}"}]
-    request = {
-        "action_request": {"action": f"Email Assistant: {state['classification_decision']}", "args": {}},
-        "config": {"allow_ignore": True, "allow_respond": True, "allow_edit": False, "allow_accept": False},
-        "description": email_markdown,
-    }
+    request: HumanInterrupt = HumanInterrupt(
+        action_request=ActionRequest(
+            action=f"Email Assistant: {state['classification_decision']}",
+            args={},
+        ),
+        config=HumanInterruptConfig(
+            allow_ignore=True,
+            allow_respond=True,
+            allow_edit=False,
+            allow_accept=False,
+        ),
+        description=email_markdown,
+    )
     thread_id = _resolve_thread_id(state)
     goto: str = END
 
@@ -419,7 +440,13 @@ def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal[
     return Command(goto=goto, update={"messages": messages})
 
 
-def llm_call(state: State, store: BaseStore):
+def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+    """Synchronously execute the triage interrupt handler task."""
+
+    return triage_interrupt_handler_task(state).result()
+
+@task
+def llm_call_task(state: State, store: BaseStore):
     """LLM decides whether to call a tool or not with Gmail-specific nudges."""
     # Offline-friendly evaluation mode: optionally produce deterministic tool plans
     # without relying on live LLM calls. Enabled when EMAIL_ASSISTANT_EVAL_MODE is truthy.
@@ -1118,7 +1145,13 @@ def llm_call(state: State, store: BaseStore):
     return {"messages": [msg]}
 
 
-def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
+def llm_call(state: State, store: BaseStore):
+    """Synchronously execute the llm_call task."""
+
+    return llm_call_task(state).result()
+
+@task
+def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
     # Always include the originating AIMessage so downstream logs/tests can see tool_calls
     ai_message = state["messages"][-1]
@@ -1240,17 +1273,38 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
             else:
                 tool_display = format_for_display(tool_call)
             description = original_email_markdown + tool_display
-            config = {}
-            if tool_call["name"] == "send_email_tool" or tool_call["name"] == "schedule_meeting_tool":
-                config = {"allow_ignore": True, "allow_respond": True, "allow_edit": True, "allow_accept": True}
+            if tool_call["name"] in {"send_email_tool", "schedule_meeting_tool"}:
+                config = HumanInterruptConfig(
+                    allow_ignore=True,
+                    allow_respond=True,
+                    allow_edit=True,
+                    allow_accept=True,
+                )
             elif tool_call["name"] == "Question":
-                config = {"allow_ignore": True, "allow_respond": True, "allow_edit": False, "allow_accept": False}
+                config = HumanInterruptConfig(
+                    allow_ignore=True,
+                    allow_respond=True,
+                    allow_edit=False,
+                    allow_accept=False,
+                )
             elif tool_call["name"] == "mark_as_spam_tool":
-                config = {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}
+                config = HumanInterruptConfig(
+                    allow_ignore=True,
+                    allow_respond=False,
+                    allow_edit=False,
+                    allow_accept=True,
+                )
             else:
                 raise ValueError(f"Invalid tool call: {tool_call['name']}")
-    
-            request = {"action_request": {"action": tool_call["name"], "args": tool_call["args"]}, "config": config, "description": description}
+
+            request: HumanInterrupt = HumanInterrupt(
+                action_request=ActionRequest(
+                    action=tool_call["name"],
+                    args=tool_call["args"],
+                ),
+                config=config,
+                description=description,
+            )
             response = _maybe_interrupt([request])[0]
     
             if response["type"] == "accept":
@@ -1278,7 +1332,19 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
                         email_input = state["email_input"]
                         author, to, subject, email_thread, email_id = parse_gmail(email_input)
                         original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-                        confirm = {"action_request": {"action": "mark_as_spam_tool", "args": {"email_id": email_id}}, "config": {"allow_ignore": True, "allow_respond": False, "allow_edit": False, "allow_accept": True}, "description": original_email_markdown + "\n\nUser flagged as spam. Move this thread to Spam?"}
+                        confirm: HumanInterrupt = HumanInterrupt(
+                            action_request=ActionRequest(
+                                action="mark_as_spam_tool",
+                                args={"email_id": email_id},
+                            ),
+                            config=HumanInterruptConfig(
+                                allow_ignore=True,
+                                allow_respond=False,
+                                allow_edit=False,
+                                allow_accept=True,
+                            ),
+                            description=original_email_markdown + "\n\nUser flagged as spam. Move this thread to Spam?",
+                        )
                         followup = _maybe_interrupt([confirm])[0]
                         if followup["type"] == "accept":
                             # Emit a synthetic tool_call so logs/tests register the action
@@ -1368,7 +1434,13 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
     return decision
 
 
-def mark_as_read_node(state: State):
+def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
+    """Synchronously execute the interrupt handler task."""
+
+    return interrupt_handler_task(state).result()
+
+@task
+def mark_as_read_node_task(state: State):
     """Finalize Gmail flow by marking the thread as read and append a summary message.
 
     Appends a final assistant text message summarizing the reply content so
@@ -1450,6 +1522,11 @@ def mark_as_read_node(state: State):
 
     return result_payload
 
+
+def mark_as_read_node(state: State):
+    """Synchronously execute the mark_as_read_node task."""
+
+    return mark_as_read_node_task(state).result()
 
 # Build workflow
 agent_builder = StateGraph(State)
