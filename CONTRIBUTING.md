@@ -11,13 +11,8 @@ This project favors live Gemini verification whenever credentials are available.
 
 ## CodeRabbit Reviews & Auto-Merge
 - CodeRabbit approvals now trigger an automation that enables GitHub’s squash auto-merge for the pull request.
-- Auto-merge will complete once the branch protection checks pass; no manual intervention is required unless GitHub blocks the merge (e.g., conflicts, missing status checks).
+- Auto-merge will complete once the configured status checks pass; no manual intervention is required unless GitHub blocks the merge (e.g., conflicts, missing status checks).
 - CodeRabbit itself cannot delete branches or merge PRs; the workflow handles auto-merge enabling, while GitHub’s branch settings govern the rest.
-
-## Branch Protection
-- Protect `main` in GitHub with “Require a pull request before merging” and status checks that must pass, so auto-merge only lands reviewed, green changes.
-- Pair protection with the auto-delete-head-branches option (or the pruning workflow in this repo) to keep the branch list tidy.
-- When adding new CI jobs, remember to include them as required checks before relying on auto-merge.
 
 ## Testing Expectations
 - Default to running the live Gemini suites (`pytest tests/test_live_smoke.py`, etc.). Offline paths should be treated as fallbacks and documented in the PR description when used.

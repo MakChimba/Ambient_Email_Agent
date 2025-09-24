@@ -89,7 +89,6 @@ Path | Description
 `scripts/` | Utilities including dataset registration and reminder worker.
 `tests/` | Live/eval pytest suites, spam flow coverage, notebooks smoke tests.
 `datasets/` | LangSmith experiment datasets (`register_dataset_from_jsonl.py`).
-`agui-ui/` | Optional web UI assets for demos.
 `docs/` | Placeholder for extended documentation.
 `README_LOCAL.md` | Local development recipes, dependency pin notes, testing nuances.
 
