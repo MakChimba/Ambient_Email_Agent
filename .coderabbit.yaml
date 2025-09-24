@@ -1,0 +1,9 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: en-US
+reviews:
+  request_changes_workflow: true
+  auto_title_placeholder: "@coderabbitai"
+  auto_review:
+    enabled: true
+    drafts: false
