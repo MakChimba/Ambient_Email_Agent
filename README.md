@@ -5,7 +5,7 @@ The Standalone Email Assistant is a LangGraph-powered workflow that triages inco
 ## Highlights
 - LangGraph 0.6 graph lineup with tiered capabilities: baseline responder, HITL, persistent memory, and Gmail-native automation.
 - Gemini 2.5 tool orchestration (`tool_choice="any"`) with guardrails for spam handling, no-reply detection, and deterministic evaluation modes.
-- Rich tool belt including calendar scheduling, email drafting, spam labeling, DeepWiki lookups, and reminder automation.
+- Rich tool belt including calendar scheduling, email drafting, spam labeling, and reminder automation.
 - Durable execution via SQLite-backed checkpoints/stores so interrupts and memory survive process restarts.
 - Optional S-Class reminder worker that escalates follow-ups via Gmail labels and background polling.
 
@@ -22,7 +22,7 @@ See `AGENTS.md` for a deep dive into routing, tool behavior, and the latest feat
 ## Architecture at a Glance
 1. **Triage** – Classifies each email (respond, ignore/notify, spam). Fallback logic defaults to respond so flows never stall.
 2. **Respond** – Drafts replies, schedules meetings, or escalates reminders using LangGraph tools.
-3. **Tools & Integrations** – `send_email_tool`, `schedule_meeting_tool`, DeepWiki MCP client, Gmail spam helper, and more. HITL wraps sensitive actions.
+3. **Tools & Integrations** – `send_email_tool`, `schedule_meeting_tool`, Gmail spam helper, and more. HITL wraps sensitive actions.
 4. **Memory & Checkpoints** – SQLite checkpoints and stores persist agent state and preference history across runs.
 5. **Human Interrupts** – HITL agents pause on tool calls using `HumanInterrupt`. Auto-accept can be enabled for demos/tests.
 
