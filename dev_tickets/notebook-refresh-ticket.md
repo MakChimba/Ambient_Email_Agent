@@ -7,6 +7,7 @@
 
 ## Background
 - The notebooks were last curated before the LangGraph durability overhaul, HumanInterrupt adoption, and Gmail spam guardrails described in recent tickets (`library-upgrade-ticket.md`, `adopt-new-features.md`).
+- The earlier agent notebooks remain educational exercises that build toward understanding the primary Gmail HITL+memory implementation; the refresh should keep that progressive narrative intact.
 - Since then, agent defaults shifted to the Gmail HITL+memory flow, test harnesses changed to live-first, and new env combinations need to be demonstrated for onboarding.
 
 ## Scope
