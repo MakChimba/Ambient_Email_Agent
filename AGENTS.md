@@ -36,6 +36,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - Update the ticket as progress is made (checklists, validation notes, known risks) so other contributors and coding agents can trace the current status.
 - When changes ship, reflect any new env toggles, tooling expectations, or testing requirements in the public docs (`README.md`, `README_LOCAL.md`, this file) and link back to the relevant ticket/commit when helpful.
 - Use the acceptance criteria and testing notes sections of each ticket to capture verification steps (live vs offline) so future updates reuse the same patterns.
+- After finishing code edits, run a `coderabbit` review from the repo root (default: `coderabbit review --plain`; use `--prompt-only` for shorter summaries) and include the exact command in your handoff so reviewers can retrace bot interactions or reproduce the check locally.
 
 ## Recent Changes and Improvements
 

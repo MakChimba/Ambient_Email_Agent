@@ -99,6 +99,11 @@ Path | Description
 - `CONTRIBUTING.md` – branching, review, and testing expectations.
 - `system_prompt.md` – canonical assistant instructions.
 
+## CodeRabbit Reviews
+- CodeRabbit CI still gates PRs automatically, but contributors must run a local review after finishing edits: `coderabbit review --plain` from the repo root (or `--prompt-only` for a lighter summary).
+- Share the exact command you ran in handoff notes so others can reproduce or compare results (`coderabbit auth status` is handy when double-checking login).
+- Need a refresher? `coderabbit --help` lists every subcommand, `coderabbit <subcommand> --help` dives into its flags, and `coderabbit watch --help` covers auto-review workflows.
+
 ## Contributing
 Pull requests are welcome; follow the workflow in `CONTRIBUTING.md`. Expect to run the live Gemini suites unless credentials are unavailable.
 
