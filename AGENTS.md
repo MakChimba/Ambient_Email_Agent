@@ -30,6 +30,13 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
    - Requires separate authentication and setup (`setup_gmail.py`).
    - Can read and process emails directly from a user's inbox.
 
+## Working Practices & Change Tracking
+
+- Record substantial feature work, refactors, or operational changes in a dev ticket under `dev_tickets/`. Summaries should outline scope, phased plans, and residual follow-ups.
+- Update the ticket as progress is made (checklists, validation notes, known risks) so other contributors and coding agents can trace the current status.
+- When changes ship, reflect any new env toggles, tooling expectations, or testing requirements in the public docs (`README.md`, `README_LOCAL.md`, this file) and link back to the relevant ticket/commit when helpful.
+- Use the acceptance criteria and testing notes sections of each ticket to capture verification steps (live vs offline) so future updates reuse the same patterns.
+
 ## Recent Changes and Improvements
 
 - LangGraph 0.6 upgrade: default graphs compile with SQLite-backed checkpoints/stores (`EMAIL_ASSISTANT_CHECKPOINT_PATH`, `EMAIL_ASSISTANT_STORE_PATH` override the default `~/.langgraph/` location) so HITL interrupts survive process restarts.
