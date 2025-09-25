@@ -24,21 +24,32 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - [ ] Verify local `uv pip install` / CI install paths remain valid.
 
 ### Phase 2 — Runtime & Durability Defaults
-- [ ] Apply `durability="sync"` to all graph compilation helpers and high-level `invoke/stream` entrypoints (tests, scripts, notebooks).
-- [ ] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
-- [ ] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests.
-- [ ] Ensure `prime_parent_run` / tracing metadata accepts the new context payloads.
+- **Durability & Streaming Mechanics**
+  - [ ] Apply `durability="sync"` to all graph compilation helpers and high-level `invoke/stream` entrypoints (tests, scripts, notebooks).
+  - [ ] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
+  - [ ] Confirm multi-mode stream consumers (CLI, scripts) surface progress via `get_stream_writer()` without regressions.
+- **Runtime Context & Tracing Updates**
+  - [ ] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests.
+  - [ ] Ensure `prime_parent_run` / tracing metadata accepts the new context payloads.
 
 ### Phase 3 — Gemini & Tooling Updates
-- [ ] Normalize Gemini provider routing via `init_chat_model(..., model_provider="google_genai")` or prefixed IDs; update docs/examples accordingly.
-- [ ] Ensure structured output + tool calling continue to pass type checks; update wrappers/tests as needed.
-- [ ] Audit tool nodes for `handle_tool_errors` / `ToolException` policy and adjust retries or messaging.
-- [ ] Add/maintain sample tool emitting `custom` streaming events for progress logging.
+- **Model Initialisation & Routing**
+  - [ ] Normalize Gemini provider routing via `init_chat_model(..., model_provider="google_genai")` or prefixed IDs; update docs/examples accordingly.
+- **Structured Output & Tool Calls**
+  - [ ] Ensure structured output + tool calling continue to pass type checks; update wrappers/tests as needed.
+  - [ ] Capture any schema or retry adjustments required for Gemini v1 exceptions.
+- **Tool Error Handling & Telemetry**
+  - [ ] Audit tool nodes for `handle_tool_errors` / `ToolException` policy and adjust retries or messaging.
+  - [ ] Add/maintain sample tool emitting `custom` streaming events for progress logging.
 
 ### Phase 4 — UI, Docs, and Notebooks
-- [ ] Refresh notebooks (`notebooks/*.ipynb`) to use new streaming API, context schema, and `create_agent` import path.
-- [ ] Update README / README_LOCAL / developer docs with new env toggles (`EMAIL_ASSISTANT_TIMEZONE`, streaming expectations) and upgrade notes.
-- [ ] Capture before/after screenshots or short clips demonstrating multi-mode streaming in Studio or CLI.
+- **Notebook Refresh**
+  - [ ] Update notebooks (`notebooks/*.ipynb`) to use the new streaming API, context schema, and `create_agent` import path.
+- **Documentation Updates**
+  - [ ] Update README / README_LOCAL / developer docs with new env toggles (`EMAIL_ASSISTANT_TIMEZONE`, streaming expectations) and upgrade notes.
+  - [ ] Link docs back to the research ticket and this implementation ticket where relevant.
+- **Demo Artifacts**
+  - [ ] Capture before/after screenshots or short clips demonstrating multi-mode streaming in Studio or CLI.
 
 ### Phase 5 — Validation & Rollout
 - [ ] Run targeted pytest suite (see Testing Notes) against live Gemini where possible; capture logs and LangSmith links when tracing enabled.
@@ -72,4 +83,3 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - Stage rollout behind a feature branch; merge once acceptance checklist satisfied.
 - After deployment, monitor Agent Inbox for duplicate sends or missed checkpoints.
 - Plan subsequent work to expand `Runtime[Context]` usage across remaining nodes (memory updates, Gmail tool wrappers) as follow-up tasks if needed.
-
