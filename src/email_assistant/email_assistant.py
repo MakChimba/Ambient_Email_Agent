@@ -432,7 +432,7 @@ def triage_router(
 ) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously wait for the triage router task to finish."""
 
-    return triage_router_task(state, runtime).result()
+    return triage_router_task(state, runtime=runtime).result()
 
 # Build workflow
 overall_workflow = (

@@ -129,9 +129,17 @@ def compile_agent(agent_module_name: str) -> Tuple[Any, Dict[str, Any], Optional
     }
 
     if agent_module_name in {"email_assistant_hitl_memory", "email_assistant_hitl_memory_gmail"}:
-        email_assistant = module.overall_workflow.compile(checkpointer=checkpointer, store=store)
+        email_assistant = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer, store=store)
+            .with_config(durability="sync")
+        )
     else:
-        email_assistant = module.overall_workflow.compile(checkpointer=checkpointer)
+        email_assistant = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer)
+            .with_config(durability="sync")
+        )
         store = None
 
     return email_assistant, thread_config, store, module

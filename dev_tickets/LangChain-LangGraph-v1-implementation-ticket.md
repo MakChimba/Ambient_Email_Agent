@@ -26,11 +26,13 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 ### Phase 2 — Runtime & Durability Defaults
 - **Durability & Streaming Mechanics**
   - [ ] Apply `durability="sync"` to all graph compilation helpers and high-level `invoke/stream` entrypoints (tests, scripts, notebooks).
+    - 2025-09-26 — Tests/scripts now compile agents with `durability="sync"`; notebooks pending in Phase 4 refresh.
   - [ ] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
+    - 2025-09-26 — Test harnesses already consume multi-mode streams; notebooks/CLI demos still queued.
   - [ ] Confirm multi-mode stream consumers (CLI, scripts) surface progress via `get_stream_writer()` without regressions.
 - **Runtime Context & Tracing Updates**
   - [x] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests. *(Phase 2 now covers memory + Gmail agents; runtime helpers/tests/scripts updated to seed metadata + multi-mode streaming.)*
-  - [ ] Ensure `prime_parent_run` / tracing metadata accepts the new context payloads.
+  - [x] Ensure `prime_parent_run` / tracing metadata accepts the new context payloads. *(Runtime helpers now feed timezone/eval/thread metadata through every triage/tool node; scripts/tests verified via offline smoke.)*
   - [ ] Add focused regression coverage so triage/router nodes exercise the new context plumbing offline and live.
 
 ### Phase 3 — Gemini & Tooling Updates
@@ -55,6 +57,7 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 ### Phase 5 — Validation & Rollout
 - [ ] Run targeted pytest suite (see Testing Notes) against live Gemini where possible; capture logs and LangSmith links when tracing enabled.
   - 2025-09-26 — Offline smoke (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) passes tool assertions; remaining failure from LLM judge expected while Gmail API creds unavailable (auto-flag for scheduling behaviour).
+  - 2025-09-26 — Added sanity run for base agent (`pytest tests/test_response.py --agent-module=email_assistant -k tool_calls --maxfail=1`) to confirm durability refactor; all cases pass offline.
 - [ ] Regenerate or verify `tests/snapshots/live_smoke.json` and other fixtures if deterministic outputs change.
 - [ ] Collect final pass/fail checklist evidence and link in this ticket (artifacts, logs, screenshots).
 - [ ] Coordinate merge strategy (feature branch, rollout toggles) and note any fallback procedure.
@@ -89,3 +92,4 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 ## Progress Log
 - 2025-09-25 — Phase 1 dependency upgrades landed (`langchain==1.0.0a9`, `langgraph==1.0.0a3`, regenerated `uv.lock`, validated install via `uv pip install --prerelease allow .`). Introduced shared `extract_runtime_metadata` helper and moved `email_assistant` + `email_assistant_hitl` triage nodes onto `Runtime[AssistantContext]` while preserving sync durability.
 - 2025-09-26 — Extended runtime-context plumbing to memory + Gmail agents; scripts/tests emit context metadata and request multi-mode streams. Offline Gmail smoke suite passes apart from expected LLM judge failure (no Gmail API).
+- 2025-09-26 — Updated tests/scripts to compile graphs with `durability="sync"`; validated base agent tool-call smoke locally.

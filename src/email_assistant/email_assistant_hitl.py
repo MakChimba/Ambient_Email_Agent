@@ -153,7 +153,7 @@ def triage_router(
 ) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state, runtime).result()
+    return triage_router_task(state, runtime=runtime).result()
 
 @task
 def triage_interrupt_handler_task(

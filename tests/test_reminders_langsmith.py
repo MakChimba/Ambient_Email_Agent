@@ -85,7 +85,11 @@ def test_reminder_scenarios_on_langsmith(example: Example, gmail_service):
 
     checkpointer = MemorySaver()
     store = InMemoryStore()
-    agent = overall_workflow.compile(checkpointer=checkpointer, store=store)
+    agent = (
+        overall_workflow
+        .compile(checkpointer=checkpointer, store=store)
+        .with_config(durability="sync")
+    )
 
     thread_id = f"reminders-{uuid.uuid4()}"
     config = {

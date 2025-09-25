@@ -58,7 +58,11 @@ def main(mock_schedule, mock_check, mock_send):
     # Compile workflow with in-memory store + checkpointer so nodes receive a store
     checkpointer = MemorySaver()
     langgraph_store = InMemoryStore()
-    agent = overall_workflow.compile(checkpointer=checkpointer, store=langgraph_store)
+    agent = (
+        overall_workflow
+        .compile(checkpointer=checkpointer, store=langgraph_store)
+        .with_config(durability="sync")
+    )
 
     test_cases = [
         {

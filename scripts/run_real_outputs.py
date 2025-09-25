@@ -50,10 +50,18 @@ def _compile_agent(agent_module: str):
     checkpointer = MemorySaver()
     store = InMemoryStore()
     try:
-        graph = module.overall_workflow.compile(checkpointer=checkpointer, store=store)
+        graph = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer, store=store)
+            .with_config(durability="sync")
+        )
     except Exception:
         # Fallback for agents that don't take store
-        graph = module.overall_workflow.compile(checkpointer=checkpointer)
+        graph = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer)
+            .with_config(durability="sync")
+        )
         store = None
     return graph, store
 
