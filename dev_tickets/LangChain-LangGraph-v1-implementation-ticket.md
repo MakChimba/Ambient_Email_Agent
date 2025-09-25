@@ -19,9 +19,9 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 
 ## Implementation Plan
 ### Phase 1 — Dependencies & Environment
-- [ ] Update `pyproject.toml` / lockfile to LangChain v1.x, LangGraph v1.x, langchain-google-genai ≥2.1, langgraph-checkpoint-sqlite latest proved in research.
-- [ ] Document new minimum Python version expectations if required by upstream packages.
-- [ ] Verify local `uv pip install` / CI install paths remain valid.
+- [x] Update `pyproject.toml` / lockfile to LangChain v1.x, LangGraph v1.x, langchain-google-genai ≥2.1, langgraph-checkpoint-sqlite latest proved in research. *(2025-09-25: bumped to langchain==1.0.0a9 / langgraph==1.0.0a3, regenerated `uv.lock`, validated install via `uv pip install --prerelease allow .`)*
+- [x] Document new minimum Python version expectations if required by upstream packages. *(No change: upstream continues to target Python ≥3.11; requirement already documented in `pyproject.toml`.)*
+- [x] Verify local `uv pip install` / CI install paths remain valid. *(Confirmed `uv pip install --prerelease allow .` completes locally; no CI adjustments required.)*
 
 ### Phase 2 — Runtime & Durability Defaults
 - **Durability & Streaming Mechanics**
@@ -29,7 +29,7 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
   - [ ] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
   - [ ] Confirm multi-mode stream consumers (CLI, scripts) surface progress via `get_stream_writer()` without regressions.
 - **Runtime Context & Tracing Updates**
-  - [ ] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests.
+  - [ ] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests. *(In progress — `email_assistant` + `email_assistant_hitl` now accept `Runtime[AssistantContext]`; helper added in `src/email_assistant/runtime.py`)*
   - [ ] Ensure `prime_parent_run` / tracing metadata accepts the new context payloads.
   - [ ] Add focused regression coverage so triage/router nodes exercise the new context plumbing offline and live.
 
@@ -84,3 +84,6 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - Stage rollout behind a feature branch; merge once acceptance checklist satisfied.
 - After deployment, monitor Agent Inbox for duplicate sends or missed checkpoints.
 - Plan subsequent work to expand `Runtime[Context]` usage across remaining nodes (memory updates, Gmail tool wrappers) as follow-up tasks if needed.
+
+## Progress Log
+- 2025-09-25 — Phase 1 dependency upgrades landed (`langchain==1.0.0a9`, `langgraph==1.0.0a3`, regenerated `uv.lock`, validated install via `uv pip install --prerelease allow .`). Introduced shared `extract_runtime_metadata` helper and moved `email_assistant` + `email_assistant_hitl` triage nodes onto `Runtime[AssistantContext]` while preserving sync durability.

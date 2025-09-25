@@ -4,10 +4,10 @@ version = "0.1.0"
 description = "Build an e-mail assistant from scratch"
 requires-python = ">=3.11"
 dependencies = [
-    "langchain==0.3.27",
-    "langchain-core>=0.3.59",
-    "langchain-google-genai",
-    "langgraph==0.6.7",
+    "langchain==1.0.0a9",
+    "langchain-core>=1.0.0a4",
+    "langchain-google-genai>=2.1.12",
+    "langgraph==1.0.0a3",
     "langgraph-checkpoint-sqlite>=2.0.11",
     "langsmith[pytest]==0.4.30",
     "pandas",
