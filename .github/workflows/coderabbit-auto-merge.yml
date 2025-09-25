@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   enable-auto-merge:
-    if: contains(fromJson('["coderabbitai","coderabbitai[bot]"]'), github.event.review.user.login) && github.event.review.state == 'approved'
+    if: contains(fromJson('["coderabbitai","coderabbitai[bot]","coderabbit","coderabbit[bot]","CodeRabbit","CodeRabbit[bot]"]'), github.event.review.user.login) && github.event.review.state == 'approved'
     runs-on: ubuntu-latest
     steps:
       - name: Enable GitHub auto-merge
