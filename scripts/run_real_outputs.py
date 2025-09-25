@@ -93,9 +93,20 @@ def main():
     email_inputs, email_names, triage_list = _load_dataset(args.agent_module)
     agent, store = _compile_agent(args.agent_module)
 
-    # Thread config
+    # Thread config with runtime context metadata
     import uuid
-    thread_config = {"configurable": {"thread_id": uuid.uuid4()}}
+
+    thread_id = f"script-{uuid.uuid4()}"
+    thread_config = {
+        "run_id": str(uuid.uuid4()),
+        "configurable": {
+            "thread_id": thread_id,
+            "thread_metadata": {"thread_id": thread_id},
+            "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
+            "eval_mode": os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes"),
+        },
+        "recursion_limit": 100,
+    }
 
     count = 0
     for i, (inp, name, triage) in enumerate(zip(email_inputs, email_names, triage_list)):
@@ -106,7 +117,11 @@ def main():
         summary = summarize_email_for_grid(inp)
 
         def _invoke_agent():
-            return agent.invoke(payload, config=thread_config)
+            return agent.invoke(
+                payload,
+                config=thread_config,
+                durability="sync",
+            )
 
         try:
             result = invoke_with_root_run(

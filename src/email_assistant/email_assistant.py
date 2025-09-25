@@ -13,12 +13,22 @@ from email_assistant.tracing import (
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import AGENT_TOOLS_PROMPT
-from email_assistant.prompts import triage_system_prompt, triage_user_prompt, agent_system_prompt, default_background, default_triage_instructions, default_response_preferences, default_cal_preferences
-from email_assistant.schemas import State, RouterSchema, StateInput
+from email_assistant.prompts import (
+    triage_system_prompt,
+    triage_user_prompt,
+    agent_system_prompt,
+    default_background,
+    default_triage_instructions,
+    default_response_preferences,
+    default_cal_preferences,
+)
+from email_assistant.schemas import State, RouterSchema, StateInput, AssistantContext
+from email_assistant.runtime import extract_runtime_metadata
 from email_assistant.utils import parse_email, format_email_markdown
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
 from langgraph.types import Command
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=True)
@@ -308,7 +318,10 @@ agent_builder.add_edge("environment", "llm_call")
 agent = agent_builder.compile()
 
 @task
-def triage_router_task(state: State) -> Command[Literal["response_agent", "__end__"]]:
+def triage_router_task(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -316,6 +329,8 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
     - Company-wide announcements
     - Messages meant for other teams
     """
+    timezone, eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
+
     email_input = state["email_input"]
     author, to, subject, email_thread = parse_email(email_input)
     system_prompt = triage_system_prompt.format(
@@ -329,7 +344,12 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
-    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
+    prime_parent_run(
+        email_input=email_input,
+        email_markdown=email_markdown,
+        metadata_update=metadata,
+        thread_id=thread_id,
+    )
 
     # Run the router LLM with structured output (fallback to heuristic on failure)
     classification: str | None = None
@@ -376,7 +396,13 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
         goto = END
     elif classification == "notify":
         # If real life, this would do something else
@@ -387,27 +413,40 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
         goto = END
     else:
         raise ValueError(f"Invalid classification: {classification}")
     return Command(goto=goto, update=update)
 
 
-def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]:
+def triage_router(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously wait for the triage router task to finish."""
 
-    return triage_router_task(state).result()
+    return triage_router_task(state, runtime).result()
 
 # Build workflow
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
     .add_node("response_agent", agent)
     .add_edge(START, "triage_router")
 )
 
-email_assistant = overall_workflow.compile().with_config(durability="sync")
+email_assistant = (
+    overall_workflow
+    .compile()
+    .with_config(durability="sync")
+)
 
 def get_agent_executor():
     """Return the compiled email assistant executor.

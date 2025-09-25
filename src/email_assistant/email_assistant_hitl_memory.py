@@ -8,13 +8,21 @@ from langgraph.prebuilt.interrupt import (
     HumanInterrupt,
     HumanInterruptConfig,
 )
+from langgraph.runtime import Runtime
 from langgraph.types import interrupt, Command
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import HITL_MEMORY_TOOLS_PROMPT
 from email_assistant.prompts import triage_system_prompt, triage_user_prompt, agent_system_prompt_hitl_memory, default_triage_instructions, default_background, default_response_preferences, default_cal_preferences, MEMORY_UPDATE_INSTRUCTIONS, MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT
 from email_assistant.configuration import get_llm
-from email_assistant.schemas import State, RouterSchema, StateInput, UserPreferences
+from email_assistant.schemas import (
+    AssistantContext,
+    State,
+    RouterSchema,
+    StateInput,
+    UserPreferences,
+)
+from email_assistant.runtime import extract_runtime_metadata
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
 from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from email_assistant.tracing import (
@@ -141,7 +149,11 @@ def update_memory(store, namespace, messages):
 
 # Nodes 
 @task
-def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router_task(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -149,7 +161,8 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
     - Company-wide announcements
     - Messages meant for other teams
     """
-    
+    _, _, thread_id, metadata = extract_runtime_metadata(runtime)
+
     # Parse the email input
     email_input = state["email_input"]
     author, to, subject, email_thread = parse_email(email_input)
@@ -159,7 +172,12 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
-    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
+    prime_parent_run(
+        email_input=email_input,
+        email_markdown=email_markdown,
+        metadata_update=metadata,
+        thread_id=thread_id,
+    )
 
     # Search for existing memory
     triage_instructions = get_memory(
@@ -217,7 +235,13 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
 
     elif classification == "notify":
         print("🔔 Classification: NOTIFY - This email contains important information") 
@@ -228,6 +252,12 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
         update = {
             "classification_decision": classification,
         }
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
 
     else:
         raise ValueError(f"Invalid classification: {classification}")
@@ -235,13 +265,21 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
     return Command(goto=goto, update=update)
 
 
-def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state).result()
+    return triage_router_task(state, runtime=runtime).result()
 
 @task
-def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler_task(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     
     # Parse the email input
@@ -310,10 +348,14 @@ def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Lit
     return Command(goto=goto, update=update)
 
 
-def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state).result()
+    return triage_interrupt_handler_task(state, runtime=runtime).result()
 
 @task
 def llm_call_task(state: State, store: BaseStore):
@@ -597,8 +639,13 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
     return interrupt_handler_task(state).result()
 
 # Conditional edge function
-def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handler", "__end__"]:
+def should_continue(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Literal["interrupt_handler", "__end__"]:
     """Route to tool handler, or end if Done tool called"""
+    _, _, thread_id, metadata = extract_runtime_metadata(runtime)
     messages = state["messages"]
     last_message = messages[-1]
     if last_message.tool_calls:
@@ -612,6 +659,8 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
                 email_input=state.get("email_input", {}),
                 email_markdown=None,
                 outputs=output_text,
+                metadata_update=metadata,
+                thread_id=thread_id,
             )
             return END
         return "interrupt_handler"
@@ -621,11 +670,13 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
         email_input=state.get("email_input", {}),
         email_markdown=None,
         outputs=output_text,
+        metadata_update=metadata,
+        thread_id=thread_id,
     )
     return END
 
 # Build workflow
-agent_builder = StateGraph(State)
+agent_builder = StateGraph(State, context_schema=AssistantContext)
 
 # Add nodes - with store parameter
 agent_builder.add_node("llm_call", llm_call)
@@ -647,7 +698,7 @@ response_agent = agent_builder.compile()
 
 # Build overall workflow with store and checkpointer
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)

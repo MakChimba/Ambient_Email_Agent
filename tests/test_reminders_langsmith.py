@@ -87,11 +87,25 @@ def test_reminder_scenarios_on_langsmith(example: Example, gmail_service):
     store = InMemoryStore()
     agent = overall_workflow.compile(checkpointer=checkpointer, store=store)
 
-    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    thread_id = f"reminders-{uuid.uuid4()}"
+    config = {
+        "run_id": str(uuid.uuid4()),
+        "configurable": {
+            "thread_id": thread_id,
+            "thread_metadata": {"thread_id": thread_id},
+            "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
+            "eval_mode": EVAL_MODE_ENABLED,
+        },
+        "recursion_limit": 100,
+    }
     summary = summarize_email_for_grid(example.inputs.get("email_input", {}))
 
     def _invoke_agent():
-        return agent.invoke(example.inputs, config)
+        return agent.invoke(
+            example.inputs,
+            config,
+            durability="sync",
+        )
 
     result = invoke_with_root_run(
         _invoke_agent,

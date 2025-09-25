@@ -222,7 +222,14 @@ def maybe_invoke_llm_judge(
 def run_initial_stream(email_assistant: Any, email_input: Dict, thread_config: Dict) -> List[Dict]:
     """Run the initial stream and return collected messages."""
     messages = []
-    for chunk in email_assistant.stream({"email_input": email_input}, config=thread_config):
+    for mode, chunk in email_assistant.stream(
+        {"email_input": email_input},
+        config=thread_config,
+        stream_mode=["updates", "messages", "custom"],
+        durability="sync",
+    ):
+        if mode == "custom":
+            continue
         messages.append(chunk)
     return messages
 
@@ -230,7 +237,14 @@ def run_initial_stream(email_assistant: Any, email_input: Dict, thread_config: D
 def run_stream_with_command(email_assistant: Any, command: Command, thread_config: Dict) -> List[Dict]:
     """Run stream with a command and return collected messages."""
     messages = []
-    for chunk in email_assistant.stream(command, config=thread_config):
+    for mode, chunk in email_assistant.stream(
+        command,
+        config=thread_config,
+        stream_mode=["updates", "messages", "custom"],
+        durability="sync",
+    ):
+        if mode == "custom":
+            continue
         messages.append(chunk)
     return messages
 
@@ -305,7 +319,11 @@ def test_email_dataset_tool_calls(email_input, email_name, criteria, expected_ca
         summary = summarize_email_for_grid(email_input)
 
         def _invoke_agent():
-            return email_assistant.invoke(payload, config=thread_config)
+            return email_assistant.invoke(
+                payload,
+                config=thread_config,
+                durability="sync",
+            )
 
         invoke_with_root_run(
             _invoke_agent,

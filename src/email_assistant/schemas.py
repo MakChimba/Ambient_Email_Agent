@@ -1,3 +1,5 @@
+from typing import Any, Dict
+
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict, Literal
 from langgraph.graph import MessagesState
@@ -40,3 +42,12 @@ class UserPreferences(BaseModel):
     """Updated user preferences based on user's feedback."""
     chain_of_thought: str = Field(description="Reasoning about which user preferences need to add/update if required")
     user_preferences: str = Field(description="Updated user preferences")
+
+
+class AssistantContext(TypedDict, total=False):
+    """Runtime context propagated through LangGraph Runtime."""
+
+    timezone: str
+    eval_mode: bool
+    thread_id: str | None
+    thread_metadata: Dict[str, Any]
