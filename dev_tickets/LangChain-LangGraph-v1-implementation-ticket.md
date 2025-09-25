@@ -25,10 +25,10 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 
 ### Phase 2 — Runtime & Durability Defaults
 - **Durability & Streaming Mechanics**
-  - [ ] Apply `durability="sync"` to all graph compilation helpers and high-level `invoke/stream` entrypoints (tests, scripts, notebooks).
-    - 2025-09-26 — Tests/scripts now compile agents with `durability="sync"`; notebooks pending in Phase 4 refresh.
-  - [ ] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
-    - 2025-09-26 — Test harnesses already consume multi-mode streams; notebooks/CLI demos still queued.
+  - [x] Apply `durability="sync"` to all graph compilation helpers and high-level `invoke/stream` entrypoints (tests, scripts, notebooks).
+    - 2025-09-26 — Tests/scripts now compile agents with `durability="sync"`; notebooks updated to mirror the same pattern in showcased examples.
+  - [x] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
+    - 2025-09-26 — Tests and notebooks now use `for mode, chunk ...` with `if mode == "custom": continue`. CLI demos still rely on default stdout; revisit alongside progress logging follow-ups.
   - [ ] Confirm multi-mode stream consumers (CLI, scripts) surface progress via `get_stream_writer()` without regressions.
 - **Runtime Context & Tracing Updates**
   - [x] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests. *(Phase 2 now covers memory + Gmail agents; runtime helpers/tests/scripts updated to seed metadata + multi-mode streaming.)*
