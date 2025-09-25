@@ -29,11 +29,11 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
     - 2025-09-26 — Tests/scripts now compile agents with `durability="sync"`; notebooks updated to mirror the same pattern in showcased examples.
   - [x] Update streaming loops to unpack `(mode, chunk)` and handle multi-mode lists.
     - 2025-09-26 — Tests and notebooks now use `for mode, chunk ...` with `if mode == "custom": continue`. CLI demos still rely on default stdout; revisit alongside progress logging follow-ups.
-  - [ ] Confirm multi-mode stream consumers (CLI, scripts) surface progress via `get_stream_writer()` without regressions.
+  - [x] Confirm multi-mode stream consumers (CLI, scripts) surface progress via `get_stream_writer()` without regressions. *(CLI script now supports `--stream` and prints `updates`/`messages` from multi-mode streaming; manual dry-run with eval mode passes.)*
 - **Runtime Context & Tracing Updates**
   - [x] Implement the `Runtime[Context]` refactor for triage/router (and related nodes) and pass context from runners/tests. *(Phase 2 now covers memory + Gmail agents; runtime helpers/tests/scripts updated to seed metadata + multi-mode streaming.)*
   - [x] Ensure `prime_parent_run` / tracing metadata accepts the new context payloads. *(Runtime helpers now feed timezone/eval/thread metadata through every triage/tool node; scripts/tests verified via offline smoke.)*
-  - [ ] Add focused regression coverage so triage/router nodes exercise the new context plumbing offline and live.
+  - [x] Add focused regression coverage so triage/router nodes exercise the new context plumbing offline and live. *(New `tests/test_runtime_context.py` validates runtime metadata extraction and triage routing with patched LLM.)*
 
 ### Phase 3 — Gemini & Tooling Updates
 - **Model Initialisation & Routing**
@@ -93,3 +93,4 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - 2025-09-25 — Phase 1 dependency upgrades landed (`langchain==1.0.0a9`, `langgraph==1.0.0a3`, regenerated `uv.lock`, validated install via `uv pip install --prerelease allow .`). Introduced shared `extract_runtime_metadata` helper and moved `email_assistant` + `email_assistant_hitl` triage nodes onto `Runtime[AssistantContext]` while preserving sync durability.
 - 2025-09-26 — Extended runtime-context plumbing to memory + Gmail agents; scripts/tests emit context metadata and request multi-mode streams. Offline Gmail smoke suite passes apart from expected LLM judge failure (no Gmail API).
 - 2025-09-26 — Updated tests/scripts to compile graphs with `durability="sync"`; validated base agent tool-call smoke locally.
+- 2025-09-27 — Added CLI streaming progress (`--stream`) and runtime metadata regression tests (`tests/test_runtime_context.py`).

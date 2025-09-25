@@ -82,6 +82,11 @@ def main():
     ap.add_argument("--max", type=int, default=5, help="Max examples to run")
     ap.add_argument("--respond-only", action="store_true", help="Only run examples with triage=='respond'")
     ap.add_argument("--auto-accept", action="store_true", help="Auto-accept HITL prompts")
+    ap.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream agent progress (prints updates/messages as they arrive)",
+    )
     args = ap.parse_args()
 
     init_project(AGENT_PROJECT)
@@ -131,9 +136,27 @@ def main():
                 durability="sync",
             )
 
+        def _stream_agent():
+            print("Streaming agent output (updates/messages)...")
+            for mode, chunk in agent.stream(
+                payload,
+                config=thread_config,
+                stream_mode=["updates", "messages", "custom"],
+                durability="sync",
+            ):
+                if mode == "custom":
+                    continue
+                preview = str(chunk)
+                if len(preview) > 240:
+                    preview = preview[:240] + "..."
+                print(f"[{mode}] {preview}")
+            # Return final state so invoke_with_root_run captures something meaningful
+            return agent.get_state(thread_config)
+
         try:
-            result = invoke_with_root_run(
-                _invoke_agent,
+            runner = _stream_agent if args.stream else _invoke_agent
+            invoke_with_root_run(
+                runner,
                 root_name=f"agent:{args.agent_module}",
                 input_summary=summary,
             )
