@@ -3,6 +3,12 @@ name: Enable auto-merge after CodeRabbit approval
 on:
   pull_request_review:
     types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pull_request:
+        description: "PR number to enable auto-merge for"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -10,30 +16,75 @@ permissions:
 
 jobs:
   enable-auto-merge:
-    if: contains(fromJson('["coderabbitai","coderabbitai[bot]","coderabbit","coderabbit[bot]","CodeRabbit","CodeRabbit[bot]"]'), github.event.review.user.login) && github.event.review.state == 'approved'
+    if: >-
+      (github.event_name == 'pull_request_review'
+        && contains(fromJson('["coderabbitai","coderabbitai[bot]","coderabbit","coderabbit[bot]","CodeRabbit","CodeRabbit[bot]"]'), github.event.review.user.login)
+        && github.event.review.state == 'approved')
+      || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - name: Enable GitHub auto-merge
         uses: actions/github-script@v7
+        env:
+          DISPATCH_PR_NUMBER: ${{ github.event.inputs.pull_request }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const pr = context.payload.pull_request;
-            if (pr.draft) {
-              core.info("PR is draft; skipping auto-merge enablement.");
-              return;
-            }
-            if (pr.state !== "open") {
-              core.info(`PR state is ${pr.state}; skipping auto-merge enablement.`);
+            const dispatchInput = github?.event?.inputs?.pull_request;
+            core.info(`Dispatch env raw value: ${process.env.DISPATCH_PR_NUMBER ?? 'unset'}`);
+            const envDispatch = process.env.DISPATCH_PR_NUMBER;
+            const envInput = process.env.INPUT_PULL_REQUEST;
+            const inputPrNumber = core.getInput ? core.getInput('pull_request') : undefined;
+            const firstNonEmpty = (...values) => {
+              for (const value of values) {
+                if (value === undefined || value === null) continue;
+                const text = typeof value === 'string' ? value.trim() : value;
+                if (text === '' || text === null || text === undefined) continue;
+                return value;
+              }
+              return undefined;
+            };
+            const prNumberRaw = firstNonEmpty(pr?.number, dispatchInput, inputPrNumber, envInput, envDispatch);
+            const prNumber = prNumberRaw ? Number(prNumberRaw) : undefined;
+            core.info(`Resolved prNumberRaw=${prNumberRaw ?? 'undefined'} prNumber=${prNumber ?? 'undefined'}`);
+            if (!prNumber || Number.isNaN(prNumber)) {
+              core.setFailed('No pull request number available; provide `pull_request` input when dispatching manually.');
               return;
             }
 
             const { owner, repo } = context.repo;
 
+            const fetchLivePr = async () => {
+              return github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            };
+
+            let prSnapshot = pr;
+            if (!prSnapshot) {
+              core.info(`Fetching PR #${prNumber} details for manual dispatch.`);
+              try {
+                const response = await fetchLivePr();
+                prSnapshot = response.data;
+              } catch (error) {
+                const message = error.errors?.map(e => e.message).join('; ') || error.message;
+                core.setFailed(`Unable to fetch PR #${prNumber}: ${message}`);
+                return;
+              }
+            }
+
+            if (prSnapshot.draft) {
+              core.info("PR is draft; skipping auto-merge enablement.");
+              return;
+            }
+            if (prSnapshot.state !== "open") {
+              core.info(`PR state is ${prSnapshot.state}; skipping auto-merge enablement.`);
+              return;
+            }
+
             // Fetch live mergeability to avoid enabling auto-merge while GitHub marks
             // the PR as "unstable" (e.g., required checks still running/failing).
             const fetchMergeability = async () => {
-              return github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+              return github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             };
 
             let prDetails;
@@ -47,8 +98,8 @@ jobs:
 
             let mergeableState = prDetails.data.mergeable_state;
             let mergeableFlag = prDetails.data.mergeable;
-            const retryDelayMs = Number(process.env.AUTO_MERGE_MERGEABLE_DELAY_MS || 3000);
-            const maxRetries = Number(process.env.AUTO_MERGE_MERGEABLE_RETRIES || 3);
+            const retryDelayMs = Number(process.env.AUTO_MERGE_MERGEABLE_DELAY_MS || 5000);
+            const maxRetries = Number(process.env.AUTO_MERGE_MERGEABLE_RETRIES || 6);
 
             for (let attempt = 1; mergeableFlag === null && attempt <= maxRetries; attempt += 1) {
               core.info(`mergeability still computing (state=${mergeableState}); retry ${attempt}/${maxRetries} after ${retryDelayMs}ms.`);
@@ -92,15 +143,18 @@ jobs:
               return;
             }
             const isAllowedState = allowedStates.includes(mergeableState);
-            const isTransientButMergeable = transientStates.includes(mergeableState) && mergeableFlag === true;
-            if (!isAllowedState && !isTransientButMergeable) {
-              core.warning(
-                `PR mergeable_state=${mergeableState} mergeable=${mergeableFlag}; skipping auto-merge enablement until GitHub reports a stable state.`
-              );
+            const isTransientState = transientStates.includes(mergeableState);
+            if (!isAllowedState) {
+              if (isTransientState) {
+                core.setFailed(
+                  `PR mergeable_state=${mergeableState} still transient after ${maxRetries} retries; rerun once GitHub marks it clean.`
+                );
+              } else {
+                core.warning(
+                  `PR mergeable_state=${mergeableState} mergeable=${mergeableFlag}; skipping auto-merge enablement until GitHub reports a stable state.`
+                );
+              }
               return;
-            }
-            if (isTransientButMergeable) {
-              core.info(`mergeable_state=${mergeableState} reported with mergeable=true; proceeding with auto-merge enablement.`);
             }
             if (mergeableFlag === false && !["has_hooks", "behind"].includes(mergeableState)) {
               core.warning(`PR mergeable_state=${mergeableState} mergeable=${mergeableFlag}; skipping auto-merge enablement until GitHub reports a stable state.`);
@@ -129,7 +183,8 @@ jobs:
                 mergeMethod = "SQUASH";
               }
               core.info(`Attempting to enable auto-merge with method: ${mergeMethod}`);
-              const enable = async (method) => github.graphql(query, { prId: pr.node_id, mergeMethod: method });
+              const prNodeId = pr?.node_id ?? prSnapshot.node_id;
+              const enable = async (method) => github.graphql(query, { prId: prNodeId, mergeMethod: method });
               let result;
               try {
                 result = await enable(mergeMethod);
@@ -137,13 +192,20 @@ jobs:
                 const message = error.errors?.map(e => e.message).join('; ') || error.message;
                 if (mergeMethod !== "SQUASH" && /not (allowed|enabled)|disabled/i.test(message)) {
                   core.warning(`Merge method "${mergeMethod}" not permitted; falling back to SQUASH.`);
+                  mergeMethod = "SQUASH";
                   result = await enable("SQUASH");
+                } else if (/clean status/i.test(message)) {
+                  const restMethod = mergeMethod === "REBASE" ? "rebase" : mergeMethod === "MERGE" ? "merge" : "squash";
+                  core.warning(`Auto-merge API reported clean status; attempting direct ${restMethod} merge.`);
+                  await github.rest.pulls.merge({ owner, repo, pull_number: prNumber, merge_method: restMethod });
+                  core.info(`Pull request #${prNumber} merged directly via ${restMethod}.`);
+                  return;
                 } else {
                   throw error;
                 }
               }
               const enabledBy = result?.enablePullRequestAutoMerge?.pullRequest?.autoMergeRequest?.enabledBy?.login;
-              core.info(`Auto-merge enabled by ${enabledBy || 'workflow'} for PR #${pr.number}.`);
+              core.info(`Auto-merge enabled by ${enabledBy || 'workflow'} for PR #${prNumber}.`);
             } catch (error) {
               const message = error.errors?.map(e => e.message).join('; ') || error.message;
               if (message.match(/already enabled|mergeable|Cannot enable auto-merge/i)) {
