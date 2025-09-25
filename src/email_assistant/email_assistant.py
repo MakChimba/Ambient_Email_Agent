@@ -1,7 +1,7 @@
 from typing import Literal
 import os
 
-from email_assistant.configuration import get_llm
+from email_assistant.configuration import get_llm, format_model_identifier
 from email_assistant.tracing import (
     AGENT_PROJECT,
     init_project,
@@ -30,6 +30,7 @@ from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from langchain_core.tools import ToolException
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=True)
 init_project(AGENT_PROJECT)
@@ -54,16 +55,18 @@ DEFAULT_MODEL = (
 )
 ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
-print(f"[email_assistant] Models -> router={ROUTER_MODEL_NAME}, tools={TOOL_MODEL_NAME}")
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+print(f"[email_assistant] Models -> router={router_identifier}, tools={tool_identifier}")
 
 # Initialize the LLM for use with router / structured output
 llm = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME)
-print(f"[email_assistant] Router model: {ROUTER_MODEL_NAME} -> {type(llm).__name__}")
+print(f"[email_assistant] Router model: {router_identifier} -> {type(llm).__name__}")
 llm_router = llm.with_structured_output(RouterSchema)
 
 # Initialize the LLM, enforcing tool use (of any available tools) for agent
 llm = get_llm(temperature=0.0, model=TOOL_MODEL_NAME)
-print(f"[email_assistant] Tool model: {TOOL_MODEL_NAME} -> {type(llm).__name__}")
+print(f"[email_assistant] Tool model: {tool_identifier} -> {type(llm).__name__}")
 llm_with_tools = llm.bind_tools(tools, tool_choice="any")
 
 # Nodes
@@ -255,9 +258,24 @@ def tool_node_task(state: State):
     result = []
     for tool_call in state["messages"][-1].tool_calls:
         tool = tools_by_name[tool_call["name"]]
-        observation = tool.invoke(tool_call["args"])
-        log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
-        result.append({"role": "tool", "content" : observation, "tool_call_id": tool_call["id"]})
+        metadata_update = None
+        try:
+            observation = tool.invoke(tool_call["args"])
+        except ToolException as exc:
+            observation = f"ToolException: {exc}"
+            metadata_update = {"error": True, "exception": "ToolException"}
+        except Exception as exc:  # noqa: BLE001 - surface tool errors downstream
+            observation = f"Error: {exc}"
+            metadata_update = {"error": True, "exception": exc.__class__.__name__}
+        log_tool_child_run(
+            name=tool_call["name"],
+            args=tool_call["args"],
+            result=observation,
+            metadata_update=metadata_update,
+        )
+        result.append(
+            {"role": "tool", "content": observation, "tool_call_id": tool_call["id"]}
+        )
     return {"messages": result}
 
 

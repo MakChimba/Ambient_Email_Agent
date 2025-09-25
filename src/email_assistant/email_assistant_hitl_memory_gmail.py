@@ -29,7 +29,7 @@ from email_assistant.prompts import (
     MEMORY_UPDATE_INSTRUCTIONS,
     MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT,
 )
-from email_assistant.configuration import get_llm
+from email_assistant.configuration import get_llm, format_model_identifier
 from email_assistant.schemas import (
     AssistantContext,
     State,
@@ -126,7 +126,12 @@ def _safe_tool_invoke(name: str, args):
         return result
     except Exception as e:
         error = f"Error executing {name}: {str(e)}"
-        log_tool_child_run(name=name, args=args, result=error, metadata_update={"error": True})
+        log_tool_child_run(
+            name=name,
+            args=args,
+            result=error,
+            metadata_update={"error": True, "exception": e.__class__.__name__},
+        )
         return error
 
 
@@ -201,6 +206,14 @@ DEFAULT_MODEL = (
 ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or os.getenv("GEMINI_MODEL_AGENT") or DEFAULT_MODEL
 MEMORY_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_MEMORY_MODEL") or DEFAULT_MODEL
+
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+memory_identifier = format_model_identifier(MEMORY_MODEL_NAME)
+print(
+    "[email_assistant_hitl_memory_gmail] Models -> "
+    f"router={router_identifier}, tools={tool_identifier}, memory={memory_identifier}"
+)
 
 # Initialize models
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
@@ -286,7 +299,7 @@ def triage_router_task(
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
 
     metadata_payload = dict(metadata)
-    metadata_payload.setdefault("router_model", ROUTER_MODEL_NAME)
+    metadata_payload.setdefault("router_model", router_identifier)
     if tz_name:
         metadata_payload.setdefault("timezone", tz_name)
     metadata_payload.setdefault("eval_mode", eval_mode)

@@ -145,6 +145,7 @@ def main():
                 durability="sync",
             ):
                 if mode == "custom":
+                    print(f"[custom] {chunk}")
                     continue
                 preview = str(chunk)
                 if len(preview) > 240:

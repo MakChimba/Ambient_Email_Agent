@@ -37,13 +37,13 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 
 ### Phase 3 — Gemini & Tooling Updates
 - **Model Initialisation & Routing**
-  - [ ] Normalize Gemini provider routing via `init_chat_model(..., model_provider="google_genai")` or prefixed IDs; update docs/examples accordingly.
+  - [x] Normalize Gemini provider routing via `init_chat_model(..., model_provider="google_genai")` or prefixed IDs; update docs/examples accordingly.
 - **Structured Output & Tool Calls**
-  - [ ] Ensure structured output + tool calling continue to pass type checks; update wrappers/tests as needed.
-  - [ ] Capture any schema or retry adjustments required for Gemini v1 exceptions.
+  - [x] Ensure structured output + tool calling continue to pass type checks; update wrappers/tests as needed.
+  - [x] Capture any schema or retry adjustments required for Gemini v1 exceptions.
 - **Tool Error Handling & Telemetry**
-  - [ ] Audit tool nodes for `handle_tool_errors` / `ToolException` policy and adjust retries or messaging.
-  - [ ] Add/maintain sample tool emitting `custom` streaming events for progress logging.
+  - [x] Audit tool nodes for `handle_tool_errors` / `ToolException` policy and adjust retries or messaging.
+  - [x] Add/maintain sample tool emitting `custom` streaming events for progress logging.
 
 ### Phase 4 — UI, Docs, and Notebooks
 - **Notebook Refresh**
@@ -94,3 +94,4 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - 2025-09-26 — Extended runtime-context plumbing to memory + Gmail agents; scripts/tests emit context metadata and request multi-mode streams. Offline Gmail smoke suite passes apart from expected LLM judge failure (no Gmail API).
 - 2025-09-26 — Updated tests/scripts to compile graphs with `durability="sync"`; validated base agent tool-call smoke locally.
 - 2025-09-27 — Added CLI streaming progress (`--stream`) and runtime metadata regression tests (`tests/test_runtime_context.py`).
+- 2025-09-28 — Phase 3 Gemini/tooling pass: standardized `get_llm` on `init_chat_model`, added `stream_progress` demo tool with custom-stream logging, and wrapped tool execution in resilient telemetry. Tests: `uv run pytest tests/test_configuration.py` and `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 uv run pytest tests/test_response.py --agent-module=email_assistant -k tool_calls --maxfail=1`.

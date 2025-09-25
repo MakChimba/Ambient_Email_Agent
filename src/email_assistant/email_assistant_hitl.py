@@ -10,11 +10,12 @@ from langgraph.prebuilt.interrupt import (
     HumanInterruptConfig,
 )
 from langgraph.types import interrupt, Command
+from langchain_core.tools import ToolException
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import HITL_TOOLS_PROMPT
 from email_assistant.prompts import triage_system_prompt, triage_user_prompt, agent_system_prompt_hitl, default_background, default_triage_instructions, default_response_preferences, default_cal_preferences
-from email_assistant.configuration import get_llm
+from email_assistant.configuration import get_llm, format_model_identifier
 from email_assistant.schemas import State, RouterSchema, StateInput, AssistantContext
 from email_assistant.runtime import extract_runtime_metadata
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
@@ -36,6 +37,28 @@ init_project(AGENT_PROJECT)
 tools = get_tools(["write_email", "schedule_meeting", "check_calendar_availability", "Question", "Done"])
 tools_by_name = get_tools_by_name(tools)
 
+
+def _invoke_tool_with_logging(tool_name: str, args: dict) -> str:
+    """Invoke a tool, log the outcome, and surface readable error descriptions."""
+
+    tool = tools_by_name[tool_name]
+    metadata_update = None
+    try:
+        observation = tool.invoke(args)
+    except ToolException as exc:
+        observation = f"ToolException: {exc}"
+        metadata_update = {"error": True, "exception": "ToolException"}
+    except Exception as exc:  # noqa: BLE001 - ensure tool errors propagate as observations
+        observation = f"Error: {exc}"
+        metadata_update = {"error": True, "exception": exc.__class__.__name__}
+    log_tool_child_run(
+        name=tool_name,
+        args=args,
+        result=observation,
+        metadata_update=metadata_update,
+    )
+    return observation
+
 # Role-specific model selection (override via env)
 DEFAULT_MODEL = (
     os.getenv("EMAIL_ASSISTANT_MODEL")
@@ -44,6 +67,10 @@ DEFAULT_MODEL = (
 )
 ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
+
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+print(f"[email_assistant_hitl] Models -> router={router_identifier}, tools={tool_identifier}")
 
 # Initialize the LLM for use with router / structured output
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
@@ -278,9 +305,9 @@ def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__
         if tool_call["name"] not in hitl_tools:
 
             # Execute search_memory and other tools without interruption
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
+            observation = _invoke_tool_with_logging(
+                tool_call["name"], tool_call["args"]
+            )
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
             continue
             
@@ -335,16 +362,15 @@ def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__
         if response["type"] == "accept":
 
             # Execute the tool with original args
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
-            result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+            observation = _invoke_tool_with_logging(
+                tool_call["name"], tool_call["args"]
+            )
+            result.append(
+                {"role": "tool", "content": observation, "tool_call_id": tool_call["id"]}
+            )
                         
         elif response["type"] == "edit":
 
-            # Tool selection 
-            tool = tools_by_name[tool_call["name"]]
-            
             # Get edited args from Agent Inbox
             edited_args = response["args"]["args"]
 
@@ -366,22 +392,24 @@ def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__
             if tool_call["name"] == "write_email":
 
                 # Execute the tool with edited args
-                observation = tool.invoke(edited_args)
+                observation = _invoke_tool_with_logging(
+                    tool_call["name"], edited_args
+                )
 
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
 
             # Update the schedule_meeting tool call with the edited content from Agent Inbox
             elif tool_call["name"] == "schedule_meeting":
 
 
                 # Execute the tool with edited args
-                observation = tool.invoke(edited_args)
+                observation = _invoke_tool_with_logging(
+                    tool_call["name"], edited_args
+                )
 
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
             
             # Catch all other tool calls
             else:

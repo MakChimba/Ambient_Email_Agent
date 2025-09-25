@@ -20,13 +20,13 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
-from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 from langsmith import Client
 from langsmith.evaluation import EvaluationResult, LangChainStringEvaluator, StringEvaluator
 from langsmith.run_helpers import get_current_run_tree, traceable
 from langsmith.schemas import Example, Run
 
+from email_assistant.configuration import get_llm
 from email_assistant.utils import extract_message_content, format_messages_string
 from email_assistant.tracing import invoke_with_root_run, strip_markdown_to_text
 
@@ -81,11 +81,10 @@ def _default_model_name() -> str:
 
 @lru_cache(maxsize=4)
 def _build_base_chain(model_name: str, temperature: float) -> Runnable:
-    llm = ChatGoogleGenerativeAI(
+    llm = get_llm(
         model=model_name,
         temperature=temperature,
         max_output_tokens=4096,
-        convert_system_message_to_human=False,
     )
     parser = JsonOutputParser(pydantic_object=JudgeResult)
     prompt = ChatPromptTemplate.from_messages(
