@@ -194,7 +194,7 @@ def main():
         else:
             try:
                 state_obj = agent.get_state(thread_config)
-            except Exception as exc:
+            except (AttributeError, KeyError, RuntimeError) as exc:
                 logger.warning("Failed to fetch agent state (%s: %s)", exc.__class__.__name__, exc)
                 state_obj = None
 
