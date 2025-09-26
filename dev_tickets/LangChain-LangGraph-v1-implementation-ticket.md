@@ -52,17 +52,18 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
   - [x] Update README / README_LOCAL / developer docs with new env toggles (`EMAIL_ASSISTANT_TIMEZONE`, streaming expectations) and upgrade notes.
   - [x] Link docs back to the research ticket and this implementation ticket where relevant.
 - **Demo Artifacts**
-  - [ ] Capture before/after screenshots or short clips demonstrating multi-mode streaming in Studio or CLI.
+  - [ ] Captured assets deferred to follow-up ticket (`dev_tickets/LangChain-LangGraph-v1-follow-up-ticket.md`).
 
 ### Phase 5 — Validation & Rollout
-- [ ] Run targeted pytest suite (see Testing Notes) against live Gemini where possible; capture logs and LangSmith links when tracing enabled.
+> Remaining live validation, demo capture, and rollout prep are coordinated through `dev_tickets/LangChain-LangGraph-v1-follow-up-ticket.md` while offline coverage continues here.
+- [ ] Run targeted pytest suite (see Testing Notes) against live Gemini where possible; capture logs and LangSmith links when tracing enabled. *(Deferred; see follow-up ticket for execution plan.)*
   - 2025-09-26 — Offline smoke (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) passes tool assertions; remaining failure from LLM judge expected while Gmail API creds unavailable (auto-flag for scheduling behaviour).
   - 2025-09-26 — Added sanity run for base agent (`pytest tests/test_response.py --agent-module=email_assistant -k tool_calls --maxfail=1`) to confirm durability refactor; all cases pass offline.
   - 2025-09-29 — Re-ran offline Gmail smoke with eval toggles (same command as above, `--maxfail=1`). LLM judge still flags `email_input_1` for not auto-scheduling (expected in eval mode); no additional regressions observed.
   - 2025-09-30 — Offline dataset run via `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1 uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`. Three cases still fail because the LLM judge enforces `schedule_meeting_tool` usage; tool call sequencing otherwise matches expectations. Live Gmail suite remains pending until credentials are available post-Phase 5.
-- [ ] Regenerate or verify `tests/snapshots/live_smoke.json` and other fixtures if deterministic outputs change.
-- [ ] Collect final pass/fail checklist evidence and link in this ticket (artifacts, logs, screenshots).
-- [ ] Coordinate merge strategy (feature branch, rollout toggles) and note any fallback procedure.
+- [ ] Regenerate or verify `tests/snapshots/live_smoke.json` and other fixtures if deterministic outputs change. *(Deferred; tracked in follow-up ticket.)*
+- [ ] Collect final pass/fail checklist evidence and link in this ticket (artifacts, logs, screenshots). *(Start once live validation completes; interim notes captured in follow-up ticket.)*
+- [ ] Coordinate merge strategy (feature branch, rollout toggles) and note any fallback procedure. *(Begin drafting alongside final pass/fail summary after follow-up tasks finish.)*
 
 ## Acceptance Criteria
 - [ ] Dependency bump merged with passing CI (unit + integration) on both offline eval and live Gemini runs.
@@ -75,8 +76,8 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 
 ## Testing Notes
 - Primary: `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
-- Live coverage: `pytest tests/test_live_smoke.py --agent-module=email_assistant_hitl_memory_gmail`
-- HITL spam flow: `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
+- Live coverage: `pytest tests/test_live_smoke.py --agent-module=email_assistant_hitl_memory_gmail` *(pending; execute via follow-up ticket)*
+- HITL spam flow: `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail` *(pending; execute via follow-up ticket)*
 - Optional full runner: `python scripts/run_tests_langsmith.py` (honours live vs offline env)
 - When running offline/deterministic: set `EMAIL_ASSISTANT_EVAL_MODE=1`, `HITL_AUTO_ACCEPT=1`, `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`, optionally `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1`.
 
@@ -87,7 +88,7 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - Notebook re-execution drift → capture updated snapshots or note cells that require live Gemini access.
 
 ## Rollout & Follow-up
-- Stage rollout behind a feature branch; merge once acceptance checklist satisfied.
+- Stage rollout behind a feature branch; merge once acceptance checklist satisfied. *(Coordinate after follow-up ticket completes live validation + demo capture.)*
 - After deployment, monitor Agent Inbox for duplicate sends or missed checkpoints.
 - Plan subsequent work to expand `Runtime[Context]` usage across remaining nodes (memory updates, Gmail tool wrappers) as follow-up tasks if needed.
 
@@ -99,3 +100,4 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - 2025-09-28 — Phase 3 Gemini/tooling pass: standardized `get_llm` on `init_chat_model`, added `stream_progress` demo tool with custom-stream logging, and wrapped tool execution in resilient telemetry. Tests: `uv run pytest tests/test_configuration.py` and `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 uv run pytest tests/test_response.py --agent-module=email_assistant -k tool_calls --maxfail=1`.
 - 2025-09-29 — Phase 4 docs/notebooks: README, README_LOCAL, and AGENTS.md now document the new `init_chat_model` defaults, streaming env toggles (`EMAIL_ASSISTANT_TRACE_DEBUG`, provider overrides), and link back to this ticket. Updated `hitl.ipynb`, `memory.ipynb`, and `langgraph_101.ipynb` to compile graphs with `.with_config(durability="sync")`, refreshed LangGraph 1.0 narration, and kept `stream_mode=["updates","messages","custom"]` walkthroughs intact. Demo artefacts (screenshots/video) still pending.
 - 2025-09-30 — Phase 5 offline validation: reran `uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` with eval toggles. The LLM judge continues to fail scheduling-focused cases (`email_input_1`, `email_input_10`, `email_input_13`) because `schedule_meeting_tool` is not invoked in offline mode; results captured for reference while live Gmail tests remain deferred.
+- 2025-09-30 — Created follow-up ticket to track live validation, streaming demo artefacts, and final pass/fail + merge strategy tasks once credentials/assets become available.
