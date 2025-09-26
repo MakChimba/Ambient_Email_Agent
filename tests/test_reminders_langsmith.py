@@ -14,6 +14,7 @@ from tests.trace_utils import configure_tracing_project, configure_judge_project
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from email_assistant.email_assistant_hitl_memory_gmail import overall_workflow
+from email_assistant.tools.gmail import gmail_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 from email_assistant.tracing import invoke_with_root_run, summarize_email_for_grid
@@ -36,6 +37,18 @@ configure_judge_project("email-assistant-judge-test-reminders")
 
 # --- 1. Setup LangSmith Client and Dataset ---
 DATASET_NAME = "Reminder Scenarios Evaluation v1"
+
+
+@pytest.fixture(autouse=True)
+def _route_gmail_through_fixture(gmail_service, monkeypatch):
+    """Ensure mark_as_read uses the Gmail fixture rather than live credentials."""
+
+    monkeypatch.setattr(
+        gmail_tools,
+        "mark_as_read",
+        gmail_service.mark_as_read,
+        raising=True,
+    )
 
 
 def _normalize_email_input(d: dict) -> dict:
@@ -85,13 +98,31 @@ def test_reminder_scenarios_on_langsmith(example: Example, gmail_service):
 
     checkpointer = MemorySaver()
     store = InMemoryStore()
-    agent = overall_workflow.compile(checkpointer=checkpointer, store=store)
+    agent = (
+        overall_workflow
+        .compile(checkpointer=checkpointer, store=store)
+        .with_config(durability="sync")
+    )
 
-    config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    thread_id = f"reminders-{uuid.uuid4()}"
+    config = {
+        "run_id": str(uuid.uuid4()),
+        "configurable": {
+            "thread_id": thread_id,
+            "thread_metadata": {"thread_id": thread_id},
+            "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
+            "eval_mode": EVAL_MODE_ENABLED,
+        },
+        "recursion_limit": 100,
+    }
     summary = summarize_email_for_grid(example.inputs.get("email_input", {}))
 
     def _invoke_agent():
-        return agent.invoke(example.inputs, config)
+        return agent.invoke(
+            example.inputs,
+            config,
+            durability="sync",
+        )
 
     result = invoke_with_root_run(
         _invoke_agent,

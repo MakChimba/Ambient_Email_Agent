@@ -3,7 +3,8 @@
 The Standalone Email Assistant is a LangGraph-powered workflow that triages incoming email, coordinates tools, and drafts high-quality replies using Google's Gemini models. The project showcases how to layer human-in-the-loop checkpoints, durable memory, and Gmail automation on top of a modular graph so you can evolve an assistant from a simple responder into a production-ready agent.
 
 ## Highlights
-- LangGraph 0.6 graph lineup with tiered capabilities: baseline responder, HITL, persistent memory, and Gmail-native automation.
+- LangGraph 1.0 graph lineup with sync durability baked in: baseline responder, HITL, persistent memory, and Gmail-native automation.
+- Multi-mode streaming (`updates`/`messages`/`custom`) wired through `get_stream_writer()` plus the `stream_progress` helper for live progress events.
 - Gemini 2.5 tool orchestration (`tool_choice="any"`) with guardrails for spam handling, no-reply detection, and deterministic evaluation modes.
 - Rich tool belt including calendar scheduling, email drafting, spam labeling, and reminder automation.
 - Durable execution via SQLite-backed checkpoints/stores so interrupts and memory survive process restarts.
@@ -48,13 +49,26 @@ GOOGLE_API_KEY=...
 GEMINI_MODEL=gemini-2.5-pro
 ```
 
+Model helper defaults: `email_assistant.configuration.get_llm` now normalises provider/model pairs via `init_chat_model`, defaulting to `google_genai:gemini-2.5-pro`. Override the provider by setting `EMAIL_ASSISTANT_MODEL_PROVIDER` or prefixing the model value (e.g., `google_genai:gemini-2.0-pro-exp`).
+
 Helpful toggles (leave unset for live runs):
 - `HITL_AUTO_ACCEPT=1` – auto-accept tool interrupts.
 - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` – skip Gmail `mark_as_read` call.
 - `EMAIL_ASSISTANT_EVAL_MODE=1` – deterministic, offline tool calls.
 - `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` – evaluator compatibility mode.
+- `EMAIL_ASSISTANT_MODEL_PROVIDER=google_genai` – explicit provider override for `init_chat_model` (defaults to `google_genai`).
 - `EMAIL_ASSISTANT_SQLITE_TIMEOUT=60` – optional override (seconds) for SQLite busy timeouts when running LangSmith traces or parallel judges; defaults to 30.
 - `EMAIL_ASSISTANT_TRACE_TIMEZONE=Australia/Sydney` – override the timezone used when auto-grouping LangSmith projects (`email-assistant-AGENT-YYYYMMDD`). Defaults to Australia/Sydney.
+- `EMAIL_ASSISTANT_TRACE_DEBUG=1` – log LangGraph stream events and tracing metadata to stdout (useful when validating custom streaming progress).
+- `EMAIL_ASSISTANT_TRACE_STAGE` / `EMAIL_ASSISTANT_TRACE_TAGS` – append rollout metadata to LangSmith runs for multi-stage deploys.
+- `EMAIL_ASSISTANT_TIMEZONE=Australia/Melbourne` – default runtime timezone used by scripts and reminders when no explicit timezone is provided.
+- `EMAIL_ASSISTANT_JUDGE_PROJECT=email-assistant:judge` – base LangSmith project name for Gemini judge evaluations (date suffix appended automatically).
+
+### Streaming & Tracing
+- All notebooks, scripts, and tests request `stream_mode=["updates","messages","custom"]`; the `custom` channel surfaces `stream_progress` events for live demos and automated logs.
+- `scripts/run_real_outputs.py --stream` mirrors the production agent stream and prints each channel as it arrives. Combine with `EMAIL_ASSISTANT_TRACE_DEBUG=1` when you need verbose instrumentation.
+- LangSmith project helpers respect `EMAIL_ASSISTANT_TRACE_PROJECT`, `EMAIL_ASSISTANT_TRACE_STAGE`, and `EMAIL_ASSISTANT_TRACE_TAGS`, keeping traces grouped when replaying multi-mode streaming runs (`EMAIL_ASSISTANT_TRACE_PROJECT` changes the base name; the daily suffix still applies).
+- See `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md` for the upgrade log covering the LangGraph 1.0 migration and streaming instrumentation decisions.
 
 ### Launch LangGraph Studio or CLI
 ```bash
@@ -75,6 +89,7 @@ Select the graph that matches your use case (`langgraph.json` lists all availabl
   - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
 - **Offline/deterministic runs:** set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionally `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1`).
+- **SQLite lock avoidance:** tests now auto-configure unique `EMAIL_ASSISTANT_CHECKPOINT_PATH` / `EMAIL_ASSISTANT_STORE_PATH` values, but when running scripts manually set them to fresh locations (e.g. `/tmp/checkpoints.sqlite`) to avoid `OperationalError: database is locked` from earlier runs.
 - `python scripts/run_tests_langsmith.py` mirrors the tool-call suite and records traces when LangSmith is configured.
 - Enable Gemini 2.5 Flash judging (`EMAIL_ASSISTANT_LLM_JUDGE=1`) to score correctness/tool usage; add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail on judge verdicts.
 
@@ -97,6 +112,8 @@ Path | Description
 ## Additional Resources
 - `README_LOCAL.md` – local dev/test details, tmux/cron recipes, notebook tips.
 - `AGENTS.md` – agent evolution, feature changelog, evaluation modes.
+- `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md` – end-to-end implementation log with acceptance checklist and rollout notes.
+- `dev_tickets/LangChain-LangGraph-v1-follow-up-ticket.md` – Phase 5 validation/demo follow-ups, risks, and merge coordination tasks.
 - `notebooks/UPDATES.md` – notebook refresh log, live-first checklists, reminder/HITL env toggles.
 - `CONTRIBUTING.md` – branching, review, and testing expectations.
 - `system_prompt.md` – canonical assistant instructions.

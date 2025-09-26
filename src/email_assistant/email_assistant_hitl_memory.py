@@ -1,4 +1,5 @@
-from typing import Literal
+import os
+from typing import Any, Iterable, Literal, cast
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
@@ -8,13 +9,22 @@ from langgraph.prebuilt.interrupt import (
     HumanInterrupt,
     HumanInterruptConfig,
 )
+from langgraph.runtime import Runtime
 from langgraph.types import interrupt, Command
+from langchain_core.tools import ToolException
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import HITL_MEMORY_TOOLS_PROMPT
 from email_assistant.prompts import triage_system_prompt, triage_user_prompt, agent_system_prompt_hitl_memory, default_triage_instructions, default_background, default_response_preferences, default_cal_preferences, MEMORY_UPDATE_INSTRUCTIONS, MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT
-from email_assistant.configuration import get_llm
-from email_assistant.schemas import State, RouterSchema, StateInput, UserPreferences
+from email_assistant.configuration import get_llm, format_model_identifier
+from email_assistant.schemas import (
+    AssistantContext,
+    State,
+    RouterSchema,
+    StateInput,
+    UserPreferences,
+)
+from email_assistant.runtime import extract_runtime_metadata
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
 from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from email_assistant.tracing import (
@@ -34,12 +44,67 @@ init_project(AGENT_PROJECT)
 tools = get_tools(["write_email", "schedule_meeting", "check_calendar_availability", "Question", "Done"])
 tools_by_name = get_tools_by_name(tools)
 
+
+def _invoke_tool_with_logging(tool_name: str, args: dict) -> str:
+    """Invoke a tool, log the output, and keep error telemetry consistent."""
+
+    tool = tools_by_name[tool_name]
+    metadata_update = None
+    try:
+        observation = tool.invoke(args)
+    except ToolException as exc:
+        observation = f"ToolException: {exc}"
+        metadata_update = {"error": True, "exception": "ToolException"}
+    except Exception as exc:  # noqa: BLE001 - ensure tool errors reach the LLM loop
+        observation = f"Error: {exc}"
+        metadata_update = {"error": True, "exception": exc.__class__.__name__}
+    log_tool_child_run(
+        name=tool_name,
+        args=args,
+        result=observation,
+        metadata_update=metadata_update,
+    )
+    return observation
+
 # Optional auto-accept for HITL in tests
-import os
 def _maybe_interrupt(requests):
-    if os.getenv("HITL_AUTO_ACCEPT", "").lower() in ("1", "true", "yes"):
-        return [{"type": "accept", "args": {}}]
-    return interrupt(requests)
+    """Optionally auto-handle interrupts when demos/tests enable auto-accept."""
+
+    if os.getenv("HITL_AUTO_ACCEPT", "").lower() not in ("1", "true", "yes"):
+        return interrupt(requests)
+
+    def _allow(config: Any, attr: str) -> bool:
+        if config is None:
+            return False
+        if isinstance(config, dict):
+            return bool(config.get(attr, False))
+        return bool(getattr(config, attr, False))
+
+    synthesized = []
+    for req in cast(Iterable[Any] | None, requests) or []:
+        config = None
+        action = ""
+        if isinstance(req, dict):
+            config = req.get("config")
+            action_request = req.get("action_request") or {}
+            action = str(action_request.get("action", ""))
+        else:
+            config = getattr(req, "config", None)
+            action = str(
+                getattr(getattr(req, "action_request", None), "action", "")
+            )
+
+        if _allow(config, "allow_accept"):
+            synthesized.append({"type": "accept", "args": {}})
+        elif _allow(config, "allow_respond"):
+            responder = "Auto-accept demo: proceed." if action.lower() == "question" else ""
+            synthesized.append({"type": "response", "args": responder})
+        elif _allow(config, "allow_ignore"):
+            synthesized.append({"type": "ignore", "args": {}})
+        else:
+            synthesized.append({"type": "response", "args": ""})
+
+    return synthesized
 
 # Role-specific model selection (override via env)
 DEFAULT_MODEL = (
@@ -49,6 +114,14 @@ DEFAULT_MODEL = (
 )
 ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
+
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+    print(
+        "[email_assistant_hitl_memory] Models -> "
+        f"router={router_identifier}, tools={tool_identifier}"
+    )
 
 # Initialize the LLM for use with router / structured output
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
@@ -141,7 +214,11 @@ def update_memory(store, namespace, messages):
 
 # Nodes 
 @task
-def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router_task(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -149,7 +226,8 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
     - Company-wide announcements
     - Messages meant for other teams
     """
-    
+    _, _, thread_id, metadata = extract_runtime_metadata(runtime)
+
     # Parse the email input
     email_input = state["email_input"]
     author, to, subject, email_thread = parse_email(email_input)
@@ -159,7 +237,12 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
-    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
+    prime_parent_run(
+        email_input=email_input,
+        email_markdown=email_markdown,
+        metadata_update=metadata,
+        thread_id=thread_id,
+    )
 
     # Search for existing memory
     triage_instructions = get_memory(
@@ -217,7 +300,13 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
 
     elif classification == "notify":
         print("🔔 Classification: NOTIFY - This email contains important information") 
@@ -228,6 +317,12 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
         update = {
             "classification_decision": classification,
         }
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
 
     else:
         raise ValueError(f"Invalid classification: {classification}")
@@ -235,13 +330,20 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
     return Command(goto=goto, update=update)
 
 
-def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state).result()
+    return triage_router_task(state, store=store, runtime=runtime).result()
 
 @task
-def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler_task(
+    state: State,
+    store: BaseStore,
+) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     
     # Parse the email input
@@ -310,10 +412,13 @@ def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Lit
     return Command(goto=goto, update=update)
 
 
-def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler(
+    state: State,
+    store: BaseStore,
+) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state).result()
+    return triage_interrupt_handler_task(state, store=store).result()
 
 @task
 def llm_call_task(state: State, store: BaseStore):
@@ -396,9 +501,9 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
         if tool_call["name"] not in hitl_tools:
 
             # Execute search_memory and other tools without interruption
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
+            observation = _invoke_tool_with_logging(
+                tool_call["name"], tool_call["args"]
+            )
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
             continue
             
@@ -453,15 +558,16 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
         if response["type"] == "accept":
 
             # Execute the tool with original args
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
-            result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+            observation = _invoke_tool_with_logging(
+                tool_call["name"], tool_call["args"]
+            )
+            result.append(
+                {"role": "tool", "content": observation, "tool_call_id": tool_call["id"]}
+            )
                         
         elif response["type"] == "edit":
 
-            # Tool selection 
-            tool = tools_by_name[tool_call["name"]]
+            # Preserve the initial tool payload for memory updates
             initial_tool_call = tool_call["args"]
             
             # Get edited args from Agent Inbox
@@ -485,8 +591,9 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
             if tool_call["name"] == "write_email":
                 
                 # Execute the tool with edited args
-                observation = tool.invoke(edited_args)
-                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
+                observation = _invoke_tool_with_logging(
+                    tool_call["name"], edited_args
+                )
                 
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
@@ -501,8 +608,9 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
             elif tool_call["name"] == "schedule_meeting":
                 
                 # Execute the tool with edited args
-                observation = tool.invoke(edited_args)
-                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
+                observation = _invoke_tool_with_logging(
+                    tool_call["name"], edited_args
+                )
                 
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
@@ -597,8 +705,12 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
     return interrupt_handler_task(state).result()
 
 # Conditional edge function
-def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handler", "__end__"]:
+def should_continue(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Literal["interrupt_handler", "__end__"]:
     """Route to tool handler, or end if Done tool called"""
+    _, _, thread_id, metadata = extract_runtime_metadata(runtime)
     messages = state["messages"]
     last_message = messages[-1]
     if last_message.tool_calls:
@@ -612,6 +724,8 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
                 email_input=state.get("email_input", {}),
                 email_markdown=None,
                 outputs=output_text,
+                metadata_update=metadata,
+                thread_id=thread_id,
             )
             return END
         return "interrupt_handler"
@@ -621,11 +735,13 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
         email_input=state.get("email_input", {}),
         email_markdown=None,
         outputs=output_text,
+        metadata_update=metadata,
+        thread_id=thread_id,
     )
     return END
 
 # Build workflow
-agent_builder = StateGraph(State)
+agent_builder = StateGraph(State, context_schema=AssistantContext)
 
 # Add nodes - with store parameter
 agent_builder.add_node("llm_call", llm_call)
@@ -647,11 +763,14 @@ response_agent = agent_builder.compile()
 
 # Build overall workflow with store and checkpointer
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("triage_interrupt_handler", "response_agent")
 )
 
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()

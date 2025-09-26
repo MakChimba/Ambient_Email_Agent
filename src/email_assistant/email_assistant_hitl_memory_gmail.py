@@ -12,6 +12,7 @@ from langgraph.prebuilt.interrupt import (
     HumanInterruptConfig,
 )
 from langgraph.store.base import BaseStore
+from langgraph.runtime import Runtime
 from langgraph.types import interrupt, Command
 
 from email_assistant.tools import get_tools, get_tools_by_name
@@ -28,14 +29,21 @@ from email_assistant.prompts import (
     MEMORY_UPDATE_INSTRUCTIONS,
     MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT,
 )
-from email_assistant.configuration import get_llm
-from email_assistant.schemas import State, RouterSchema, StateInput, UserPreferences
+from email_assistant.configuration import get_llm, format_model_identifier
+from email_assistant.schemas import (
+    AssistantContext,
+    State,
+    RouterSchema,
+    StateInput,
+    UserPreferences,
+)
+from email_assistant.runtime import extract_runtime_metadata, runtime_thread_id
 from email_assistant.utils import (
     parse_gmail,
     format_for_display,
     format_gmail_markdown,
-    format_messages_string,
     extract_message_content,
+    format_messages_string,
 )
 from email_assistant.tracing import (
     AGENT_PROJECT,
@@ -118,7 +126,12 @@ def _safe_tool_invoke(name: str, args):
         return result
     except Exception as e:
         error = f"Error executing {name}: {str(e)}"
-        log_tool_child_run(name=name, args=args, result=error, metadata_update={"error": True})
+        log_tool_child_run(
+            name=name,
+            args=args,
+            result=error,
+            metadata_update={"error": True, "exception": e.__class__.__name__},
+        )
         return error
 
 
@@ -194,13 +207,28 @@ ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or os.getenv("GEMINI_MODEL_AGENT") or DEFAULT_MODEL
 MEMORY_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_MEMORY_MODEL") or DEFAULT_MODEL
 
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+memory_identifier = format_model_identifier(MEMORY_MODEL_NAME)
+print(
+    "[email_assistant_hitl_memory_gmail] Models -> "
+    f"router={router_identifier}, tools={tool_identifier}, memory={memory_identifier}"
+)
+
 # Initialize models
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
 llm_with_tools = get_llm(temperature=0.0, model=TOOL_MODEL_NAME).bind_tools(tools, tool_choice="any")
 
 
-def _resolve_thread_id(state: State) -> str | None:
-    """Best-effort extraction of thread identifiers from the LangGraph state."""
+def _resolve_thread_id(
+    state: State,
+    runtime: Runtime[AssistantContext] | None = None,
+) -> str | None:
+    """Best-effort extraction of thread identifiers from runtime context/state."""
+
+    thread_id = runtime_thread_id(runtime)
+    if thread_id:
+        return thread_id
 
     candidates: list[Any] = []
 
@@ -209,16 +237,10 @@ def _resolve_thread_id(state: State) -> str | None:
         config = state.get("config")
         if isinstance(config, Mapping):
             candidates.append(config.get("thread_id"))
-            configurable = config.get("configurable")
-            if isinstance(configurable, Mapping):
-                candidates.append(configurable.get("thread_id"))
 
     config_attr = getattr(state, "config", None)
     if isinstance(config_attr, Mapping):
         candidates.append(config_attr.get("thread_id"))
-        configurable = config_attr.get("configurable")
-        if isinstance(configurable, Mapping):
-            candidates.append(configurable.get("thread_id"))
 
     for candidate in candidates:
         if candidate:
@@ -263,13 +285,26 @@ def update_memory(store, namespace, messages):
 
 # Nodes
 @task
-def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router_task(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content; create/cancel reminders and route next step."""
 
     email_input = state["email_input"]
     author, to, subject, email_thread, email_id = parse_gmail(email_input)
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-    thread_id = _resolve_thread_id(state)
+    tz_name, eval_mode, thread_id_ctx, metadata = extract_runtime_metadata(runtime)
+    thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
+
+    metadata_payload = dict(metadata)
+    metadata_payload.setdefault("router_model", router_identifier)
+    if tz_name:
+        metadata_payload.setdefault("timezone", tz_name)
+    metadata_payload.setdefault("eval_mode", eval_mode)
+    if thread_id:
+        metadata_payload.setdefault("thread_id", thread_id)
 
     prime_parent_run(
         email_input=email_input,
@@ -279,7 +314,7 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
         tags=TRACE_AGENT_TAGS,
         thread_id=thread_id,
         run_label=email_id,
-        metadata_update={"router_model": ROUTER_MODEL_NAME},
+        metadata_update=metadata_payload,
     )
 
     user_prompt = triage_user_prompt.format(author=author, to=to, subject=subject, email_thread=email_thread)
@@ -304,7 +339,12 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
         run_type="chain",
         inputs_summary=stage_inputs,
         tags=["triage", "router"],
-        metadata={"email_id": email_id, "thread_id": thread_id},
+        metadata={
+            "email_id": email_id,
+            "thread_id": thread_id,
+            "timezone": tz_name,
+            "eval_mode": eval_mode,
+        },
         extra={
             "router_prompt": router_prompt,
             "triage_instructions": triage_instructions,
@@ -378,17 +418,26 @@ def triage_router_task(state: State, store: BaseStore) -> Command[Literal["triag
     return Command(goto=goto, update=update)
 
 
-def triage_router(state: State, store: BaseStore) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state).result()
+    return triage_router_task(state, store=store, runtime=runtime).result()
 
 @task
-def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler_task(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
     messages = [{"role": "user", "content": f"Email to notify user about: {email_markdown}"}]
+    tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
     request: HumanInterrupt = HumanInterrupt(
         action_request=ActionRequest(
             action=f"Email Assistant: {state['classification_decision']}",
@@ -402,7 +451,7 @@ def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Lit
         ),
         description=email_markdown,
     )
-    thread_id = _resolve_thread_id(state)
+    thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
     goto: str = END
 
     with trace_stage(
@@ -410,7 +459,12 @@ def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Lit
         run_type="chain",
         inputs_summary=f"triage notify -> {state['classification_decision']}",
         tags=["triage", "hitl"],
-        metadata={"email_id": email_id, "thread_id": thread_id},
+        metadata={
+            "email_id": email_id,
+            "thread_id": thread_id,
+            "timezone": tz_name,
+            "eval_mode": eval_mode,
+        },
         extra={"request": request},
     ) as trace:
         response = _maybe_interrupt([request])[0]
@@ -440,10 +494,14 @@ def triage_interrupt_handler_task(state: State, store: BaseStore) -> Command[Lit
     return Command(goto=goto, update={"messages": messages})
 
 
-def triage_interrupt_handler(state: State, store: BaseStore) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state).result()
+    return triage_interrupt_handler_task(state, store=store, runtime=runtime).result()
 
 @task
 def llm_call_task(state: State, store: BaseStore):
@@ -1151,18 +1209,22 @@ def llm_call(state: State, store: BaseStore):
     return llm_call_task(state).result()
 
 @task
-def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
+def interrupt_handler_task(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
-    # Always include the originating AIMessage so downstream logs/tests can see tool_calls
     ai_message = state["messages"][-1]
-    result = [ai_message]
+    result: list[Any] = []
     goto = "llm_call"
     try:
         tool_names_summary = [tc.get("name") for tc in ai_message.tool_calls]
     except Exception:
         tool_names_summary = []
     email_input_cached = state.get("email_input", {})
-    thread_id = _resolve_thread_id(state)
+    tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
+    thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
     try:
         _author_meta, _to_meta, _subject_meta, _body_meta, email_id_meta = parse_gmail(email_input_cached)
     except Exception:
@@ -1173,7 +1235,12 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
         run_type="chain",
         inputs_summary=f"tool_calls={len(tool_names_summary)}",
         tags=["response_agent", "hitl"],
-        metadata={"email_id": email_id_meta, "thread_id": thread_id},
+        metadata={
+            "email_id": email_id_meta,
+            "thread_id": thread_id,
+            "timezone": tz_name,
+            "eval_mode": eval_mode,
+        },
         extra={"tool_names": tool_names_summary},
     ) as trace:
         for tool_call in ai_message.tool_calls:
@@ -1349,18 +1416,36 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
                         if followup["type"] == "accept":
                             # Emit a synthetic tool_call so logs/tests register the action
                             from langchain_core.messages import AIMessage
+
                             spam_call = {
                                 "name": "mark_as_spam_tool",
-                            "args": {"email_id": email_id},
-                            "id": "mark_spam",
-                        }
-                        result.append(AIMessage(content="", tool_calls=[spam_call]))
-                        observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id})
-                        result.append({"role": "tool", "content": observation, "tool_call_id": "mark_spam"})
-                        update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": "User marked this email as spam. Update triage preferences to classify similar emails as ignore."}])
-                        goto = END
-                    else:
-                        result.append({"role": "tool", "content": "User declined to move to Spam.", "tool_call_id": tool_call["id"]})
+                                "args": {"email_id": email_id},
+                                "id": "mark_spam",
+                            }
+                            result.append(AIMessage(content="", tool_calls=[spam_call]))
+                            observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id})
+                            result.append({"role": "tool", "content": observation, "tool_call_id": "mark_spam"})
+                            update_memory(
+                                store,
+                                ("email_assistant", "triage_preferences"),
+                                state["messages"]
+                                + result
+                                + [
+                                    {
+                                        "role": "user",
+                                        "content": "User marked this email as spam. Update triage preferences to classify similar emails as ignore.",
+                                    }
+                                ],
+                            )
+                            goto = END
+                        else:
+                            result.append(
+                                {
+                                    "role": "tool",
+                                    "content": "User declined to move to Spam.",
+                                    "tool_call_id": tool_call["id"],
+                                }
+                            )
                 else:
                     result.append({"role": "tool", "content": f"User answered the question. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
             else:
@@ -1371,13 +1456,24 @@ def interrupt_handler_task(state: State, store: BaseStore) -> Command[Literal["l
                     update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
 
         if trace:
-            handled = max(len(result) - 1, 0)
+            handled = sum(
+                1
+                for entry in result
+                if (
+                    (isinstance(entry, dict) and entry.get("role") == "tool")
+                    or getattr(entry, "tool_calls", None)
+                )
+            )
             trace.set_outputs(f"goto={goto}; handled={handled}")
 
     return Command(goto=goto, update={"messages": result})
 
 
-def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handler", "mark_as_read_node", "llm_call"]:
+def should_continue(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Literal["interrupt_handler", "mark_as_read_node", "llm_call"]:
     """Route to tool handler, or end if Done tool called"""
     email_input = state.get("email_input", {})
     try:
@@ -1385,7 +1481,8 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
     except Exception:
         author = to = subject = email_thread = ""
         email_id = None
-    thread_id = _resolve_thread_id(state)
+    tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
+    thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
 
     decision: Literal["interrupt_handler", "mark_as_read_node", "llm_call"] = "mark_as_read_node"
     last_message = state["messages"][-1]
@@ -1399,7 +1496,12 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
         run_type="chain",
         inputs_summary="evaluate next step",
         tags=["response_agent", "router"],
-        metadata={"email_id": email_id, "thread_id": thread_id},
+        metadata={
+            "email_id": email_id,
+            "thread_id": thread_id,
+            "timezone": tz_name,
+            "eval_mode": eval_mode,
+        },
         extra={"last_tool_names": tool_names},
     ) as trace:
         if getattr(last_message, "tool_calls", None):
@@ -1434,13 +1536,20 @@ def should_continue(state: State, store: BaseStore) -> Literal["interrupt_handle
     return decision
 
 
-def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_call", "__end__"]]:
+def interrupt_handler(
+    state: State,
+    store: BaseStore,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["llm_call", "__end__"]]:
     """Synchronously execute the interrupt handler task."""
 
-    return interrupt_handler_task(state).result()
+    return interrupt_handler_task(state, store=store, runtime=runtime).result()
 
 @task
-def mark_as_read_node_task(state: State):
+def mark_as_read_node_task(
+    state: State,
+    runtime: Runtime[AssistantContext],
+):
     """Finalize Gmail flow by marking the thread as read and append a summary message.
 
     Appends a final assistant text message summarizing the reply content so
@@ -1449,20 +1558,26 @@ def mark_as_read_node_task(state: State):
     skip = os.getenv("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "").lower() in ("1", "true", "yes")
     email_input = state["email_input"]
     author, to, subject, email_thread, email_id = parse_gmail(email_input)
-    thread_id = _resolve_thread_id(state)
+    tz_name, eval_mode, thread_id_ctx, metadata = extract_runtime_metadata(runtime)
+    thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
 
     result_payload: dict[str, Any]
 
     email_markdown = ""
-    tool_trace = ""
     output_text = ""
+    tool_trace = ""
 
     with trace_stage(
         "mark_as_read_node",
         run_type="chain",
         inputs_summary=f"finalise thread {email_id or 'UNKNOWN'}",
         tags=["finalize"],
-        metadata={"email_id": email_id, "thread_id": thread_id},
+        metadata={
+            "email_id": email_id,
+            "thread_id": thread_id,
+            "timezone": tz_name,
+            "eval_mode": eval_mode,
+        },
     ) as trace:
         if skip:
             print(f"[gmail] Skipping mark_as_read for {email_id or 'UNKNOWN_ID'} (toggle enabled)")
@@ -1473,10 +1588,9 @@ def mark_as_read_node_task(state: State):
                 print(f"[gmail] mark_as_read failed for {email_id}: {e}")
 
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-        tool_trace = format_messages_string(state.get("messages", []))
         output_text = format_final_output(state)
+        tool_trace = format_messages_string(state.get("messages", []))
 
-        from langchain_core.messages import AIMessage
         summary = None
         try:
             for m in reversed(state.get("messages", [])):
@@ -1498,38 +1612,50 @@ def mark_as_read_node_task(state: State):
             result_payload = {
                 "messages": [{"role": "assistant", "content": summary}],
                 "assistant_reply": summary,
-                "tool_trace": tool_trace,
                 "email_markdown": email_markdown,
-                "output_text": output_text,
             }
         else:
             result_payload = {
                 "assistant_reply": "",
-                "tool_trace": tool_trace,
                 "email_markdown": email_markdown,
-                "output_text": output_text,
             }
+
+        if tool_trace:
+            result_payload["tool_trace"] = tool_trace
+        if output_text:
+            result_payload["output_text"] = output_text
+
+        for key in ("assistant_reply", "email_markdown", "tool_trace", "output_text"):
+            if key in result_payload and result_payload[key] == state.get(key):
+                result_payload.pop(key)
 
         if trace:
             trace.set_outputs(output_text or "workflow complete")
 
+    metadata_payload = dict(metadata)
+    metadata_payload.setdefault("email_id", email_id)
     prime_parent_run(
         email_input=state.get("email_input", {}),
         email_markdown=email_markdown,
         outputs=output_text,
         extra_update={"email_id": email_id},
+        metadata_update=metadata_payload,
+        thread_id=thread_id,
     )
 
     return result_payload
 
 
-def mark_as_read_node(state: State):
+def mark_as_read_node(
+    state: State,
+    runtime: Runtime[AssistantContext],
+):
     """Synchronously execute the mark_as_read_node task."""
 
-    return mark_as_read_node_task(state).result()
+    return mark_as_read_node_task(state, runtime=runtime).result()
 
 # Build workflow
-agent_builder = StateGraph(State)
+agent_builder = StateGraph(State, context_schema=AssistantContext)
 agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("interrupt_handler", interrupt_handler)
 agent_builder.add_node("mark_as_read_node", mark_as_read_node)
@@ -1547,13 +1673,15 @@ agent_builder.add_edge("mark_as_read_node", END)
 response_agent = agent_builder.compile()
 
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
-    .add_node("mark_as_read_node", mark_as_read_node)
     .add_edge(START, "triage_router")
-    .add_edge("mark_as_read_node", END)
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("triage_interrupt_handler", "response_agent")
+    .add_edge("response_agent", END)
 )
 
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()

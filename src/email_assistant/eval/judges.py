@@ -20,15 +20,20 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
-from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import BaseModel, Field
 from langsmith import Client
 from langsmith.evaluation import EvaluationResult, LangChainStringEvaluator, StringEvaluator
 from langsmith.run_helpers import get_current_run_tree, traceable
 from langsmith.schemas import Example, Run
 
+from email_assistant.configuration import get_llm
 from email_assistant.utils import extract_message_content, format_messages_string
-from email_assistant.tracing import invoke_with_root_run, strip_markdown_to_text
+from email_assistant.tracing import (
+    email_fingerprint,
+    invoke_with_root_run,
+    strip_markdown_to_text,
+    truncate_markdown,
+)
 
 _FEEDBACK_PRIORITY_DELAY = float(os.getenv("EMAIL_ASSISTANT_FEEDBACK_DELAY", "0.05"))
 
@@ -72,7 +77,7 @@ class JudgeResult(BaseModel):
 
 SYSTEM_PROMPT = """You are “LLM Reviewer.” Return ONE valid JSON object only.\n\nJudge CORRECTNESS of an email agent’s final reply and its tool usage.\n\nAxes (0–5 each):\n• Content Alignment — Does the drafted reply resolve the sender’s request with correct commitments, deadlines, tone, and follow-through?\n• Tool Usage — Were the right tools used with correct arguments, in a valid order?\n\nPolicies:\n\n- Scheduling request → check_calendar_tool → schedule_meeting_tool → send_email_tool → Done. Confirm meeting duration matches the ask (allow ±10 minutes for “about” phrasing).\n- 90-minute planning (availability-only) → check_calendar_tool → send_email_tool → Done (NO scheduling). Ensure reply offers availability covering the requested window.\n- Conference invitations that only require interest/questions (e.g., TechConf) → send_email_tool → Done. Do NOT expect calendar tools unless the sender explicitly asks to schedule.\n- send_email_tool must include email_id and email_address, then Done.\n- Never call Done before drafting the reply.\n- Spam requires explicit confirmation before mark_as_spam_tool.\n- Tool-name normalization: treat as equivalent\n    - send_email_tool == write_email\n    - check_calendar_tool == check_calendar_availability\n    - schedule_meeting_tool == schedule_meeting\n- Exceptions:\n    - No‑reply/system “do not reply”: may end without send_email_tool (Done allowed).\n    - Spam (after explicit HITL confirmation): may end via mark_as_spam_tool without Done and without drafting a reply.\n- Question is correct when information is missing or consent is ambiguous.\n- For schedule_meeting_tool: start_time/end_time must be ISO; organizer_email required; timezone present or defaulted; duration should respect the request.\n- Tool-name/arg normalization: send_email_tool == write_email. When the name is write_email (normalized), accept the fields “to”, “subject”, and “content” and do not require Gmail-only args. Require email_id and email_address only when the raw name is send_email_tool.\n- When evaluating send_email_tool/write_email content, ensure the reply acknowledges key user constraints (deadlines, commitments, next steps) reflected in the email context and any executed tools.\n\nFinding & scoring rules:\n- Always explain tool issues via missing_tools / incorrect_tool_uses instead of only lowering scores.\n- missing_tools must list every expected tool from Policies that never ran (use normalized names).\n- incorrect_tool_uses must contain {{"tool": name, "why": explanation}} for wrong args, wrong order, premature Done, duration mismatches, wrong recipients, or other policy violations.\n- - If either list is non-empty, tool_usage must be ≤2 (use 1 for severely broken flows). Scores 3–5 are only allowed when both lists are empty.\n- Reduce content_alignment when the reply text fails to acknowledge commitments/tools outcomes the user needs.\n\nRubric:\n• Content Alignment: 5 exact/complete/tone-appropriate; 3 minor gaps; 1 misses/incorrect.\n• Tool Usage: 5 correct tools/args/order (+ terminal Done when applicable); 3 minor issues; 1 wrong/missing tools or invalid sequence.\n\nExamples:\nPass — all tools correct:\n{{"overall_correctness": 0.92, "verdict": "pass", "content_alignment": 5, "tool_usage": 5, "missing_tools": [], "incorrect_tool_uses": [], "evidence": ["Schedule shows 60 min meeting", "Reply confirms time and attendees"], "notes": "Handled scheduling request end-to-end."}}\nFail — missing schedule_meeting_tool:\n{{"overall_correctness": 0.40, "verdict": "fail", "content_alignment": 2, "tool_usage": 2, "missing_tools": ["schedule_meeting_tool"], "incorrect_tool_uses": [], "evidence": ["Email asked to schedule 60 min", "Only check_calendar_tool was called"], "notes": "Agent never scheduled the requested meeting."}}\n\nEvaluation source of truth:\n\n- Prefer final-state fields if present: output.assistant_reply, output.tool_trace, output.email_markdown.\n- Otherwise, derive from output.messages (e.g., last assistant content; AI tool_calls).\n- Validate arguments using raw tool calls from output.messages (AI messages with tool_calls). Use output.tool_trace for sequence evidence only; it is lossy/normalized.\n- Do not penalize the literal tool name when an equivalent normalized name is used.\n- Treat each field as populated unless it literally reads "(no … provided)" or "(empty)". Truncated strings ending with an ellipsis (… ) still contain evidence—use them. NEVER claim "information insufficient" when substantive content is present.\n\nCompute:\noverall_correctness = 0.6*(content_alignment/5) + 0.4*(tool_usage/5)\nverdict = "pass" if overall_correctness ≥ 0.70 else "fail".\n\nSTRICT OUTPUT CONTRACT: return valid JSON with these exact keys (empty arrays allowed): overall_correctness, verdict, content_alignment, tool_usage, missing_tools, incorrect_tool_uses, evidence, notes. Use double quotes and no trailing commas.\n\nValidity rules: standard JSON only (no markdown or free-text outside the JSON). Provide 2–4 evidence strings (≤120 chars each). Notes must always contain a concise (≤300 chars) insight: for passes, highlight strengths; for fails, state the key fix. If information is insufficient, still return the full object with zeros and empty arrays and put the reason in notes."""
 
-HUMAN_PROMPT = """Evaluate this run per the rubric and return ONLY the JSON object.\n\n<email_markdown>\n{{email_markdown}}\n</email_markdown>\n\n<assistant_reply>\n{{assistant_reply}}\n</assistant_reply>\n\n<tool_trace>\n{{tool_trace}}\n</tool_trace>\n\n<tool_calls_summary>\n{{tool_calls_summary}}\n</tool_calls_summary>\n\n<tool_calls_json>\n{{tool_calls_json}}\n</tool_calls_json>\n\n<raw_output_optional>\n{{raw_output_optional}}\n</raw_output_optional>\n"""
+HUMAN_PROMPT = """Evaluate this run per the rubric and return ONLY the JSON object.\n\n<email_markdown>\n{email_markdown}\n</email_markdown>\n\n<assistant_reply>\n{assistant_reply}\n</assistant_reply>\n\n<tool_trace>\n{tool_trace}\n</tool_trace>\n\n<tool_calls_summary>\n{tool_calls_summary}\n</tool_calls_summary>\n\n<tool_calls_json>\n{tool_calls_json}\n</tool_calls_json>\n\n<raw_output_optional>\n{raw_output_optional}\n</raw_output_optional>\n"""
 
 
 def _default_model_name() -> str:
@@ -81,11 +86,10 @@ def _default_model_name() -> str:
 
 @lru_cache(maxsize=4)
 def _build_base_chain(model_name: str, temperature: float) -> Runnable:
-    llm = ChatGoogleGenerativeAI(
+    llm = get_llm(
         model=model_name,
         temperature=temperature,
         max_output_tokens=4096,
-        convert_system_message_to_human=False,
     )
     parser = JsonOutputParser(pydantic_object=JudgeResult)
     prompt = ChatPromptTemplate.from_messages(
@@ -241,7 +245,11 @@ def run_correctness_judge(
         else:
             raise TypeError(f"Unexpected judge payload type: {type(raw)}")
 
-        _record_feedback(result, parent_run_id=parent_run_id)
+        _record_feedback(
+            result,
+            parent_run_id=parent_run_id,
+            email_markdown=email_markdown,
+        )
         return result
     except Exception as exc:  # pragma: no cover - defensive logging
         raise JudgeUnavailableError(f"Judge invocation failed: {exc}") from exc
@@ -354,7 +362,7 @@ def _build_tool_call_context(messages: Iterable[object]) -> Tuple[str, str]:
                 call = {"name": str(call), "args": str(call)}
             name = str(call.get("name", ""))
             args = call.get("args", {})
-            args_text = _compact_json(args)
+            args_text = _compact_json(args, limit=600)
             call_id = str(call.get("id") or call.get("tool_call_id") or "")
             result_text = tool_results.get(call_id, "")
             entry: Dict[str, Any] = {"step": index, "name": name, "args": args_text}
@@ -436,7 +444,12 @@ def _normalise_result_dict(data: dict) -> dict:
     return result
 
 
-def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -> None:
+def _record_feedback(
+    result: JudgeResult,
+    *,
+    parent_run_id: Optional[str] = None,
+    email_markdown: Optional[str] = None,
+) -> None:
     """Attach judge feedback to the current LangSmith run if possible."""
 
     try:
@@ -470,6 +483,38 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                 current_id = str(parent_id)
             return chain
 
+        target_markdown = truncate_markdown(email_markdown) if email_markdown else None
+        target_fingerprint = email_fingerprint(email_markdown)
+
+        def _matches_markdown(run: Run) -> bool:
+            candidate_fp = None
+            if target_fingerprint:
+                candidate_fp = (
+                    getattr(run, "metadata", None) or {}
+                ).get("email_fingerprint")
+                if not candidate_fp:
+                    candidate_fp = (
+                        getattr(run, "extra", None) or {}
+                    ).get("email_fingerprint")
+                if candidate_fp and candidate_fp == target_fingerprint:
+                    return True
+
+            if not target_markdown:
+                return False
+            metadata = getattr(run, "metadata", None) or {}
+            candidate_md = metadata.get("email_markdown")
+            if not candidate_md:
+                extra = getattr(run, "extra", None) or {}
+                candidate_md = extra.get("email_markdown")
+            if not candidate_md:
+                return False
+            candidate_md_str = str(candidate_md)
+            return (
+                candidate_md_str == target_markdown
+                or target_markdown in candidate_md_str
+                or candidate_md_str in target_markdown
+            )
+
         def _resolve_agent_run(start_id: str, depth: int = 0) -> str:
             if depth > 3:
                 return start_id
@@ -481,7 +526,13 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
             name = str(getattr(current, "name", "") or "")
             normalised = name.lower()
             if normalised.startswith("agent:") or normalised.startswith("email_assistant"):
+                if _matches_markdown(current):
+                    return start_id
                 return start_id
+
+            reference_example_id = getattr(current, "reference_example_id", None)
+            trace_id = getattr(current, "trace_id", None)
+            start_time = getattr(current, "start_time", None)
 
             try:
                 children = list(
@@ -490,13 +541,37 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
             except Exception:
                 children = []
 
-            for child in children:
+            def _sorted_children(runs: List[Run]) -> List[Run]:
+                # Prioritise the most recent children so feedback targets the
+                # run that just completed rather than earlier siblings rolled
+                # up under the same parent (e.g., parametrised pytest case).
+                def _start_time(run: Run) -> float:
+                    ts = getattr(run, "start_time", None)
+                    if ts is None:
+                        return float("-inf")
+                    try:
+                        return ts.timestamp()
+                    except Exception:
+                        return float("-inf")
+
+                return sorted(runs, key=_start_time, reverse=True)
+
+            pending_agent_id: Optional[str] = None
+            for child in _sorted_children(children):
                 child_name = str(getattr(child, "name", "") or "")
                 child_norm = child_name.lower()
                 if child_norm.startswith("agent:") or child_norm.startswith("email_assistant"):
-                    return str(child.id)
+                    if not _matches_markdown(child):
+                        try:
+                            child = client.read_run(str(child.id))
+                        except Exception:
+                            pass
+                    if _matches_markdown(child):
+                        return str(child.id)
+                    if pending_agent_id is None:
+                        pending_agent_id = str(child.id)
 
-            for child in children:
+            for child in _sorted_children(children):
                 resolved = _resolve_agent_run(str(child.id), depth + 1)
                 if resolved != str(child.id):
                     return resolved
@@ -504,6 +579,8 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
             session_id = getattr(current, "session_id", None)
             if session_id:
                 try:
+                    best_match: Optional[Run] = None
+                    best_delta: float = float("inf")
                     for candidate_run in iter_experiment_runs(
                         client=client,
                         project_id=session_id,
@@ -514,9 +591,47 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                         if candidate_name.startswith("agent:") or candidate_name.startswith(
                             "email_assistant"
                         ):
-                            return str(candidate_run.id)
+                            if not _matches_markdown(candidate_run):
+                                try:
+                                    candidate_run = client.read_run(candidate_run.id)
+                                except Exception:
+                                    pass
+                            if _matches_markdown(candidate_run):
+                                return str(candidate_run.id)
+                            candidate_ref = getattr(candidate_run, "reference_example_id", None)
+                            if reference_example_id and candidate_ref == reference_example_id:
+                                return str(candidate_run.id)
+                            candidate_trace = getattr(candidate_run, "trace_id", None)
+                            if trace_id and candidate_trace == trace_id:
+                                return str(candidate_run.id)
+                            candidate_start = getattr(candidate_run, "start_time", None)
+                            if start_time and candidate_start:
+                                try:
+                                    delta = abs((candidate_start - start_time).total_seconds())
+                                except Exception:
+                                    delta = float("inf")
+                                else:
+                                    # Prefer runs that started at or after the
+                                    # current run; older runs are likely
+                                    # unrelated siblings.
+                                    if (
+                                        candidate_start >= start_time
+                                        and delta < best_delta
+                                        and delta <= 180
+                                    ):
+                                        best_delta = delta
+                                        best_match = candidate_run
+                    if best_match is not None:
+                        return str(best_match.id)
                 except Exception:
                     pass
+
+            if (
+                pending_agent_id is not None
+                and not target_fingerprint
+                and not target_markdown
+            ):
+                return pending_agent_id
 
             return start_id
 
@@ -553,11 +668,8 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
 
             if result.incorrect_tool_uses:
                 for issue in result.incorrect_tool_uses:
-                    _safe_feedback(
-                        key="tool",
-                        value=issue.tool or "(unknown)",
-                        comment=issue.why or "Incorrect tool usage detected",
-                    )
+                    # Emit the explanation first so the follow-up tool label
+                    # appears above it in the LangSmith UI (newest-first).
                     _safe_feedback(
                         key="why",
                         value=issue.why or "See comment",
@@ -566,6 +678,11 @@ def _record_feedback(result: JudgeResult, parent_run_id: Optional[str] = None) -
                             if issue.tool
                             else "Incorrect tool usage details"
                         ),
+                    )
+                    _safe_feedback(
+                        key="tool",
+                        value=issue.tool or "(unknown)",
+                        comment=issue.why or "Incorrect tool usage detected",
                     )
 
             # Metrics next.

@@ -1,7 +1,8 @@
-from typing import Literal
+from datetime import datetime
 import os
+from typing import Literal
 
-from email_assistant.configuration import get_llm
+from email_assistant.configuration import get_llm, format_model_identifier
 from email_assistant.tracing import (
     AGENT_PROJECT,
     init_project,
@@ -13,13 +14,25 @@ from email_assistant.tracing import (
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import AGENT_TOOLS_PROMPT
-from email_assistant.prompts import triage_system_prompt, triage_user_prompt, agent_system_prompt, default_background, default_triage_instructions, default_response_preferences, default_cal_preferences
-from email_assistant.schemas import State, RouterSchema, StateInput
+from email_assistant.prompts import (
+    triage_system_prompt,
+    triage_user_prompt,
+    agent_system_prompt,
+    default_background,
+    default_triage_instructions,
+    default_response_preferences,
+    default_cal_preferences,
+)
+from email_assistant.schemas import State, RouterSchema, StateInput, AssistantContext
+from email_assistant.runtime import extract_runtime_metadata
+from email_assistant.checkpointing import get_sqlite_checkpointer
 from email_assistant.utils import parse_email, format_email_markdown
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
 from langgraph.types import Command
+from langchain_core.tools import ToolException
 from dotenv import load_dotenv, find_dotenv
 load_dotenv(find_dotenv(), override=True)
 init_project(AGENT_PROJECT)
@@ -44,16 +57,22 @@ DEFAULT_MODEL = (
 )
 ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
-print(f"[email_assistant] Models -> router={ROUTER_MODEL_NAME}, tools={TOOL_MODEL_NAME}")
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+    print(
+        "[email_assistant] Models -> "
+        f"router={router_identifier}, tools={tool_identifier}"
+    )
 
 # Initialize the LLM for use with router / structured output
 llm = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME)
-print(f"[email_assistant] Router model: {ROUTER_MODEL_NAME} -> {type(llm).__name__}")
+print(f"[email_assistant] Router model: {router_identifier} -> {type(llm).__name__}")
 llm_router = llm.with_structured_output(RouterSchema)
 
 # Initialize the LLM, enforcing tool use (of any available tools) for agent
 llm = get_llm(temperature=0.0, model=TOOL_MODEL_NAME)
-print(f"[email_assistant] Tool model: {TOOL_MODEL_NAME} -> {type(llm).__name__}")
+print(f"[email_assistant] Tool model: {tool_identifier} -> {type(llm).__name__}")
 llm_with_tools = llm.bind_tools(tools, tool_choice="any")
 
 # Nodes
@@ -73,7 +92,7 @@ def _fallback_tool_plan(email_input: dict):
             "attendees": [author, to],
             "subject": subject,
             "duration_minutes": 45,
-            "preferred_day": __import__('datetime').datetime.now().isoformat(),
+            "preferred_day": datetime.now().isoformat(),
             "start_time": 1400,
         })
         add("write_email", {
@@ -88,7 +107,7 @@ def _fallback_tool_plan(email_input: dict):
             "attendees": [author, to],
             "subject": subject,
             "duration_minutes": 60,
-            "preferred_day": __import__('datetime').datetime.now().isoformat(),
+            "preferred_day": datetime.now().isoformat(),
             "start_time": 1100,
         })
         add("write_email", {
@@ -245,9 +264,24 @@ def tool_node_task(state: State):
     result = []
     for tool_call in state["messages"][-1].tool_calls:
         tool = tools_by_name[tool_call["name"]]
-        observation = tool.invoke(tool_call["args"])
-        log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
-        result.append({"role": "tool", "content" : observation, "tool_call_id": tool_call["id"]})
+        metadata_update = None
+        try:
+            observation = tool.invoke(tool_call["args"])
+        except ToolException as exc:
+            observation = f"ToolException: {exc}"
+            metadata_update = {"error": True, "exception": "ToolException"}
+        except Exception as exc:  # noqa: BLE001 - surface tool errors downstream
+            observation = f"Error: {exc}"
+            metadata_update = {"error": True, "exception": exc.__class__.__name__}
+        log_tool_child_run(
+            name=tool_call["name"],
+            args=tool_call["args"],
+            result=observation,
+            metadata_update=metadata_update,
+        )
+        result.append(
+            {"role": "tool", "content": observation, "tool_call_id": tool_call["id"]}
+        )
     return {"messages": result}
 
 
@@ -308,7 +342,10 @@ agent_builder.add_edge("environment", "llm_call")
 agent = agent_builder.compile()
 
 @task
-def triage_router_task(state: State) -> Command[Literal["response_agent", "__end__"]]:
+def triage_router_task(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -316,6 +353,8 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
     - Company-wide announcements
     - Messages meant for other teams
     """
+    _timezone, _eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
+
     email_input = state["email_input"]
     author, to, subject, email_thread = parse_email(email_input)
     system_prompt = triage_system_prompt.format(
@@ -329,7 +368,12 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
-    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
+    prime_parent_run(
+        email_input=email_input,
+        email_markdown=email_markdown,
+        metadata_update=metadata,
+        thread_id=thread_id,
+    )
 
     # Run the router LLM with structured output (fallback to heuristic on failure)
     classification: str | None = None
@@ -376,7 +420,13 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
         goto = END
     elif classification == "notify":
         # If real life, this would do something else
@@ -387,27 +437,54 @@ def triage_router_task(state: State) -> Command[Literal["response_agent", "__end
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
         goto = END
     else:
-        raise ValueError(f"Invalid classification: {classification}")
+        if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+            print("⚠️ Invalid triage classification; defaulting to RESPOND.")
+        goto = "response_agent"
+        update = {
+            "classification_decision": "respond",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Respond to the email: {email_markdown}",
+                }
+            ],
+        }
     return Command(goto=goto, update=update)
 
 
-def triage_router(state: State) -> Command[Literal["response_agent", "__end__"]]:
+def triage_router(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously wait for the triage router task to finish."""
 
-    return triage_router_task(state).result()
+    return triage_router_task(state, runtime=runtime).result()
 
 # Build workflow
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
     .add_node("response_agent", agent)
     .add_edge(START, "triage_router")
+    .add_edge("triage_router", "response_agent")
 )
 
-email_assistant = overall_workflow.compile().with_config(durability="sync")
+_DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
+
+email_assistant = (
+    overall_workflow
+    .compile(checkpointer=_DEFAULT_CHECKPOINTER)
+    .with_config(durability="sync")
+)
 
 def get_agent_executor():
     """Return the compiled email assistant executor.

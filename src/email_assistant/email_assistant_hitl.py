@@ -1,22 +1,25 @@
-from typing import Literal
 import os
+from typing import Literal
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
 from langgraph.prebuilt.interrupt import (
     ActionRequest,
     HumanInterrupt,
     HumanInterruptConfig,
 )
 from langgraph.types import interrupt, Command
+from langchain_core.tools import ToolException
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.default.prompt_templates import HITL_TOOLS_PROMPT
 from email_assistant.prompts import triage_system_prompt, triage_user_prompt, agent_system_prompt_hitl, default_background, default_triage_instructions, default_response_preferences, default_cal_preferences
-from email_assistant.configuration import get_llm
-from email_assistant.schemas import State, RouterSchema, StateInput
+from email_assistant.configuration import get_llm, format_model_identifier
+from email_assistant.schemas import State, RouterSchema, StateInput, AssistantContext
+from email_assistant.runtime import extract_runtime_metadata
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
-from email_assistant.checkpointing import new_memory_checkpointer
+from email_assistant.checkpointing import get_sqlite_checkpointer
 from email_assistant.tracing import (
     AGENT_PROJECT,
     init_project,
@@ -34,6 +37,28 @@ init_project(AGENT_PROJECT)
 tools = get_tools(["write_email", "schedule_meeting", "check_calendar_availability", "Question", "Done"])
 tools_by_name = get_tools_by_name(tools)
 
+
+def _invoke_tool_with_logging(tool_name: str, args: dict) -> str:
+    """Invoke a tool, log the outcome, and surface readable error descriptions."""
+
+    tool = tools_by_name[tool_name]
+    metadata_update = None
+    try:
+        observation = tool.invoke(args)
+    except ToolException as exc:
+        observation = f"ToolException: {exc}"
+        metadata_update = {"error": True, "exception": "ToolException"}
+    except Exception as exc:  # noqa: BLE001 - ensure tool errors propagate as observations
+        observation = f"Error: {exc}"
+        metadata_update = {"error": True, "exception": exc.__class__.__name__}
+    log_tool_child_run(
+        name=tool_name,
+        args=args,
+        result=observation,
+        metadata_update=metadata_update,
+    )
+    return observation
+
 # Role-specific model selection (override via env)
 DEFAULT_MODEL = (
     os.getenv("EMAIL_ASSISTANT_MODEL")
@@ -43,6 +68,14 @@ DEFAULT_MODEL = (
 ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
 
+router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
+tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
+if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+    print(
+        "[email_assistant_hitl] Models -> "
+        f"router={router_identifier}, tools={tool_identifier}"
+    )
+
 # Initialize the LLM for use with router / structured output
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
 
@@ -51,7 +84,10 @@ llm_with_tools = get_llm(temperature=0.0, model=TOOL_MODEL_NAME).bind_tools(tool
 
 # Nodes 
 @task
-def triage_router_task(state: State) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router_task(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Analyze email content to decide if we should respond, notify, or ignore.
 
     The triage step prevents the assistant from wasting time on:
@@ -59,6 +95,8 @@ def triage_router_task(state: State) -> Command[Literal["triage_interrupt_handle
     - Company-wide announcements
     - Messages meant for other teams
     """
+
+    _timezone, _eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
 
     # Parse the email input
     email_input = state["email_input"]
@@ -69,7 +107,12 @@ def triage_router_task(state: State) -> Command[Literal["triage_interrupt_handle
 
     # Create email markdown for Agent Inbox in case of notification  
     email_markdown = format_email_markdown(subject, author, to, email_thread)
-    prime_parent_run(email_input=email_input, email_markdown=email_markdown)
+    prime_parent_run(
+        email_input=email_input,
+        email_markdown=email_markdown,
+        metadata_update=metadata,
+        thread_id=thread_id,
+    )
 
     # Format system prompt with background and triage instructions
     system_prompt = triage_system_prompt.format(
@@ -112,7 +155,13 @@ def triage_router_task(state: State) -> Command[Literal["triage_interrupt_handle
         summary_state = dict(state)
         summary_state["classification_decision"] = classification
         output_text = format_final_output(summary_state)
-        prime_parent_run(email_input=email_input, email_markdown=email_markdown, outputs=output_text)
+        prime_parent_run(
+            email_input=email_input,
+            email_markdown=email_markdown,
+            outputs=output_text,
+            metadata_update=metadata,
+            thread_id=thread_id,
+        )
 
     elif classification == "notify":
         print("🔔 Classification: NOTIFY - This email contains important information") 
@@ -125,17 +174,34 @@ def triage_router_task(state: State) -> Command[Literal["triage_interrupt_handle
         }
 
     else:
-        raise ValueError(f"Invalid classification: {classification}")
+        if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+            print("⚠️ Invalid triage classification; defaulting to RESPOND.")
+        goto = "response_agent"
+        update = {
+            "classification_decision": "respond",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Respond to the email: {email_markdown}",
+                }
+            ],
+        }
     return Command(goto=goto, update=update)
 
 
-def triage_router(state: State) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
+def triage_router(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state).result()
+    return triage_router_task(state, runtime=runtime).result()
 
 @task
-def triage_interrupt_handler_task(state: State) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler_task(
+    state: State,
+    _runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     
     # Parse the email input
@@ -194,10 +260,13 @@ def triage_interrupt_handler_task(state: State) -> Command[Literal["response_age
     return Command(goto=goto, update=update)
 
 
-def triage_interrupt_handler(state: State) -> Command[Literal["response_agent", "__end__"]]:
+def triage_interrupt_handler(
+    state: State,
+    runtime: Runtime[AssistantContext],
+) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state).result()
+    return triage_interrupt_handler_task(state, runtime).result()
 
 @task
 def llm_call_task(state: State):
@@ -251,9 +320,9 @@ def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__
         if tool_call["name"] not in hitl_tools:
 
             # Execute search_memory and other tools without interruption
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
+            observation = _invoke_tool_with_logging(
+                tool_call["name"], tool_call["args"]
+            )
             result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
             continue
             
@@ -308,16 +377,15 @@ def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__
         if response["type"] == "accept":
 
             # Execute the tool with original args
-            tool = tools_by_name[tool_call["name"]]
-            observation = tool.invoke(tool_call["args"])
-            log_tool_child_run(name=tool_call["name"], args=tool_call["args"], result=observation)
-            result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+            observation = _invoke_tool_with_logging(
+                tool_call["name"], tool_call["args"]
+            )
+            result.append(
+                {"role": "tool", "content": observation, "tool_call_id": tool_call["id"]}
+            )
                         
         elif response["type"] == "edit":
 
-            # Tool selection 
-            tool = tools_by_name[tool_call["name"]]
-            
             # Get edited args from Agent Inbox
             edited_args = response["args"]["args"]
 
@@ -339,22 +407,24 @@ def interrupt_handler_task(state: State) -> Command[Literal["llm_call", "__end__
             if tool_call["name"] == "write_email":
 
                 # Execute the tool with edited args
-                observation = tool.invoke(edited_args)
+                observation = _invoke_tool_with_logging(
+                    tool_call["name"], edited_args
+                )
 
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
 
             # Update the schedule_meeting tool call with the edited content from Agent Inbox
             elif tool_call["name"] == "schedule_meeting":
 
 
                 # Execute the tool with edited args
-                observation = tool.invoke(edited_args)
+                observation = _invoke_tool_with_logging(
+                    tool_call["name"], edited_args
+                )
 
                 # Add only the tool response message
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
-                log_tool_child_run(name=tool_call["name"], args=edited_args, result=observation)
             
             # Catch all other tool calls
             else:
@@ -461,15 +531,17 @@ response_agent = agent_builder.compile()
 
 # Build overall workflow
 overall_workflow = (
-    StateGraph(State, input_schema=StateInput)
+    StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
-    
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("triage_interrupt_handler", "response_agent")
 )
 
-_DEFAULT_CHECKPOINTER = new_memory_checkpointer()
+_DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
 email_assistant = (
     overall_workflow
     .compile(checkpointer=_DEFAULT_CHECKPOINTER)

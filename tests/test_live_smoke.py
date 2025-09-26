@@ -92,8 +92,15 @@ def test_live_smoke_cases(agent_module_name, gmail_service):
         payload = {"email_input": email_input}
         summary = summarize_email_for_grid(email_input)
 
-        def _invoke_agent():
-            return email_assistant.invoke(payload, config=thread_config)
+        def _invoke_agent(
+            email_assistant=email_assistant,
+            payload=payload,
+            thread_config=thread_config,
+        ):
+            return email_assistant.invoke(
+                payload,
+                config=thread_config,
+            )
 
         invoke_with_root_run(
             _invoke_agent,

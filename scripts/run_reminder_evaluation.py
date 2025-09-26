@@ -58,7 +58,11 @@ def main(mock_schedule, mock_check, mock_send):
     # Compile workflow with in-memory store + checkpointer so nodes receive a store
     checkpointer = MemorySaver()
     langgraph_store = InMemoryStore()
-    agent = overall_workflow.compile(checkpointer=checkpointer, store=langgraph_store)
+    agent = (
+        overall_workflow
+        .compile(checkpointer=checkpointer, store=langgraph_store)
+        .with_config(durability="sync")
+    )
 
     test_cases = [
         {
@@ -86,13 +90,31 @@ def main(mock_schedule, mock_check, mock_send):
                 email_data = json.load(f)
             
             email_data = _normalize_email_input(email_data)
-            config = {"configurable": {"thread_id": str(uuid.uuid4())}}
+            thread_id = f"reminder-{uuid.uuid4()}"
+            config = {
+                "run_id": str(uuid.uuid4()),
+                "configurable": {
+                    "thread_id": thread_id,
+                    "thread_metadata": {"thread_id": thread_id},
+                    "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
+                    "eval_mode": os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes"),
+                },
+                "recursion_limit": 100,
+            }
             # Run the agent
             payload = {"email_input": email_data}
             summary = summarize_email_for_grid(email_data)
 
-            def _invoke_agent():
-                return agent.invoke(payload, config)
+            def _invoke_agent(
+                agent=agent,
+                payload=payload,
+                config=config,
+            ):
+                return agent.invoke(
+                    payload,
+                    config,
+                    durability="sync",
+                )
 
             final_state = invoke_with_root_run(
                 _invoke_agent,

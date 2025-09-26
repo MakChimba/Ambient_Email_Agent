@@ -16,9 +16,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import importlib
-from typing import Any, Dict, List, Tuple
+import sys
+from typing import Any, Dict, List
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -29,6 +31,9 @@ from email_assistant.tracing import (
     invoke_with_root_run,
     summarize_email_for_grid,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _load_dataset(agent_module: str):
@@ -50,10 +55,24 @@ def _compile_agent(agent_module: str):
     checkpointer = MemorySaver()
     store = InMemoryStore()
     try:
-        graph = module.overall_workflow.compile(checkpointer=checkpointer, store=store)
-    except Exception:
+        graph = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer, store=store)
+            .with_config(durability="sync")
+        )
+    except (TypeError, AttributeError, NotImplementedError) as exc:
+        logger.warning(
+            "Falling back to compile without store for %s (%s: %s)",
+            agent_module,
+            exc.__class__.__name__,
+            exc,
+        )
         # Fallback for agents that don't take store
-        graph = module.overall_workflow.compile(checkpointer=checkpointer)
+        graph = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer)
+            .with_config(durability="sync")
+        )
         store = None
     return graph, store
 
@@ -74,6 +93,11 @@ def main():
     ap.add_argument("--max", type=int, default=5, help="Max examples to run")
     ap.add_argument("--respond-only", action="store_true", help="Only run examples with triage=='respond'")
     ap.add_argument("--auto-accept", action="store_true", help="Auto-accept HITL prompts")
+    ap.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream agent progress (prints updates/messages as they arrive)",
+    )
     args = ap.parse_args()
 
     init_project(AGENT_PROJECT)
@@ -93,24 +117,69 @@ def main():
     email_inputs, email_names, triage_list = _load_dataset(args.agent_module)
     agent, store = _compile_agent(args.agent_module)
 
-    # Thread config
+    # Thread config with runtime context metadata
     import uuid
-    thread_config = {"configurable": {"thread_id": uuid.uuid4()}}
 
     count = 0
-    for i, (inp, name, triage) in enumerate(zip(email_inputs, email_names, triage_list)):
+    if sys.version_info >= (3, 10):
+        example_iter = zip(email_inputs, email_names, triage_list, strict=True)
+    else:
+        example_iter = zip(email_inputs, email_names, triage_list)
+
+    for i, (inp, name, triage) in enumerate(example_iter):
         if args.respond_only and str(triage).lower() != "respond":
             continue
+        thread_id = f"script-{uuid.uuid4()}"
+        thread_config = {
+            "run_id": str(uuid.uuid4()),
+            "configurable": {
+                "thread_id": thread_id,
+                "thread_metadata": {"thread_id": thread_id},
+                "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
+                "eval_mode": os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes"),
+            },
+            "recursion_limit": 100,
+        }
         print(f"\n=== [{i}] {name} | triage={triage} ===")
         payload = {"email_input": inp}
         summary = summarize_email_for_grid(inp)
 
-        def _invoke_agent():
-            return agent.invoke(payload, config=thread_config)
+        def _invoke_agent(
+            payload=payload,
+            thread_config=thread_config,
+            agent=agent,
+        ):
+            return agent.invoke(
+                payload,
+                config=thread_config,
+            )
 
+        def _stream_agent(
+            payload=payload,
+            thread_config=thread_config,
+            agent=agent,
+        ):
+            print("Streaming agent output (updates/messages)...")
+            for mode, chunk in agent.stream(
+                payload,
+                config=thread_config,
+                stream_mode=["updates", "messages", "custom"],
+            ):
+                if mode == "custom":
+                    print(f"[custom] {chunk}")
+                    continue
+                preview = str(chunk)
+                if len(preview) > 240:
+                    preview = preview[:240] + "..."
+                print(f"[{mode}] {preview}")
+            # Return final state so invoke_with_root_run captures something meaningful
+            return agent.get_state(thread_config)
+
+        final_state = None
         try:
-            result = invoke_with_root_run(
-                _invoke_agent,
+            runner = _stream_agent if args.stream else _invoke_agent
+            final_state = invoke_with_root_run(
+                runner,
                 root_name=f"agent:{args.agent_module}",
                 input_summary=summary,
             )
@@ -119,8 +188,29 @@ def main():
             continue
 
         # Fetch final state messages
-        state = agent.get_state(thread_config)
-        values: Dict[str, Any] = state.values if hasattr(state, "values") else state
+        values: Dict[str, Any]
+        if final_state is not None and not isinstance(final_state, dict) and hasattr(final_state, "values"):
+            state_obj = final_state
+        else:
+            try:
+                state_obj = agent.get_state(thread_config)
+            except (AttributeError, KeyError, RuntimeError) as exc:
+                logger.warning("Failed to fetch agent state (%s: %s)", exc.__class__.__name__, exc)
+                state_obj = None
+
+        if state_obj is not None:
+            if hasattr(state_obj, "values") and not isinstance(state_obj, dict):
+                values = state_obj.values
+            elif isinstance(state_obj, dict):
+                values = state_obj
+            else:
+                values = {}
+        else:
+            values = {}
+
+        if final_state is not None and isinstance(final_state, dict):
+            # Prefer explicit result dict from invoke() when available
+            values = final_state
         messages = values.get("messages", [])
         tools = _extract_tool_calls(messages)
         print(f"Tool calls: {tools}")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import logging
 import os
 import re
@@ -99,8 +100,22 @@ def _project_with_date(base: str) -> str:
     return f"{base}-{today}"
 
 
-AGENT_PROJECT = _project_with_date("email-assistant:agent")
-JUDGE_PROJECT = _project_with_date("email-assistant:judge")
+def _agent_project_name() -> str:
+    override = os.getenv("EMAIL_ASSISTANT_TRACE_PROJECT")
+    if override:
+        return _project_with_date(override)
+    return _project_with_date("email-assistant:agent")
+
+
+def _judge_project_name() -> str:
+    override = os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT")
+    if override:
+        return _project_with_date(override)
+    return _project_with_date("email-assistant:judge")
+
+
+AGENT_PROJECT = _agent_project_name()
+JUDGE_PROJECT = _judge_project_name()
 
 _HIDDEN_FLAGS = (
     "LANGSMITH_HIDE_INPUTS",
@@ -743,13 +758,20 @@ def prime_parent_run(
     metadata_payload = dict(base_metadata)
     if metadata_update:
         metadata_payload.update(metadata_update)
+
+    fingerprint = email_fingerprint(email_markdown)
+
     if email_markdown is not None:
         metadata_payload.setdefault("email_markdown", truncate_markdown(email_markdown))
+    if fingerprint:
+        metadata_payload.setdefault("email_fingerprint", fingerprint)
 
     metadata_payload.setdefault("example_raw", email_input)
 
     extra_payload = dict(extra_update or {})
     extra_payload.setdefault("raw_input", email_input)
+    if fingerprint and "email_fingerprint" not in extra_payload:
+        extra_payload["email_fingerprint"] = fingerprint
 
     summary = summarize_email_for_grid(email_input)
 
@@ -1097,3 +1119,11 @@ __all__ = [
     "trace_stage",
     "TraceRunHandle",
 ]
+def email_fingerprint(email_markdown: str | None) -> str | None:
+    """Return a stable fingerprint for the provided email markdown."""
+
+    if not email_markdown:
+        return None
+    normalised = " ".join(str(email_markdown).split()).lower()
+    digest = hashlib.sha256(normalised.encode("utf-8")).hexdigest()
+    return digest[:24]

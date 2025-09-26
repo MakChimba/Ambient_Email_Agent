@@ -26,6 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
+DEFAULT_TEST_TIMEZONE = os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne")
+
 
 _GMAIL_TOOL_NAME_MAP = {
     "write_email": "send_email_tool",
@@ -113,16 +115,31 @@ def compile_agent(agent_module_name: str) -> Tuple[Any, Dict[str, Any], Optional
     checkpointer = MemorySaver()
     store: Optional[InMemoryStore] = InMemoryStore()
     run_id = str(uuid.uuid4())
+    thread_id = f"thread-{uuid.uuid4()}"
+    configurable_context: Dict[str, Any] = {
+        "thread_id": thread_id,
+        "thread_metadata": {"thread_id": thread_id},
+        "timezone": DEFAULT_TEST_TIMEZONE,
+        "eval_mode": is_eval_mode(),
+    }
     thread_config = {
         "run_id": run_id,
-        "configurable": {"thread_id": uuid.uuid4()},
+        "configurable": configurable_context,
         "recursion_limit": 100,
     }
 
     if agent_module_name in {"email_assistant_hitl_memory", "email_assistant_hitl_memory_gmail"}:
-        email_assistant = module.overall_workflow.compile(checkpointer=checkpointer, store=store)
+        email_assistant = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer, store=store)
+            .with_config(durability="sync")
+        )
     else:
-        email_assistant = module.overall_workflow.compile(checkpointer=checkpointer)
+        email_assistant = (
+            module.overall_workflow
+            .compile(checkpointer=checkpointer)
+            .with_config(durability="sync")
+        )
         store = None
 
     return email_assistant, thread_config, store, module
