@@ -16,9 +16,11 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import importlib
-from typing import Any, Dict, List, Tuple
+import sys
+from typing import Any, Dict, List
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
@@ -29,6 +31,9 @@ from email_assistant.tracing import (
     invoke_with_root_run,
     summarize_email_for_grid,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _load_dataset(agent_module: str):
@@ -55,7 +60,13 @@ def _compile_agent(agent_module: str):
             .compile(checkpointer=checkpointer, store=store)
             .with_config(durability="sync")
         )
-    except Exception:
+    except (TypeError, AttributeError, NotImplementedError) as exc:
+        logger.warning(
+            "Falling back to compile without store for %s (%s: %s)",
+            agent_module,
+            exc.__class__.__name__,
+            exc,
+        )
         # Fallback for agents that don't take store
         graph = (
             module.overall_workflow
@@ -110,9 +121,12 @@ def main():
     import uuid
 
     count = 0
-    for i, (inp, name, triage) in enumerate(
-        zip(email_inputs, email_names, triage_list, strict=True)
-    ):
+    if sys.version_info >= (3, 10):
+        example_iter = zip(email_inputs, email_names, triage_list, strict=True)
+    else:
+        example_iter = zip(email_inputs, email_names, triage_list)
+
+    for i, (inp, name, triage) in enumerate(example_iter):
         if args.respond_only and str(triage).lower() != "respond":
             continue
         thread_id = f"script-{uuid.uuid4()}"
@@ -130,13 +144,21 @@ def main():
         payload = {"email_input": inp}
         summary = summarize_email_for_grid(inp)
 
-        def _invoke_agent():
+        def _invoke_agent(
+            payload=payload,
+            thread_config=thread_config,
+            agent=agent,
+        ):
             return agent.invoke(
                 payload,
                 config=thread_config,
             )
 
-        def _stream_agent():
+        def _stream_agent(
+            payload=payload,
+            thread_config=thread_config,
+            agent=agent,
+        ):
             print("Streaming agent output (updates/messages)...")
             for mode, chunk in agent.stream(
                 payload,
@@ -153,9 +175,10 @@ def main():
             # Return final state so invoke_with_root_run captures something meaningful
             return agent.get_state(thread_config)
 
+        final_state = None
         try:
             runner = _stream_agent if args.stream else _invoke_agent
-            invoke_with_root_run(
+            final_state = invoke_with_root_run(
                 runner,
                 root_name=f"agent:{args.agent_module}",
                 input_summary=summary,
@@ -165,8 +188,29 @@ def main():
             continue
 
         # Fetch final state messages
-        state = agent.get_state(thread_config)
-        values: Dict[str, Any] = state.values if hasattr(state, "values") else state
+        values: Dict[str, Any]
+        if final_state is not None and not isinstance(final_state, dict) and hasattr(final_state, "values"):
+            state_obj = final_state
+        else:
+            try:
+                state_obj = agent.get_state(thread_config)
+            except Exception as exc:
+                logger.warning("Failed to fetch agent state (%s: %s)", exc.__class__.__name__, exc)
+                state_obj = None
+
+        if state_obj is not None:
+            if hasattr(state_obj, "values") and not isinstance(state_obj, dict):
+                values = state_obj.values
+            elif isinstance(state_obj, dict):
+                values = state_obj
+            else:
+                values = {}
+        else:
+            values = {}
+
+        if final_state is not None and isinstance(final_state, dict):
+            # Prefer explicit result dict from invoke() when available
+            values = final_state
         messages = values.get("messages", [])
         tools = _extract_tool_calls(messages)
         print(f"Tool calls: {tools}")
