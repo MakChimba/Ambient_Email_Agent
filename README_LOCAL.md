@@ -4,12 +4,22 @@ This document contains recipes and notes for running the Email Assistant compone
 
 ## Dependency Pins
 
-- Core libraries are currently pinned to `langchain==0.3.27`, `langsmith[pytest]==0.4.30`, and `langgraph==0.6.7` (Phase 1 of the library upgrade ticket).
+- Core libraries are currently pinned to `langchain==1.0.0a9`, `langsmith[pytest]==0.4.30`, and `langgraph==1.0.0a3` (see `pyproject.toml`).
 - After adjusting pins, run `uv lock` so the resolver captures the new versions and transitive updates (for example, `yarl` and `vcrpy` now appear through the LangSmith pytest extras).
 - Live-mode pytest (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) may surface LangSmith queue telemetry without Gmail credentials; these warnings are expected when Gmail APIs are not configured locally.
-- LangGraph 0.6 agents now load a SQLite checkpointer/store by default. Override paths with `EMAIL_ASSISTANT_CHECKPOINT_PATH` / `EMAIL_ASSISTANT_STORE_PATH` if you want the on-disk artefacts somewhere other than `~/.langgraph/`.
+- LangGraph 1.0 agents now load a SQLite checkpointer/store by default and expect sync durability via `.compile(...).with_config(durability="sync")`. Override paths with `EMAIL_ASSISTANT_CHECKPOINT_PATH` / `EMAIL_ASSISTANT_STORE_PATH` if you want the on-disk artefacts somewhere other than `~/.langgraph/`.
 - HITL flows now emit interrupts via `langgraph.prebuilt.interrupt.HumanInterrupt`, and the LLM/tool nodes are wrapped with `@task` so durable replays persist side effects.
 - LangSmith experiment pagination is handled through `iter_experiment_runs()` (see `src/email_assistant/eval/judges.py`), which leverages `Client.get_experiment_results()` to stream more than 100 judge records when reviewing datasets locally.
+- Gemini model routing is centralised in `email_assistant.configuration.get_llm`, which normalises provider/model pairs through `init_chat_model`. Defaults resolve to `google_genai:gemini-2.5-pro`. Override via `EMAIL_ASSISTANT_MODEL`, `EMAIL_ASSISTANT_ROUTER_MODEL`, `EMAIL_ASSISTANT_TOOL_MODEL`, or `EMAIL_ASSISTANT_MODEL_PROVIDER` if you need bespoke routing.
+
+Upgrade context and open follow-ups are tracked in `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md`; log checklist updates there whenever you touch the notebooks, docs, or test flows referenced below.
+
+## Streaming Instrumentation
+
+- Tests, scripts, and notebooks request `stream_mode=["updates","messages","custom"]`; the `custom` channel carries progress payloads emitted by the `stream_progress` tool in `email_assistant.tools.default.progress_tools`.
+- Set `EMAIL_ASSISTANT_TRACE_DEBUG=1` when you need to print raw stream payloads and LangSmith metadata while verifying notebook/CLI demos.
+- `EMAIL_ASSISTANT_TRACE_STAGE` and `EMAIL_ASSISTANT_TRACE_TAGS` feed through to LangSmith so replayed runs carry rollout metadata. Combine with `EMAIL_ASSISTANT_TRACE_PROJECT` to pin traces to a specific workspace bucket.
+- `scripts/run_real_outputs.py --stream` mirrors the production streaming surface outside of Jupyter. Use it to sanity check custom events before recording screenshots or videos. Set `EMAIL_ASSISTANT_TRACE_PROJECT` when you need an alternate LangSmith project base name (the helper still appends the daily suffix automatically).
 
 ## Running the Reminder Worker
 
@@ -64,8 +74,10 @@ This repo supports both offline-friendly tests and live model evaluation.
   - `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1`
   - `EMAIL_ASSISTANT_EVAL_MODE=1` (synthesize tool calls without a live LLM)
   - Optional: `EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1` (compat mode for evaluators that expect the reply recipient in `send_email_tool.email_address` instead of your address). Off by default for live-correct Gmail behavior.
+  - Optional: `EMAIL_ASSISTANT_MODEL_PROVIDER=google_genai` if you need to force the provider explicitly; `get_llm` applies this default automatically when unset.
   - Optional: `EMAIL_ASSISTANT_SQLITE_TIMEOUT=60` (seconds) to extend SQLite busy handling when LangSmith tracing or judge runs create extra contention; default is 30.
   - Optional: `EMAIL_ASSISTANT_TRACE_TIMEZONE=Australia/Sydney` to change the timezone used for daily LangSmith project grouping. Defaults to Australia/Sydney.
+  - Optional: `EMAIL_ASSISTANT_TRACE_DEBUG=1` to mirror the streaming payloads the notebooks/CLI surface.
 
 ### Notebooks
 

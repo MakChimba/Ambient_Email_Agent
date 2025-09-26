@@ -47,10 +47,10 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 
 ### Phase 4 — UI, Docs, and Notebooks
 - **Notebook Refresh**
-  - [ ] Update notebooks (`notebooks/*.ipynb`) to use the new streaming API, context schema, and `create_agent` import path.
+  - [x] Update notebooks (`notebooks/*.ipynb`) to use the new streaming API, context schema, and `create_agent` import path.
 - **Documentation Updates**
-  - [ ] Update README / README_LOCAL / developer docs with new env toggles (`EMAIL_ASSISTANT_TIMEZONE`, streaming expectations) and upgrade notes.
-  - [ ] Link docs back to the research ticket and this implementation ticket where relevant.
+  - [x] Update README / README_LOCAL / developer docs with new env toggles (`EMAIL_ASSISTANT_TIMEZONE`, streaming expectations) and upgrade notes.
+  - [x] Link docs back to the research ticket and this implementation ticket where relevant.
 - **Demo Artifacts**
   - [ ] Capture before/after screenshots or short clips demonstrating multi-mode streaming in Studio or CLI.
 
@@ -58,6 +58,7 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - [ ] Run targeted pytest suite (see Testing Notes) against live Gemini where possible; capture logs and LangSmith links when tracing enabled.
   - 2025-09-26 — Offline smoke (`pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`) passes tool assertions; remaining failure from LLM judge expected while Gmail API creds unavailable (auto-flag for scheduling behaviour).
   - 2025-09-26 — Added sanity run for base agent (`pytest tests/test_response.py --agent-module=email_assistant -k tool_calls --maxfail=1`) to confirm durability refactor; all cases pass offline.
+  - 2025-09-29 — Re-ran offline Gmail smoke with eval toggles (same command as above, `--maxfail=1`). LLM judge still flags `email_input_1` for not auto-scheduling (expected in eval mode); no additional regressions observed.
 - [ ] Regenerate or verify `tests/snapshots/live_smoke.json` and other fixtures if deterministic outputs change.
 - [ ] Collect final pass/fail checklist evidence and link in this ticket (artifacts, logs, screenshots).
 - [ ] Coordinate merge strategy (feature branch, rollout toggles) and note any fallback procedure.
@@ -95,3 +96,4 @@ Ship the LangChain/LangGraph v1.0 upgrade across the production Gmail HITL agent
 - 2025-09-26 — Updated tests/scripts to compile graphs with `durability="sync"`; validated base agent tool-call smoke locally.
 - 2025-09-27 — Added CLI streaming progress (`--stream`) and runtime metadata regression tests (`tests/test_runtime_context.py`).
 - 2025-09-28 — Phase 3 Gemini/tooling pass: standardized `get_llm` on `init_chat_model`, added `stream_progress` demo tool with custom-stream logging, and wrapped tool execution in resilient telemetry. Tests: `uv run pytest tests/test_configuration.py` and `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 uv run pytest tests/test_response.py --agent-module=email_assistant -k tool_calls --maxfail=1`.
+- 2025-09-29 — Phase 4 docs/notebooks: README, README_LOCAL, and AGENTS.md now document the new `init_chat_model` defaults, streaming env toggles (`EMAIL_ASSISTANT_TRACE_DEBUG`, provider overrides), and link back to this ticket. Updated `hitl.ipynb`, `memory.ipynb`, and `langgraph_101.ipynb` to compile graphs with `.with_config(durability="sync")`, refreshed LangGraph 1.0 narration, and kept `stream_mode=["updates","messages","custom"]` walkthroughs intact. Demo artefacts (screenshots/video) still pending.

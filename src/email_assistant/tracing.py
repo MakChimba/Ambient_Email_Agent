@@ -99,8 +99,22 @@ def _project_with_date(base: str) -> str:
     return f"{base}-{today}"
 
 
-AGENT_PROJECT = _project_with_date("email-assistant:agent")
-JUDGE_PROJECT = _project_with_date("email-assistant:judge")
+def _agent_project_name() -> str:
+    override = os.getenv("EMAIL_ASSISTANT_TRACE_PROJECT")
+    if override:
+        return _project_with_date(override)
+    return _project_with_date("email-assistant:agent")
+
+
+def _judge_project_name() -> str:
+    override = os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT")
+    if override:
+        return _project_with_date(override)
+    return _project_with_date("email-assistant:judge")
+
+
+AGENT_PROJECT = _agent_project_name()
+JUDGE_PROJECT = _judge_project_name()
 
 _HIDDEN_FLAGS = (
     "LANGSMITH_HIDE_INPUTS",
