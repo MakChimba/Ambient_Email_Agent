@@ -343,7 +343,6 @@ def triage_router(
 def triage_interrupt_handler_task(
     state: State,
     store: BaseStore,
-    runtime: Runtime[AssistantContext],
 ) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     
@@ -416,11 +415,10 @@ def triage_interrupt_handler_task(
 def triage_interrupt_handler(
     state: State,
     store: BaseStore,
-    runtime: Runtime[AssistantContext],
 ) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state, store=store, runtime=runtime).result()
+    return triage_interrupt_handler_task(state, store=store).result()
 
 @task
 def llm_call_task(state: State, store: BaseStore):
@@ -709,7 +707,6 @@ def interrupt_handler(state: State, store: BaseStore) -> Command[Literal["llm_ca
 # Conditional edge function
 def should_continue(
     state: State,
-    store: BaseStore,
     runtime: Runtime[AssistantContext],
 ) -> Literal["interrupt_handler", "__end__"]:
     """Route to tool handler, or end if Done tool called"""

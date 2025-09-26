@@ -110,7 +110,9 @@ def main():
     import uuid
 
     count = 0
-    for i, (inp, name, triage) in enumerate(zip(email_inputs, email_names, triage_list)):
+    for i, (inp, name, triage) in enumerate(
+        zip(email_inputs, email_names, triage_list, strict=True)
+    ):
         if args.respond_only and str(triage).lower() != "respond":
             continue
         thread_id = f"script-{uuid.uuid4()}"

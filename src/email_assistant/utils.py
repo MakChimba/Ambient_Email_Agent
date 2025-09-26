@@ -278,14 +278,18 @@ def extract_tool_calls(messages: List[Any]) -> List[str]:
                 args = getattr(call, "args", None)
 
             name = str(name_value or "").lower()
+            if not name:
+                continue
             call_id = str(call_id or "")
 
             if call_id:
                 key = (name, call_id)
             else:
                 try:
-                    serialized_args = json.dumps(args or {}, sort_keys=True, default=str)
-                except Exception:
+                    serialized_args = json.dumps(
+                        args or {}, sort_keys=True, default=str
+                    )
+                except (TypeError, ValueError):
                     serialized_args = repr(args)
                 key = (name, serialized_args)
 

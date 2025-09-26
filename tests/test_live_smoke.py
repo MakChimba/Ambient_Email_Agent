@@ -100,7 +100,6 @@ def test_live_smoke_cases(agent_module_name, gmail_service):
             return email_assistant.invoke(
                 payload,
                 config=thread_config,
-                durability="sync",
             )
 
         invoke_with_root_run(
