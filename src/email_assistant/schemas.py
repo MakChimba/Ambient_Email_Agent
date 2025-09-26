@@ -40,7 +40,10 @@ class EmailData(TypedDict):
 
 class UserPreferences(BaseModel):
     """Updated user preferences based on user's feedback."""
-    chain_of_thought: str = Field(description="Reasoning about which user preferences need to add/update if required")
+
+    rationale: str = Field(
+        description="Brief rationale for updating user preferences based on feedback."
+    )
     user_preferences: str = Field(description="Updated user preferences")
 
 

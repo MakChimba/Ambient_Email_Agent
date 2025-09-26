@@ -109,22 +109,21 @@ def main():
     # Thread config with runtime context metadata
     import uuid
 
-    thread_id = f"script-{uuid.uuid4()}"
-    thread_config = {
-        "run_id": str(uuid.uuid4()),
-        "configurable": {
-            "thread_id": thread_id,
-            "thread_metadata": {"thread_id": thread_id},
-            "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
-            "eval_mode": os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes"),
-        },
-        "recursion_limit": 100,
-    }
-
     count = 0
     for i, (inp, name, triage) in enumerate(zip(email_inputs, email_names, triage_list)):
         if args.respond_only and str(triage).lower() != "respond":
             continue
+        thread_id = f"script-{uuid.uuid4()}"
+        thread_config = {
+            "run_id": str(uuid.uuid4()),
+            "configurable": {
+                "thread_id": thread_id,
+                "thread_metadata": {"thread_id": thread_id},
+                "timezone": os.getenv("EMAIL_ASSISTANT_TIMEZONE", "Australia/Melbourne"),
+                "eval_mode": os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes"),
+            },
+            "recursion_limit": 100,
+        }
         print(f"\n=== [{i}] {name} | triage={triage} ===")
         payload = {"email_input": inp}
         summary = summarize_email_for_grid(inp)
@@ -133,7 +132,6 @@ def main():
             return agent.invoke(
                 payload,
                 config=thread_config,
-                durability="sync",
             )
 
         def _stream_agent():
@@ -142,7 +140,6 @@ def main():
                 payload,
                 config=thread_config,
                 stream_mode=["updates", "messages", "custom"],
-                durability="sync",
             ):
                 if mode == "custom":
                     print(f"[custom] {chunk}")

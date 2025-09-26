@@ -1,5 +1,6 @@
-from typing import Literal
+from datetime import datetime
 import os
+from typing import Literal
 
 from email_assistant.configuration import get_llm, format_model_identifier
 from email_assistant.tracing import (
@@ -24,6 +25,7 @@ from email_assistant.prompts import (
 )
 from email_assistant.schemas import State, RouterSchema, StateInput, AssistantContext
 from email_assistant.runtime import extract_runtime_metadata
+from email_assistant.checkpointing import get_sqlite_checkpointer
 from email_assistant.utils import parse_email, format_email_markdown
 
 from langgraph.func import task
@@ -57,7 +59,11 @@ ROUTER_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_ROUTER_MODEL") or DEFAULT_MODEL
 TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
 router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
 tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
-print(f"[email_assistant] Models -> router={router_identifier}, tools={tool_identifier}")
+if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+    print(
+        "[email_assistant] Models -> "
+        f"router={router_identifier}, tools={tool_identifier}"
+    )
 
 # Initialize the LLM for use with router / structured output
 llm = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME)
@@ -86,7 +92,7 @@ def _fallback_tool_plan(email_input: dict):
             "attendees": [author, to],
             "subject": subject,
             "duration_minutes": 45,
-            "preferred_day": __import__('datetime').datetime.now().isoformat(),
+            "preferred_day": datetime.now().isoformat(),
             "start_time": 1400,
         })
         add("write_email", {
@@ -101,7 +107,7 @@ def _fallback_tool_plan(email_input: dict):
             "attendees": [author, to],
             "subject": subject,
             "duration_minutes": 60,
-            "preferred_day": __import__('datetime').datetime.now().isoformat(),
+            "preferred_day": datetime.now().isoformat(),
             "start_time": 1100,
         })
         add("write_email", {
@@ -347,7 +353,7 @@ def triage_router_task(
     - Company-wide announcements
     - Messages meant for other teams
     """
-    timezone, eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
+    _timezone, _eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
 
     email_input = state["email_input"]
     author, to, subject, email_thread = parse_email(email_input)
@@ -440,7 +446,18 @@ def triage_router_task(
         )
         goto = END
     else:
-        raise ValueError(f"Invalid classification: {classification}")
+        if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+            print("⚠️ Invalid triage classification; defaulting to RESPOND.")
+        goto = "response_agent"
+        update = {
+            "classification_decision": "respond",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Respond to the email: {email_markdown}",
+                }
+            ],
+        }
     return Command(goto=goto, update=update)
 
 
@@ -458,11 +475,14 @@ overall_workflow = (
     .add_node(triage_router)
     .add_node("response_agent", agent)
     .add_edge(START, "triage_router")
+    .add_edge("triage_router", "response_agent")
 )
+
+_DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
 
 email_assistant = (
     overall_workflow
-    .compile()
+    .compile(checkpointer=_DEFAULT_CHECKPOINTER)
     .with_config(durability="sync")
 )
 

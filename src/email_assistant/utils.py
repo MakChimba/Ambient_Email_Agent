@@ -253,15 +253,47 @@ Correct Classification: {correct_routing}
 
 def extract_tool_calls(messages: List[Any]) -> List[str]:
     """Extract tool call names from messages, safely handling messages without tool_calls."""
-    tool_call_names = []
+
+    tool_call_names: List[str] = []
+    seen_keys: set[tuple] = set()
+
     for message in messages:
-        # Check if message is a dict and has tool_calls
-        if isinstance(message, dict) and message.get("tool_calls"):
-            tool_call_names.extend([call["name"].lower() for call in message["tool_calls"]])
-        # Check if message is an object with tool_calls attribute
-        elif hasattr(message, "tool_calls") and message.tool_calls:
-            tool_call_names.extend([call["name"].lower() for call in message.tool_calls])
-    
+        if isinstance(message, dict):
+            tool_calls = message.get("tool_calls") or []
+        else:
+            tool_calls = getattr(message, "tool_calls", []) or []
+
+        if not tool_calls:
+            continue
+
+        for call in tool_calls:
+            # Support both dict and object-based tool call representations
+            if isinstance(call, dict):
+                name_value = call.get("name")
+                call_id = call.get("id")
+                args = call.get("args")
+            else:
+                name_value = getattr(call, "name", None)
+                call_id = getattr(call, "id", None)
+                args = getattr(call, "args", None)
+
+            name = str(name_value or "").lower()
+            call_id = str(call_id or "")
+
+            if call_id:
+                key = (name, call_id)
+            else:
+                try:
+                    serialized_args = json.dumps(args or {}, sort_keys=True, default=str)
+                except Exception:
+                    serialized_args = repr(args)
+                key = (name, serialized_args)
+
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            tool_call_names.append(name)
+
     return tool_call_names
 
 def format_messages_string(messages: List[Any]) -> str:

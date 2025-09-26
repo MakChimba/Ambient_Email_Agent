@@ -1,4 +1,5 @@
-from typing import Literal
+import os
+from typing import Any, Iterable, Literal, cast
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
@@ -66,11 +67,44 @@ def _invoke_tool_with_logging(tool_name: str, args: dict) -> str:
     return observation
 
 # Optional auto-accept for HITL in tests
-import os
 def _maybe_interrupt(requests):
-    if os.getenv("HITL_AUTO_ACCEPT", "").lower() in ("1", "true", "yes"):
-        return [{"type": "accept", "args": {}}]
-    return interrupt(requests)
+    """Optionally auto-handle interrupts when demos/tests enable auto-accept."""
+
+    if os.getenv("HITL_AUTO_ACCEPT", "").lower() not in ("1", "true", "yes"):
+        return interrupt(requests)
+
+    def _allow(config: Any, attr: str) -> bool:
+        if config is None:
+            return False
+        if isinstance(config, dict):
+            return bool(config.get(attr, False))
+        return bool(getattr(config, attr, False))
+
+    synthesized = []
+    for req in cast(Iterable[Any] | None, requests) or []:
+        config = None
+        action = ""
+        if isinstance(req, dict):
+            config = req.get("config")
+            action_request = req.get("action_request") or {}
+            action = str(action_request.get("action", ""))
+        else:
+            config = getattr(req, "config", None)
+            action = str(
+                getattr(getattr(req, "action_request", None), "action", "")
+            )
+
+        if _allow(config, "allow_accept"):
+            synthesized.append({"type": "accept", "args": {}})
+        elif _allow(config, "allow_respond"):
+            responder = "Auto-accept demo: proceed." if action.lower() == "question" else ""
+            synthesized.append({"type": "response", "args": responder})
+        elif _allow(config, "allow_ignore"):
+            synthesized.append({"type": "ignore", "args": {}})
+        else:
+            synthesized.append({"type": "response", "args": ""})
+
+    return synthesized
 
 # Role-specific model selection (override via env)
 DEFAULT_MODEL = (
@@ -83,7 +117,11 @@ TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
 
 router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
 tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
-print(f"[email_assistant_hitl_memory] Models -> router={router_identifier}, tools={tool_identifier}")
+if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+    print(
+        "[email_assistant_hitl_memory] Models -> "
+        f"router={router_identifier}, tools={tool_identifier}"
+    )
 
 # Initialize the LLM for use with router / structured output
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
@@ -299,7 +337,7 @@ def triage_router(
 ) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state, runtime=runtime).result()
+    return triage_router_task(state, store=store, runtime=runtime).result()
 
 @task
 def triage_interrupt_handler_task(
@@ -382,7 +420,7 @@ def triage_interrupt_handler(
 ) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state, runtime=runtime).result()
+    return triage_interrupt_handler_task(state, store=store, runtime=runtime).result()
 
 @task
 def llm_call_task(state: State, store: BaseStore):
@@ -733,6 +771,9 @@ overall_workflow = (
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("triage_interrupt_handler", "response_agent")
 )
 
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()

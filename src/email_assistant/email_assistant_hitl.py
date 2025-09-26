@@ -1,5 +1,5 @@
-from typing import Literal
 import os
+from typing import Literal
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
@@ -19,7 +19,7 @@ from email_assistant.configuration import get_llm, format_model_identifier
 from email_assistant.schemas import State, RouterSchema, StateInput, AssistantContext
 from email_assistant.runtime import extract_runtime_metadata
 from email_assistant.utils import parse_email, format_for_display, format_email_markdown
-from email_assistant.checkpointing import new_memory_checkpointer
+from email_assistant.checkpointing import get_sqlite_checkpointer
 from email_assistant.tracing import (
     AGENT_PROJECT,
     init_project,
@@ -70,7 +70,11 @@ TOOL_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_TOOL_MODEL") or DEFAULT_MODEL
 
 router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
 tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
-print(f"[email_assistant_hitl] Models -> router={router_identifier}, tools={tool_identifier}")
+if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+    print(
+        "[email_assistant_hitl] Models -> "
+        f"router={router_identifier}, tools={tool_identifier}"
+    )
 
 # Initialize the LLM for use with router / structured output
 llm_router = get_llm(temperature=0.0, model=ROUTER_MODEL_NAME).with_structured_output(RouterSchema)
@@ -92,7 +96,7 @@ def triage_router_task(
     - Messages meant for other teams
     """
 
-    timezone, eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
+    _timezone, _eval_mode, thread_id, metadata = extract_runtime_metadata(runtime)
 
     # Parse the email input
     email_input = state["email_input"]
@@ -170,7 +174,18 @@ def triage_router_task(
         }
 
     else:
-        raise ValueError(f"Invalid classification: {classification}")
+        if os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes"):
+            print("⚠️ Invalid triage classification; defaulting to RESPOND.")
+        goto = "response_agent"
+        update = {
+            "classification_decision": "respond",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"Respond to the email: {email_markdown}",
+                }
+            ],
+        }
     return Command(goto=goto, update=update)
 
 
@@ -185,7 +200,7 @@ def triage_router(
 @task
 def triage_interrupt_handler_task(
     state: State,
-    runtime: Runtime[AssistantContext],
+    _runtime: Runtime[AssistantContext],
 ) -> Command[Literal["response_agent", "__end__"]]:
     """Handles interrupts from the triage step"""
     
@@ -521,10 +536,12 @@ overall_workflow = (
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
-    
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("triage_interrupt_handler", "response_agent")
 )
 
-_DEFAULT_CHECKPOINTER = new_memory_checkpointer()
+_DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
 email_assistant = (
     overall_workflow
     .compile(checkpointer=_DEFAULT_CHECKPOINTER)

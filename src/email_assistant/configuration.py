@@ -24,7 +24,11 @@ class ModelSpec:
 
 
 def _default_model() -> str:
-    return os.environ.get("GEMINI_MODEL", _DEFAULT_MODEL)
+    return (
+        os.environ.get("EMAIL_ASSISTANT_MODEL")
+        or os.environ.get("GEMINI_MODEL")
+        or _DEFAULT_MODEL
+    )
 
 
 def _default_provider() -> str:
@@ -78,6 +82,12 @@ def format_model_identifier(model: str | None = None, *, provider: str | None = 
 
     spec = normalize_model_spec(model, model_provider=provider)
     return spec.identifier
+
+
+def model_spec(model: str | None = None, *, provider: str | None = None) -> ModelSpec:
+    """Convenience helper that exposes the normalised ``ModelSpec``."""
+
+    return normalize_model_spec(model, model_provider=provider)
 
 
 def get_llm(temperature: float = 0.0, **kwargs):

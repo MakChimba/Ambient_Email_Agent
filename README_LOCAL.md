@@ -196,3 +196,4 @@ Notes
 
 - Transient 5xx from model providers: retry the run. Tests do not require live LLMs; the UI judge is separate from local pytest.
 - Recursion limit errors: in Studio, increase the `recursion_limit` in the request/config to `100` for long tool sequences.
+- SQLite “database is locked”: the HITL+memory agents default to a shared on-disk checkpoint/store under `~/.langgraph/`. If another process holds that file open, imports/tests may fail with `OperationalError: database is locked`. Either stop the prior run, delete the stale sqlite files, or point your run/tests at fresh paths, e.g. `EMAIL_ASSISTANT_CHECKPOINT_PATH=/tmp/checkpoints.sqlite EMAIL_ASSISTANT_STORE_PATH=/tmp/store.sqlite pytest …`.

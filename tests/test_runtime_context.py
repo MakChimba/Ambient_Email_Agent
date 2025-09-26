@@ -54,6 +54,6 @@ def test_triage_router_uses_runtime_context(monkeypatch):
     assert command.update["classification_decision"] == "respond"
 
 
-def test_runtime_thread_id_prefers_context_thread(monkeypatch):
+def test_runtime_thread_id_prefers_context_thread():
     runtime = SimpleNamespace(context={"thread_id": "primary", "thread_metadata": {"thread_id": "secondary"}})
     assert runtime_thread_id(runtime) == "primary"

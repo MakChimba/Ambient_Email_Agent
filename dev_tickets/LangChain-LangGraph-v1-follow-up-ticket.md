@@ -24,6 +24,8 @@ Wrap up the outstanding Phase 5 tasks for the LangGraph 1.0 rollout, focusing on
 
 ## Suggested Steps
 1. Prepare environment with live credentials; rerun the live pytest commands and capture output.
+   - Export `HITL_AUTO_ACCEPT=1` and `EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1` to mirror demo/test defaults.
+   - When `GOOGLE_API_KEY` is unavailable, fall back to deterministic mode via `EMAIL_ASSISTANT_EVAL_MODE=1`.
 2. Follow `demo_artifacts.md` checklist to record the streaming session; save assets and update documentation.
 3. Revisit `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md` to tick remaining checkboxes and append rollout/rollback notes.
 4. Summarise results in this follow-up ticket for historical tracking.

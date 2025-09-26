@@ -25,6 +25,20 @@ def configure_langsmith_projects(monkeypatch):
     init_project(AGENT_PROJECT)
 
 
+@pytest.fixture(autouse=True)
+def isolate_sqlite_files(tmp_path_factory, monkeypatch):
+    """Point checkpoint/store to per-test temp files to avoid lock contention."""
+
+    run_dir = tmp_path_factory.mktemp("sqlite-run")
+    checkpoint_path = run_dir / "checkpoints.sqlite"
+    store_path = run_dir / "store.sqlite"
+
+    if not os.getenv("EMAIL_ASSISTANT_CHECKPOINT_PATH"):
+        monkeypatch.setenv("EMAIL_ASSISTANT_CHECKPOINT_PATH", str(checkpoint_path))
+    if not os.getenv("EMAIL_ASSISTANT_STORE_PATH"):
+        monkeypatch.setenv("EMAIL_ASSISTANT_STORE_PATH", str(store_path))
+
+
 def pytest_addoption(parser):
     """Add command-line options to pytest."""
     parser.addoption(

@@ -14,6 +14,7 @@ from tests.trace_utils import configure_tracing_project, configure_judge_project
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from email_assistant.email_assistant_hitl_memory_gmail import overall_workflow
+from email_assistant.tools.gmail import gmail_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.store.memory import InMemoryStore
 from email_assistant.tracing import invoke_with_root_run, summarize_email_for_grid
@@ -36,6 +37,18 @@ configure_judge_project("email-assistant-judge-test-reminders")
 
 # --- 1. Setup LangSmith Client and Dataset ---
 DATASET_NAME = "Reminder Scenarios Evaluation v1"
+
+
+@pytest.fixture(autouse=True)
+def _route_gmail_through_fixture(gmail_service, monkeypatch):
+    """Ensure mark_as_read uses the Gmail fixture rather than live credentials."""
+
+    monkeypatch.setattr(
+        gmail_tools,
+        "mark_as_read",
+        gmail_service.mark_as_read,
+        raising=True,
+    )
 
 
 def _normalize_email_input(d: dict) -> dict:

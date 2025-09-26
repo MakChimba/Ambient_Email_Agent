@@ -105,7 +105,11 @@ def main(mock_schedule, mock_check, mock_send):
             payload = {"email_input": email_data}
             summary = summarize_email_for_grid(email_data)
 
-            def _invoke_agent():
+            def _invoke_agent(
+                agent=agent,
+                payload=payload,
+                config=config,
+            ):
                 return agent.invoke(
                     payload,
                     config,

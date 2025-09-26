@@ -42,8 +42,8 @@ from email_assistant.utils import (
     parse_gmail,
     format_for_display,
     format_gmail_markdown,
-    format_messages_string,
     extract_message_content,
+    format_messages_string,
 )
 from email_assistant.tracing import (
     AGENT_PROJECT,
@@ -425,7 +425,7 @@ def triage_router(
 ) -> Command[Literal["triage_interrupt_handler", "response_agent", "__end__"]]:
     """Synchronously execute the triage router task."""
 
-    return triage_router_task(state, runtime=runtime).result()
+    return triage_router_task(state, store=store, runtime=runtime).result()
 
 @task
 def triage_interrupt_handler_task(
@@ -501,7 +501,7 @@ def triage_interrupt_handler(
 ) -> Command[Literal["response_agent", "__end__"]]:
     """Synchronously execute the triage interrupt handler task."""
 
-    return triage_interrupt_handler_task(state, runtime=runtime).result()
+    return triage_interrupt_handler_task(state, store=store, runtime=runtime).result()
 
 @task
 def llm_call_task(state: State, store: BaseStore):
@@ -1215,9 +1215,8 @@ def interrupt_handler_task(
     runtime: Runtime[AssistantContext],
 ) -> Command[Literal["llm_call", "__end__"]]:
     """Creates an interrupt for human review of tool calls"""
-    # Always include the originating AIMessage so downstream logs/tests can see tool_calls
     ai_message = state["messages"][-1]
-    result = [ai_message]
+    result: list[Any] = []
     goto = "llm_call"
     try:
         tool_names_summary = [tc.get("name") for tc in ai_message.tool_calls]
@@ -1417,18 +1416,36 @@ def interrupt_handler_task(
                         if followup["type"] == "accept":
                             # Emit a synthetic tool_call so logs/tests register the action
                             from langchain_core.messages import AIMessage
+
                             spam_call = {
                                 "name": "mark_as_spam_tool",
-                            "args": {"email_id": email_id},
-                            "id": "mark_spam",
-                        }
-                        result.append(AIMessage(content="", tool_calls=[spam_call]))
-                        observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id})
-                        result.append({"role": "tool", "content": observation, "tool_call_id": "mark_spam"})
-                        update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": "User marked this email as spam. Update triage preferences to classify similar emails as ignore."}])
-                        goto = END
-                    else:
-                        result.append({"role": "tool", "content": "User declined to move to Spam.", "tool_call_id": tool_call["id"]})
+                                "args": {"email_id": email_id},
+                                "id": "mark_spam",
+                            }
+                            result.append(AIMessage(content="", tool_calls=[spam_call]))
+                            observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id})
+                            result.append({"role": "tool", "content": observation, "tool_call_id": "mark_spam"})
+                            update_memory(
+                                store,
+                                ("email_assistant", "triage_preferences"),
+                                state["messages"]
+                                + result
+                                + [
+                                    {
+                                        "role": "user",
+                                        "content": "User marked this email as spam. Update triage preferences to classify similar emails as ignore.",
+                                    }
+                                ],
+                            )
+                            goto = END
+                        else:
+                            result.append(
+                                {
+                                    "role": "tool",
+                                    "content": "User declined to move to Spam.",
+                                    "tool_call_id": tool_call["id"],
+                                }
+                            )
                 else:
                     result.append({"role": "tool", "content": f"User answered the question. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
             else:
@@ -1439,7 +1456,14 @@ def interrupt_handler_task(
                     update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
 
         if trace:
-            handled = max(len(result) - 1, 0)
+            handled = sum(
+                1
+                for entry in result
+                if (
+                    (isinstance(entry, dict) and entry.get("role") == "tool")
+                    or getattr(entry, "tool_calls", None)
+                )
+            )
             trace.set_outputs(f"goto={goto}; handled={handled}")
 
     return Command(goto=goto, update={"messages": result})
@@ -1519,7 +1543,7 @@ def interrupt_handler(
 ) -> Command[Literal["llm_call", "__end__"]]:
     """Synchronously execute the interrupt handler task."""
 
-    return interrupt_handler_task(state, runtime=runtime).result()
+    return interrupt_handler_task(state, store=store, runtime=runtime).result()
 
 @task
 def mark_as_read_node_task(
@@ -1540,8 +1564,8 @@ def mark_as_read_node_task(
     result_payload: dict[str, Any]
 
     email_markdown = ""
-    tool_trace = ""
     output_text = ""
+    tool_trace = ""
 
     with trace_stage(
         "mark_as_read_node",
@@ -1564,10 +1588,9 @@ def mark_as_read_node_task(
                 print(f"[gmail] mark_as_read failed for {email_id}: {e}")
 
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-        tool_trace = format_messages_string(state.get("messages", []))
         output_text = format_final_output(state)
+        tool_trace = format_messages_string(state.get("messages", []))
 
-        from langchain_core.messages import AIMessage
         summary = None
         try:
             for m in reversed(state.get("messages", [])):
@@ -1589,17 +1612,22 @@ def mark_as_read_node_task(
             result_payload = {
                 "messages": [{"role": "assistant", "content": summary}],
                 "assistant_reply": summary,
-                "tool_trace": tool_trace,
                 "email_markdown": email_markdown,
-                "output_text": output_text,
             }
         else:
             result_payload = {
                 "assistant_reply": "",
-                "tool_trace": tool_trace,
                 "email_markdown": email_markdown,
-                "output_text": output_text,
             }
+
+        if tool_trace:
+            result_payload["tool_trace"] = tool_trace
+        if output_text:
+            result_payload["output_text"] = output_text
+
+        for key in ("assistant_reply", "email_markdown", "tool_trace", "output_text"):
+            if key in result_payload and result_payload[key] == state.get(key):
+                result_payload.pop(key)
 
         if trace:
             trace.set_outputs(output_text or "workflow complete")
@@ -1649,9 +1677,11 @@ overall_workflow = (
     .add_node(triage_router)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
-    .add_node("mark_as_read_node", mark_as_read_node)
     .add_edge(START, "triage_router")
-    .add_edge("mark_as_read_node", END)
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("triage_interrupt_handler", "response_agent")
+    .add_edge("response_agent", END)
 )
 
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()

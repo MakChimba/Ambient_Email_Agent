@@ -28,7 +28,7 @@ These notes walk through capturing a multi-mode streaming demo for Phase 4/5 sig
   Open the `email_assistant_hitl_memory_gmail` graph, paste the payload below, set `stream_mode=["updates","messages","custom"]`, and run once to record the UI stream.
 
 ## 3. Capture
-- **CLI recording**: use `asciinema rec demo.cast --quiet --command "python ... --stream"`, then publish or export GIF via `agg`. Highlight the `custom` channel lines in the summary.
+- **CLI recording**: use `asciinema rec demo.cast --quiet --command "python scripts/run_real_outputs.py --agent-module email_assistant_hitl_memory_gmail --stream --max 1 --respond-only"`, then publish or export GIF via `agg`. Highlight the `custom` channel lines in the summary.
 - **Browser recording**: in Chrome, open DevTools → Network → WS, start screen recording (or Performance recording) before hitting “Run.” Capture both the visible stream and the DevTools WebSocket messages showing `updates/messages/custom`.
 - Save artefacts to `notebooks/img/` using descriptive names, e.g. `streaming-demo-cli.gif`, `streaming-demo-ui.mp4`. Create thumbnails if needed for README/UPDATES references.
 

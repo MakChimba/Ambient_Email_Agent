@@ -14,7 +14,7 @@ def _stream_writer() -> Any:
 
     try:
         runtime: Runtime[Any] | None = get_runtime()  # type: ignore[type-arg]
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort runtime detection
         runtime = None
     writer = getattr(runtime, "stream_writer", None) if runtime else None
     if callable(writer):
@@ -53,7 +53,7 @@ def stream_progress(
         if writer:
             try:
                 writer(payload)
-            except Exception:
+            except Exception:  # noqa: BLE001 - stream subscriber may not be present
                 # If the writer fails (e.g., custom stream not subscribed), swallow the error
                 writer = None
         if delay_seconds > 0:

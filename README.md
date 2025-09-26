@@ -61,6 +61,8 @@ Helpful toggles (leave unset for live runs):
 - `EMAIL_ASSISTANT_TRACE_TIMEZONE=Australia/Sydney` – override the timezone used when auto-grouping LangSmith projects (`email-assistant-AGENT-YYYYMMDD`). Defaults to Australia/Sydney.
 - `EMAIL_ASSISTANT_TRACE_DEBUG=1` – log LangGraph stream events and tracing metadata to stdout (useful when validating custom streaming progress).
 - `EMAIL_ASSISTANT_TRACE_STAGE` / `EMAIL_ASSISTANT_TRACE_TAGS` – append rollout metadata to LangSmith runs for multi-stage deploys.
+- `EMAIL_ASSISTANT_TIMEZONE=Australia/Melbourne` – default runtime timezone used by scripts and reminders when no explicit timezone is provided.
+- `EMAIL_ASSISTANT_JUDGE_PROJECT=email-assistant:judge` – base LangSmith project name for Gemini judge evaluations (date suffix appended automatically).
 
 ### Streaming & Tracing
 - All notebooks, scripts, and tests request `stream_mode=["updates","messages","custom"]`; the `custom` channel surfaces `stream_progress` events for live demos and automated logs.
@@ -87,6 +89,7 @@ Select the graph that matches your use case (`langgraph.json` lists all availabl
   - `pytest tests/test_live_hitl_spam.py --agent-module=email_assistant_hitl_memory_gmail`
   - `pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`
 - **Offline/deterministic runs:** set `EMAIL_ASSISTANT_EVAL_MODE=1` (and optionally `EMAIL_ASSISTANT_UPDATE_SNAPSHOTS=1`).
+- **SQLite lock avoidance:** tests now auto-configure unique `EMAIL_ASSISTANT_CHECKPOINT_PATH` / `EMAIL_ASSISTANT_STORE_PATH` values, but when running scripts manually set them to fresh locations (e.g. `/tmp/checkpoints.sqlite`) to avoid `OperationalError: database is locked` from earlier runs.
 - `python scripts/run_tests_langsmith.py` mirrors the tool-call suite and records traces when LangSmith is configured.
 - Enable Gemini 2.5 Flash judging (`EMAIL_ASSISTANT_LLM_JUDGE=1`) to score correctness/tool usage; add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail on judge verdicts.
 
@@ -110,6 +113,7 @@ Path | Description
 - `README_LOCAL.md` – local dev/test details, tmux/cron recipes, notebook tips.
 - `AGENTS.md` – agent evolution, feature changelog, evaluation modes.
 - `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md` – end-to-end implementation log with acceptance checklist and rollout notes.
+- `dev_tickets/LangChain-LangGraph-v1-follow-up-ticket.md` – Phase 5 validation/demo follow-ups, risks, and merge coordination tasks.
 - `notebooks/UPDATES.md` – notebook refresh log, live-first checklists, reminder/HITL env toggles.
 - `CONTRIBUTING.md` – branching, review, and testing expectations.
 - `system_prompt.md` – canonical assistant instructions.
