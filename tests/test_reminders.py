@@ -8,7 +8,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from email_assistant.tools.reminders import SqliteReminderStore
-from scripts.reminder_worker import check_reminders
+from scripts.reminder_worker import check_reminders, list_reminders
 
 
 @pytest.fixture
@@ -94,3 +94,26 @@ def test_worker_finds_due_reminders(memory_store: SqliteReminderStore):
 
     # Assert that the due reminder is no longer due after being processed
     assert not memory_store.get_due_reminders()
+
+
+def test_iter_active_reminders(memory_store: SqliteReminderStore):
+    thread_id = "active_thread"
+    due_at = datetime.now(timezone.utc) + timedelta(hours=3)
+    memory_store.add_reminder(thread_id, "Active Subject", due_at, "pending follow-up")
+
+    active = memory_store.iter_active_reminders()
+
+    assert len(active) == 1
+    assert active[0].thread_id == thread_id
+
+
+def test_list_reminders_uses_public_api(memory_store: SqliteReminderStore, capfd):
+    thread_id = "list_thread"
+    due_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    memory_store.add_reminder(thread_id, "List Subject", due_at, "list")
+
+    list_reminders(memory_store)
+    captured = capfd.readouterr()
+
+    assert "Active Reminders" in captured.out
+    assert "list_thread" in captured.out

@@ -71,6 +71,11 @@ class ReminderStore(abc.ABC):
         """Mark a reminder as notified."""
         raise NotImplementedError
 
+    @abc.abstractmethod
+    def iter_active_reminders(self) -> List[Reminder]:
+        """Return active reminders that have not been cancelled or notified."""
+        raise NotImplementedError
+
 
 # ------------------------
 # SQLite implementation
@@ -180,6 +185,14 @@ class SqliteReminderStore(ReminderStore):
                 "UPDATE reminders SET status = 'notified', notified_at = ? WHERE id = ?",
                 (self._now_iso(), reminder_id),
             )
+
+    def iter_active_reminders(self) -> List[Reminder]:
+        self.setup()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM reminders WHERE status = 'pending' AND canceled_at IS NULL AND notified_at IS NULL ORDER BY due_at ASC",
+            ).fetchall()
+        return [self._row_to_reminder(r) for r in rows]
 
     # -------- helpers --------
     @staticmethod

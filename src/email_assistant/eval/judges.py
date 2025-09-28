@@ -46,6 +46,7 @@ __all__ = [
     "serialise_messages",
     "create_langsmith_correctness_evaluator",
     "iter_experiment_runs",
+    "resolve_feedback_targets",
 ]
 
 
@@ -518,6 +519,210 @@ def _normalise_result_dict(data: dict) -> dict:
     return result
 
 
+def resolve_feedback_targets(
+    parent_run_id: Optional[str],
+    *,
+    email_markdown: Optional[str] = None,
+) -> Tuple[Optional[Client], List[str]]:
+    """Return the LangSmith client and candidate run ids for feedback attachment."""
+
+    try:
+        base_run_id = parent_run_id
+        if not base_run_id:
+            run_tree = get_current_run_tree()
+            if not run_tree:
+                return None, []
+            base_run_id = run_tree.id
+        base_run_id = str(base_run_id)
+        client = Client()
+    except Exception:
+        return None, []
+
+    target_markdown = truncate_markdown(email_markdown) if email_markdown else None
+    target_fingerprint = email_fingerprint(email_markdown)
+
+    def _ancestor_chain(start_id: str, max_depth: int = 6) -> List[Tuple[str, str]]:
+        chain: List[Tuple[str, str]] = []
+        current_id = start_id
+        visited: set[str] = set()
+        for _ in range(max_depth):
+            if not current_id or current_id in visited:
+                break
+            visited.add(current_id)
+            try:
+                current = client.read_run(current_id)
+            except Exception:
+                chain.append((current_id, ""))
+                break
+            name = str(getattr(current, "name", "") or "")
+            chain.append((str(current.id), name))
+            parent_id = getattr(current, "parent_run_id", None)
+            if not parent_id:
+                break
+            current_id = str(parent_id)
+        return chain
+
+    def _matches_markdown(run: Run) -> bool:
+        if target_fingerprint:
+            candidate_fp = (
+                getattr(run, "metadata", None) or {}
+            ).get("email_fingerprint")
+            if not candidate_fp:
+                candidate_fp = (
+                    getattr(run, "extra", None) or {}
+                ).get("email_fingerprint")
+            if candidate_fp and candidate_fp == target_fingerprint:
+                return True
+
+        if target_markdown:
+            metadata_block = (
+                getattr(run, "metadata", None) or {}
+            ).get("email_markdown")
+            if metadata_block and (
+                metadata_block == target_markdown
+                or metadata_block in target_markdown
+                or target_markdown in metadata_block
+            ):
+                return True
+            extra_block = (
+                getattr(run, "extra", None) or {}
+            ).get("email_markdown")
+            if extra_block and (
+                extra_block == target_markdown
+                or extra_block in target_markdown
+                or target_markdown in extra_block
+            ):
+                return True
+        return False
+
+    def _sorted_children(runs: List[Run]) -> List[Run]:
+        def _start_time(run: Run) -> float:
+            ts = getattr(run, "start_time", None)
+            if ts is None:
+                return float("-inf")
+            try:
+                return ts.timestamp()
+            except Exception:
+                return float("-inf")
+
+        return sorted(runs, key=_start_time, reverse=True)
+
+    def _resolve_agent_run(start_id: str, depth: int = 0) -> str:
+        if depth > 3:
+            return start_id
+        try:
+            current = client.read_run(start_id)
+        except Exception:
+            return start_id
+
+        name = str(getattr(current, "name", "") or "")
+        normalised = name.lower()
+        if normalised.startswith("agent:") or normalised.startswith("email_assistant"):
+            if _matches_markdown(current):
+                return start_id
+            return start_id
+
+        reference_example_id = getattr(current, "reference_example_id", None)
+        trace_id = getattr(current, "trace_id", None)
+        start_time = getattr(current, "start_time", None)
+
+        try:
+            children = list(
+                client.list_runs(parent_run_id=start_id, limit=50, order="asc")
+            )
+        except Exception:
+            children = []
+
+        pending_agent_id: Optional[str] = None
+        for child in _sorted_children(children):
+            child_name = str(getattr(child, "name", "") or "")
+            child_norm = child_name.lower()
+            if child_norm.startswith("agent:") or child_norm.startswith("email_assistant"):
+                if not _matches_markdown(child):
+                    try:
+                        child = client.read_run(str(child.id))
+                    except Exception:
+                        pass
+                if _matches_markdown(child):
+                    return str(child.id)
+                if pending_agent_id is None:
+                    pending_agent_id = str(child.id)
+
+        for child in _sorted_children(children):
+            resolved = _resolve_agent_run(str(child.id), depth + 1)
+            if resolved != str(child.id):
+                return resolved
+
+        session_id = getattr(current, "session_id", None)
+        if session_id:
+            try:
+                best_match: Optional[Run] = None
+                best_delta: float = float("inf")
+                for candidate_run in iter_experiment_runs(
+                    client=client,
+                    project_id=session_id,
+                    preview=True,
+                    limit=200,
+                ):
+                    candidate_name = str(getattr(candidate_run, "name", "") or "").lower()
+                    if candidate_name.startswith("agent:") or candidate_name.startswith(
+                        "email_assistant"
+                    ):
+                        if not _matches_markdown(candidate_run):
+                            try:
+                                candidate_run = client.read_run(candidate_run.id)
+                            except Exception:
+                                pass
+                        if _matches_markdown(candidate_run):
+                            return str(candidate_run.id)
+                        candidate_ref = getattr(
+                            candidate_run, "reference_example_id", None
+                        )
+                        if reference_example_id and candidate_ref == reference_example_id:
+                            return str(candidate_run.id)
+                        candidate_trace = getattr(candidate_run, "trace_id", None)
+                        if trace_id and candidate_trace == trace_id:
+                            return str(candidate_run.id)
+                        candidate_start = getattr(candidate_run, "start_time", None)
+                        if start_time and candidate_start:
+                            try:
+                                delta = abs((candidate_start - start_time).total_seconds())
+                            except Exception:
+                                delta = float("inf")
+                            else:
+                                if (
+                                    candidate_start >= start_time
+                                    and delta < best_delta
+                                    and delta <= 180
+                                ):
+                                    best_delta = delta
+                                    best_match = candidate_run
+                if best_match is not None:
+                    return str(best_match.id)
+            except Exception:
+                pass
+
+        if pending_agent_id is not None and not target_fingerprint and not target_markdown:
+            return pending_agent_id
+
+        return start_id
+
+    target_run_id = _resolve_agent_run(base_run_id)
+    ancestors = _ancestor_chain(base_run_id)
+    agent_ancestor_id: Optional[str] = None
+    for ancestor_id, name in ancestors:
+        if name.lower().startswith("agent:") or name.lower().startswith("email_assistant"):
+            agent_ancestor_id = ancestor_id
+            break
+
+    run_ids: List[str] = []
+    for candidate in (base_run_id, target_run_id, agent_ancestor_id):
+        if candidate and candidate not in run_ids:
+            run_ids.append(candidate)
+
+    return client, run_ids
+
+
 def _record_feedback(
     result: JudgeResult,
     *,
@@ -536,244 +741,12 @@ def _record_feedback(
     """
 
     try:
-        base_run_id = parent_run_id
-        if not base_run_id:
-            run_tree = get_current_run_tree()
-            if not run_tree:
-                return
-            base_run_id = run_tree.id
-        base_run_id = str(base_run_id)
-        client = Client()
-
-        def _ancestor_chain(start_id: str, max_depth: int = 6) -> List[Tuple[str, str]]:
-            """
-            Builds an ancestor chain of run IDs and names starting from `start_id` up through parent runs up to `max_depth`.
-            
-            Parameters:
-                start_id (str): The starting run ID to trace upward.
-                max_depth (int): Maximum number of ancestry steps to follow (default 6).
-            
-            Returns:
-                List[Tuple[str, str]]: Ordered list of `(run_id, name)` tuples beginning with `start_id` and moving to its parents. If a run cannot be read, its ID is included with an empty name and traversal stops. Cycles or missing IDs terminate the chain early.
-            """
-            chain: List[Tuple[str, str]] = []
-            current_id = start_id
-            visited: set[str] = set()
-            for _ in range(max_depth):
-                if not current_id or current_id in visited:
-                    break
-                visited.add(current_id)
-                try:
-                    current = client.read_run(current_id)
-                except Exception:
-                    chain.append((current_id, ""))
-                    break
-                name = str(getattr(current, "name", "") or "")
-                chain.append((str(current.id), name))
-                parent_id = getattr(current, "parent_run_id", None)
-                if not parent_id:
-                    break
-                current_id = str(parent_id)
-            return chain
-
-        target_markdown = truncate_markdown(email_markdown) if email_markdown else None
-        target_fingerprint = email_fingerprint(email_markdown)
-
-        def _matches_markdown(run: Run) -> bool:
-            """
-            Checks whether a LangSmith run matches the target email content by fingerprint or markdown.
-            
-            First, if a target fingerprint is available, compares it to the run's `metadata.email_fingerprint` or `extra.email_fingerprint` and returns `True` on match. If no fingerprint match and a target markdown is provided, compares the run's `metadata.email_markdown` or `extra.email_markdown` for exact equality or substring containment in either direction.
-            
-            Returns:
-                bool: `True` if the run matches by fingerprint or markdown, `False` otherwise.
-            """
-            candidate_fp = None
-            if target_fingerprint:
-                candidate_fp = (
-                    getattr(run, "metadata", None) or {}
-                ).get("email_fingerprint")
-                if not candidate_fp:
-                    candidate_fp = (
-                        getattr(run, "extra", None) or {}
-                    ).get("email_fingerprint")
-                if candidate_fp and candidate_fp == target_fingerprint:
-                    return True
-
-            if not target_markdown:
-                return False
-            metadata = getattr(run, "metadata", None) or {}
-            candidate_md = metadata.get("email_markdown")
-            if not candidate_md:
-                extra = getattr(run, "extra", None) or {}
-                candidate_md = extra.get("email_markdown")
-            if not candidate_md:
-                return False
-            candidate_md_str = str(candidate_md)
-            return (
-                candidate_md_str == target_markdown
-                or target_markdown in candidate_md_str
-                or candidate_md_str in target_markdown
-            )
-
-        def _resolve_agent_run(start_id: str, depth: int = 0) -> str:
-            """
-            Resolve the most appropriate agent-related run id for a given starting run by searching children and related session runs.
-            
-            Searches downward from the provided start_id (up to a recursion depth of 3) to locate a run whose name indicates an agent/email_assistant run and that best matches the target content fingerprint or markdown when available. The resolution prioritizes:
-            - direct child runs with agent-like names (most recent first),
-            - recursively resolved children,
-            - candidate runs within the same session/project matched by content fingerprint or markdown, reference_example_id, trace_id, or closest start time within 180 seconds (preferring runs that started at or after the start run).
-            If a matching agent run cannot be found, the function may return a pending agent child id (if one exists and no explicit target markdown/fingerprint is provided) or the original start_id.
-            
-            Parameters:
-                start_id (str): The run id from which to begin resolution.
-                depth (int): Current recursion depth (used internally); recursion stops and returns start_id when greater than 3.
-            
-            Returns:
-                str: The resolved agent run id, or the original start_id if no better candidate is found.
-            """
-            if depth > 3:
-                return start_id
-            try:
-                current = client.read_run(start_id)
-            except Exception:
-                return start_id
-
-            name = str(getattr(current, "name", "") or "")
-            normalised = name.lower()
-            if normalised.startswith("agent:") or normalised.startswith("email_assistant"):
-                if _matches_markdown(current):
-                    return start_id
-                return start_id
-
-            reference_example_id = getattr(current, "reference_example_id", None)
-            trace_id = getattr(current, "trace_id", None)
-            start_time = getattr(current, "start_time", None)
-
-            try:
-                children = list(
-                    client.list_runs(parent_run_id=start_id, limit=50, order="asc")
-                )
-            except Exception:
-                children = []
-
-            def _sorted_children(runs: List[Run]) -> List[Run]:
-                # Prioritise the most recent children so feedback targets the
-                # run that just completed rather than earlier siblings rolled
-                # up under the same parent (e.g., parametrised pytest case).
-                """
-                Return the given runs sorted with the most recently started first.
-                
-                Parameters:
-                    runs (List[Run]): Iterable of Run objects; each may have a `start_time` attribute.
-                
-                Returns:
-                    List[Run]: The input runs sorted by `start_time` in descending order. Runs with missing or unparsable `start_time` are treated as oldest.
-                """
-                def _start_time(run: Run) -> float:
-                    ts = getattr(run, "start_time", None)
-                    if ts is None:
-                        return float("-inf")
-                    try:
-                        return ts.timestamp()
-                    except Exception:
-                        return float("-inf")
-
-                return sorted(runs, key=_start_time, reverse=True)
-
-            pending_agent_id: Optional[str] = None
-            for child in _sorted_children(children):
-                child_name = str(getattr(child, "name", "") or "")
-                child_norm = child_name.lower()
-                if child_norm.startswith("agent:") or child_norm.startswith("email_assistant"):
-                    if not _matches_markdown(child):
-                        try:
-                            child = client.read_run(str(child.id))
-                        except Exception:
-                            pass
-                    if _matches_markdown(child):
-                        return str(child.id)
-                    if pending_agent_id is None:
-                        pending_agent_id = str(child.id)
-
-            for child in _sorted_children(children):
-                resolved = _resolve_agent_run(str(child.id), depth + 1)
-                if resolved != str(child.id):
-                    return resolved
-
-            session_id = getattr(current, "session_id", None)
-            if session_id:
-                try:
-                    best_match: Optional[Run] = None
-                    best_delta: float = float("inf")
-                    for candidate_run in iter_experiment_runs(
-                        client=client,
-                        project_id=session_id,
-                        preview=True,
-                        limit=200,
-                    ):
-                        candidate_name = str(getattr(candidate_run, "name", "") or "").lower()
-                        if candidate_name.startswith("agent:") or candidate_name.startswith(
-                            "email_assistant"
-                        ):
-                            if not _matches_markdown(candidate_run):
-                                try:
-                                    candidate_run = client.read_run(candidate_run.id)
-                                except Exception:
-                                    pass
-                            if _matches_markdown(candidate_run):
-                                return str(candidate_run.id)
-                            candidate_ref = getattr(candidate_run, "reference_example_id", None)
-                            if reference_example_id and candidate_ref == reference_example_id:
-                                return str(candidate_run.id)
-                            candidate_trace = getattr(candidate_run, "trace_id", None)
-                            if trace_id and candidate_trace == trace_id:
-                                return str(candidate_run.id)
-                            candidate_start = getattr(candidate_run, "start_time", None)
-                            if start_time and candidate_start:
-                                try:
-                                    delta = abs((candidate_start - start_time).total_seconds())
-                                except Exception:
-                                    delta = float("inf")
-                                else:
-                                    # Prefer runs that started at or after the
-                                    # current run; older runs are likely
-                                    # unrelated siblings.
-                                    if (
-                                        candidate_start >= start_time
-                                        and delta < best_delta
-                                        and delta <= 180
-                                    ):
-                                        best_delta = delta
-                                        best_match = candidate_run
-                    if best_match is not None:
-                        return str(best_match.id)
-                except Exception:
-                    pass
-
-            if (
-                pending_agent_id is not None
-                and not target_fingerprint
-                and not target_markdown
-            ):
-                return pending_agent_id
-
-            return start_id
-
-        target_run_id = _resolve_agent_run(base_run_id)
-        ancestors = _ancestor_chain(base_run_id)
-        agent_ancestor_id: Optional[str] = None
-        for ancestor_id, name in ancestors:
-            if name.lower().startswith("agent:") or name.lower().startswith(
-                "email_assistant"
-            ):
-                agent_ancestor_id = ancestor_id
-                break
-        run_ids: list[str] = []
-        for candidate in (base_run_id, target_run_id, agent_ancestor_id):
-            if candidate and candidate not in run_ids:
-                run_ids.append(candidate)
+        client, run_ids = resolve_feedback_targets(
+            parent_run_id,
+            email_markdown=email_markdown,
+        )
+        if not client or not run_ids:
+            return
 
         def _attach_feedback(run_id: str) -> None:
             """

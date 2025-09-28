@@ -7,9 +7,14 @@ from dotenv import load_dotenv
 # Add src to path to allow for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from email_assistant.tools.reminders import get_default_store, get_default_delivery, SqliteReminderStore
+from email_assistant.tools.reminders import (
+    ReminderStore,
+    get_default_store,
+    get_default_delivery,
+)
 
-def check_reminders(store: SqliteReminderStore):
+
+def check_reminders(store: ReminderStore):
     """Core logic to check for and process due reminders."""
     print("INFO: Running reminder check...")
     delivery = get_default_delivery()
@@ -32,23 +37,26 @@ def check_reminders(store: SqliteReminderStore):
         print(f"ERROR: Could not check reminders: {e}")
     print("INFO: Reminder check complete.")
 
-def list_reminders(store: SqliteReminderStore):
+def list_reminders(store: ReminderStore):
     """Lists all active (pending) reminders."""
     print("--- Active Reminders ---")
-    # This is not an existing method, so we'll query directly for simplicity
-    with store._connect() as conn:
-        rows = conn.execute(
-            "SELECT id, thread_id, subject, due_at FROM reminders WHERE status = 'pending' ORDER BY due_at ASC"
-        ).fetchall()
-    
-    if not rows:
+    reminders = list(store.iter_active_reminders())
+
+    if not reminders:
         print("No active reminders found.")
         return
 
-    for row in rows:
-        print(f"- ID: {row['id']}\n  Thread: {row['thread_id']}\n  Subject: {row['subject']}\n  Due: {row['due_at']}")
+    for reminder in reminders:
+        due = reminder.due_at
+        due_display = due.isoformat() if hasattr(due, "isoformat") else str(due)
+        print(
+            f"- ID: {reminder.id}\n"
+            f"  Thread: {reminder.thread_id}\n"
+            f"  Subject: {reminder.subject}\n"
+            f"  Due: {due_display}"
+        )
 
-def cancel_reminder_cli(store: SqliteReminderStore, thread_id: str):
+def cancel_reminder_cli(store: ReminderStore, thread_id: str):
     """CLI command to cancel a reminder."""
     print(f"Attempting to cancel reminders for thread: {thread_id}...")
     cancelled_count = store.cancel_reminder(thread_id)
