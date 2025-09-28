@@ -68,10 +68,11 @@ def cancel_reminder_cli(store: ReminderStore, thread_id: str):
 def main():
     load_dotenv()
     parser = argparse.ArgumentParser(description="Reminder worker and admin tool for the Email Assistant.")
-    parser.add_argument("--once", action="store_true", help="Run the check for due reminders once and exit.")
-    parser.add_argument("--loop", action="store_true", help="Run the check in a continuous loop.")
-    parser.add_argument("--list", action="store_true", help="List all active reminders.")
-    parser.add_argument("--cancel", type=str, metavar="THREAD_ID", help="Cancel an active reminder by its thread ID.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--once", action="store_true", help="Run the check for due reminders once and exit.")
+    group.add_argument("--loop", action="store_true", help="Run the check in a continuous loop.")
+    group.add_argument("--list", action="store_true", help="List all active reminders.")
+    group.add_argument("--cancel", type=str, metavar="THREAD_ID", help="Cancel an active reminder by its thread ID.")
     args = parser.parse_args()
 
     store = get_default_store()

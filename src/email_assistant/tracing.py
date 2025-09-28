@@ -9,6 +9,7 @@ import re
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import update_wrapper
 from typing import Any, Callable, Iterable, Mapping, Sequence as SeqType
 
 from datetime import datetime, timezone
@@ -113,9 +114,16 @@ def _patch_run_tree_parent_handling() -> None:
             if parent is not None:
                 kwargs["parent_run"] = parent
 
-        return original_init(self, *args, **kwargs)  # type: ignore[misc]
-
-    RunTree.__init__ = _patched_init  # type: ignore[assignment]
+        try:
+            return original_init(self, *args, **kwargs)  # type: ignore[misc]
+        except TypeError:
+            if "parent_run" in kwargs:
+                fallback_kwargs = dict(kwargs)
+                fallback_kwargs.pop("parent_run", None)
+                return original_init(self, *args, **fallback_kwargs)  # type: ignore[misc]
+            raise
+    patched_init = update_wrapper(_patched_init, original_init)
+    RunTree.__init__ = patched_init  # type: ignore[assignment]
     _RUN_TREE_PATCHED = True
 
 

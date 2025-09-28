@@ -9,6 +9,7 @@ locally (during pytest runs) and in LangSmith datasets/experiments.
 from __future__ import annotations
 
 import json
+import logging
 import contextvars
 import os
 import time
@@ -25,10 +26,12 @@ from langsmith import Client
 from langsmith.evaluation import EvaluationResult, LangChainStringEvaluator, StringEvaluator
 from langsmith.run_helpers import get_current_run_tree, traceable
 from langsmith.schemas import Example, Run
+from langsmith.utils import LangSmithError
 
 from email_assistant.configuration import get_llm
 from email_assistant.utils import extract_message_content, format_messages_string
 from email_assistant.tracing import (
+    JUDGE_PROJECT,
     email_fingerprint,
     invoke_with_root_run,
     strip_markdown_to_text,
@@ -36,6 +39,9 @@ from email_assistant.tracing import (
 )
 
 _FEEDBACK_PRIORITY_DELAY = float(os.getenv("EMAIL_ASSISTANT_FEEDBACK_DELAY", "0.05"))
+
+logger = logging.getLogger(__name__)
+_JUDGE_DEBUG = os.getenv("EMAIL_ASSISTANT_JUDGE_DEBUG", "").lower() in {"1", "true", "yes"}
 
 __all__ = [
     "JudgeResult",
@@ -48,6 +54,11 @@ __all__ = [
     "iter_experiment_runs",
     "resolve_feedback_targets",
 ]
+
+
+def _debug_judge(message: str, *args: Any) -> None:
+    if _JUDGE_DEBUG:
+        logger.debug(message, *args)
 
 
 class JudgeUnavailableError(RuntimeError):
@@ -189,7 +200,7 @@ def run_correctness_judge(
         "raw_output_optional": _coalesce_placeholder(raw_output_optional, "(raw output omitted)"),
     }
 
-    trace_project = os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT", "email-assistant-judge")
+    trace_project = os.getenv("EMAIL_ASSISTANT_JUDGE_PROJECT") or JUDGE_PROJECT
     should_trace = bool(os.getenv("LANGSMITH_API_KEY") and trace_project)
 
     def _invoke(data):
@@ -535,7 +546,11 @@ def resolve_feedback_targets(
             base_run_id = run_tree.id
         base_run_id = str(base_run_id)
         client = Client()
-    except Exception:
+    except LangSmithError as exc:
+        _debug_judge("resolve_feedback_targets: failed to initialise LangSmith client: %s", exc)
+        return None, []
+    except Exception as exc:  # pragma: no cover - defensive guardrail
+        _debug_judge("resolve_feedback_targets: unexpected initialisation error: %s", exc)
         return None, []
 
     target_markdown = truncate_markdown(email_markdown) if email_markdown else None
@@ -551,7 +566,12 @@ def resolve_feedback_targets(
             visited.add(current_id)
             try:
                 current = client.read_run(current_id)
-            except Exception:
+            except LangSmithError as exc:
+                _debug_judge("resolve_feedback_targets: ancestor lookup failed for %s: %s", current_id, exc)
+                chain.append((current_id, ""))
+                break
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                _debug_judge("resolve_feedback_targets: unexpected ancestor error for %s: %s", current_id, exc)
                 chain.append((current_id, ""))
                 break
             name = str(getattr(current, "name", "") or "")
@@ -612,7 +632,11 @@ def resolve_feedback_targets(
             return start_id
         try:
             current = client.read_run(start_id)
-        except Exception:
+        except LangSmithError as exc:
+            _debug_judge("resolve_feedback_targets: failed to read run %s: %s", start_id, exc)
+            return start_id
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            _debug_judge("resolve_feedback_targets: unexpected error reading run %s: %s", start_id, exc)
             return start_id
 
         name = str(getattr(current, "name", "") or "")
@@ -630,7 +654,11 @@ def resolve_feedback_targets(
             children = list(
                 client.list_runs(parent_run_id=start_id, limit=50, order="asc")
             )
-        except Exception:
+        except LangSmithError as exc:
+            _debug_judge("resolve_feedback_targets: failed to list children for %s: %s", start_id, exc)
+            children = []
+        except Exception as exc:  # pragma: no cover - defensive guardrail
+            _debug_judge("resolve_feedback_targets: unexpected error listing children for %s: %s", start_id, exc)
             children = []
 
         pending_agent_id: Optional[str] = None
@@ -641,8 +669,10 @@ def resolve_feedback_targets(
                 if not _matches_markdown(child):
                     try:
                         child = client.read_run(str(child.id))
-                    except Exception:
-                        pass
+                    except LangSmithError as exc:
+                        _debug_judge("resolve_feedback_targets: retry read child %s failed: %s", child.id, exc)
+                    except Exception as exc:  # pragma: no cover - defensive guardrail
+                        _debug_judge("resolve_feedback_targets: unexpected retry read error for %s: %s", child.id, exc)
                 if _matches_markdown(child):
                     return str(child.id)
                 if pending_agent_id is None:
@@ -671,8 +701,18 @@ def resolve_feedback_targets(
                         if not _matches_markdown(candidate_run):
                             try:
                                 candidate_run = client.read_run(candidate_run.id)
-                            except Exception:
-                                pass
+                            except LangSmithError as exc:
+                                _debug_judge(
+                                    "resolve_feedback_targets: retry read candidate %s failed: %s",
+                                    candidate_run.id,
+                                    exc,
+                                )
+                            except Exception as exc:  # pragma: no cover - defensive guardrail
+                                _debug_judge(
+                                    "resolve_feedback_targets: unexpected retry candidate error %s: %s",
+                                    candidate_run.id,
+                                    exc,
+                                )
                         if _matches_markdown(candidate_run):
                             return str(candidate_run.id)
                         candidate_ref = getattr(
@@ -687,7 +727,7 @@ def resolve_feedback_targets(
                         if start_time and candidate_start:
                             try:
                                 delta = abs((candidate_start - start_time).total_seconds())
-                            except Exception:
+                            except Exception:  # pragma: no cover - fallback to keep ordering stable
                                 delta = float("inf")
                             else:
                                 if (
@@ -699,8 +739,10 @@ def resolve_feedback_targets(
                                     best_match = candidate_run
                 if best_match is not None:
                     return str(best_match.id)
-            except Exception:
-                pass
+            except LangSmithError as exc:
+                _debug_judge("resolve_feedback_targets: session scan failed for %s: %s", session_id, exc)
+            except Exception as exc:  # pragma: no cover - defensive guardrail
+                _debug_judge("resolve_feedback_targets: unexpected session scan error for %s: %s", session_id, exc)
 
         if pending_agent_id is not None and not target_fingerprint and not target_markdown:
             return pending_agent_id

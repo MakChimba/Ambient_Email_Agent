@@ -158,7 +158,7 @@ def format_for_display(tool_call):
 **Duration**: {duration_value} minutes
 **Day**: {preferred_day}
 """
-    elif name == "Question":
+    elif str(name).lower() == "question":
         # Special formatting for questions to make them clear
         content = _clean_text(args.get("content"), "")
         display += f"""# Question for User
