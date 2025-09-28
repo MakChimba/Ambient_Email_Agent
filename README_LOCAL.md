@@ -61,6 +61,16 @@ Notes
 - Ensure `.venv` exists and dependencies are installed before enabling the cron job.
 - Logs are appended to `_artifacts/reminders.log` for inspection.
 
+## Reminder Coverage & Live Tests
+
+- The reminder store now exposes `iter_active_reminders()` so scripts (and `scripts/reminder_worker.py --list`) enumerate pending reminders without touching SQLite internals. Use this helper instead of `_connect()` in custom tooling.
+- Required environment variables for end-to-end reminder coverage:
+  - `REMINDER_DB_PATH`: SQLite file for reminders (defaults to `.local/reminders.db`).
+  - `REMINDER_DEFAULT_HOURS`: Hours until a new reminder becomes due (default `48`).
+  - `REMINDER_POLL_INTERVAL_MIN`: Minutes between worker checks when running with `--loop`.
+  - `REMINDER_NOTIFY_EMAIL`: Your email address; inbound replies from this sender automatically cancel pending reminders.
+- Live reminder regression: `pytest tests/test_live_reminders.py --agent-module=email_assistant_hitl_memory_gmail` enables LangSmith tracing and the Gemini judge, exercises the create→cancel flow, and tolerates Gmail API stubs (the worker logs the missing credentials while judge feedback remains actionable).
+
 ## Test & Evaluation Modes
 
 This repo supports both offline-friendly tests and live model evaluation.

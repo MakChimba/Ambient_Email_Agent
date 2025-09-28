@@ -1,11 +1,15 @@
 from typing import List, Any
 import json
+import logging
 import re
 
 try:
     import html2text  # type: ignore
 except ImportError:
     html2text = None
+
+
+logger = logging.getLogger(__name__)
 
 def format_email_markdown(subject, author, to, email_thread, email_id=None):
     """Format email details into a nicely formatted markdown string for display
@@ -67,6 +71,55 @@ def format_gmail_markdown(subject, author, to, email_thread, email_id=None):
 ---
 """
 
+def _normalise_tool_args(name: str, raw_args):
+    """Return dict-like args for Agent Inbox formatting and log discarded shapes."""
+
+    if isinstance(raw_args, dict):
+        return raw_args, None
+
+    preview = repr(raw_args)
+    truncated_preview = preview[:200] if preview else preview
+
+    if isinstance(raw_args, list) and raw_args and isinstance(raw_args[0], dict):
+        logger.warning(
+            "Agent Inbox: tool %s emitted list args; using first element.",
+            name,
+        )
+        return raw_args[0], {"discarded": truncated_preview}
+
+    if raw_args is None:
+        logger.warning(
+            "Agent Inbox: tool %s emitted None args; defaulting to empty mapping.",
+            name,
+        )
+        return {}, {"discarded": "None"}
+
+    logger.warning(
+        "Agent Inbox: tool %s emitted non-dict args of type %s; discarding (preview=%s)",
+        name,
+        type(raw_args).__name__,
+        truncated_preview,
+    )
+    return {}, {"discarded": truncated_preview}
+
+
+def _clean_text(value, default="") -> str:
+    if value in (None, ""):
+        return default
+    return str(value)
+
+
+def _clean_list(values) -> List[str]:
+    if not isinstance(values, list):
+        return []
+    cleaned: List[str] = []
+    for item in values:
+        if not item:
+            continue
+        cleaned.append(str(item))
+    return cleaned
+
+
 def format_for_display(tool_call):
     """Format content for display in Agent Inbox
     
@@ -76,40 +129,56 @@ def format_for_display(tool_call):
     # Initialize empty display
     display = ""
     
+    name = tool_call.get("name", "")
+    raw_args = tool_call.get("args")
+    args, residual = _normalise_tool_args(name, raw_args)
+
     # Add tool call information
-    if tool_call["name"] == "write_email" or tool_call["name"] == "send_email_tool":
+    if name in {"write_email", "send_email_tool"}:
+        to_value = _clean_text(args.get("to") or args.get("email_address"), "")
+        subject_value = _clean_text(args.get("subject"), "")
+        body = args.get("content") or args.get("response_text") or ""
         display += f"""# Email Draft
 
-**To**: {tool_call["args"].get("to") or ''}
-**Subject**: {tool_call["args"].get("subject") or ''}
+**To**: {to_value}
+**Subject**: {subject_value}
 
-{tool_call["args"].get("content") or tool_call["args"].get("response_text")}
+{body}
 """
-    elif tool_call["name"] == "schedule_meeting":
+    elif name in {"schedule_meeting", "schedule_meeting_tool"}:
+        attendees = _clean_list(args.get("attendees"))
+        attendees_display = ", ".join(attendees) if attendees else "N/A"
+        subject_value = _clean_text(args.get("subject") or args.get("title"), "N/A")
+        duration_value = _clean_text(args.get("duration_minutes"), "N/A")
+        preferred_day = _clean_text(args.get("preferred_day") or args.get("start_time"), "N/A")
         display += f"""# Calendar Invite
 
-**Meeting**: {tool_call["args"].get("subject")}
-**Attendees**: {', '.join(tool_call["args"].get("attendees"))}
-**Duration**: {tool_call["args"].get("duration_minutes")} minutes
-**Day**: {tool_call["args"].get("preferred_day")}
+**Meeting**: {subject_value}
+**Attendees**: {attendees_display}
+**Duration**: {duration_value} minutes
+**Day**: {preferred_day}
 """
-    elif tool_call["name"] == "Question":
+    elif str(name).lower() == "question":
         # Special formatting for questions to make them clear
+        content = _clean_text(args.get("content"), "")
         display += f"""# Question for User
 
-{tool_call["args"].get("content")}
+{content}
 """
     else:
         # Generic format for other tools
-        display += f"""# Tool Call: {tool_call["name"]}
+        display += f"""# Tool Call: {name}
 
 Arguments:"""
-        
-        # Check if args is a dictionary or string
-        if isinstance(tool_call["args"], dict):
-            display += f"\n{json.dumps(tool_call['args'], indent=2)}\n"
+        display_args = args if args else residual.get("discarded") if residual else raw_args
+        if isinstance(display_args, dict):
+            display += f"\n{json.dumps(display_args, indent=2)}\n"
         else:
-            display += f"\n{tool_call['args']}\n"
+            display += f"\n{display_args}\n"
+
+    if residual and residual.get("discarded") and name not in {"Question"}:
+        display += "\n_Note: Original tool args were discarded due to unexpected shape._\n"
+
     return display
 
 def parse_email(email_input: dict) -> tuple[str, str, str, str]:
@@ -147,46 +216,6 @@ def parse_email(email_input: dict) -> tuple[str, str, str, str]:
 
     return (author or "", to or "", subject or "", thread or "")
 
-def parse_gmail(email_input: dict) -> tuple[str, str, str, str, str]:
-    """Parse a Gmail-style email dict flexibly and safely.
-
-    Accepts variations in key names and falls back to dataset-style keys so
-    experiments or older datasets don't break. Missing fields return empty strings.
-
-    Expected keys (preferred → fallbacks):
-      - from → From → author
-      - to → To
-      - subject → Subject
-      - body → Body → email_thread → page_content
-      - id → message_id → gmail_id
-    """
-    if not isinstance(email_input, dict):
-        return ("", "", "", "", "")
-
-    author = (
-        email_input.get("from")
-        or email_input.get("From")
-        or email_input.get("author")
-        or ""
-    )
-    to = email_input.get("to") or email_input.get("To") or ""
-    subject = email_input.get("subject") or email_input.get("Subject") or ""
-    body = (
-        email_input.get("body")
-        or email_input.get("Body")
-        or email_input.get("email_thread")
-        or email_input.get("page_content")
-        or ""
-    )
-    email_id = (
-        email_input.get("id")
-        or email_input.get("message_id")
-        or email_input.get("gmail_id")
-        or ""
-    )
-
-    return (author, to, subject, body, email_id)
-    
 def extract_message_content(message) -> str:
     """Extract content from different message types as clean string.
     

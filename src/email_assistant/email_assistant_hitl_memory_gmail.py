@@ -55,6 +55,18 @@ from email_assistant.tracing import (
     trace_stage,
 )
 from email_assistant.tools.reminders import get_default_store
+from email_assistant.graph.reminder_nodes import (
+    create_reminder_node,
+    cancel_reminder_node,
+    register_reminder_actions,
+    set_reminder_store,
+)
+from email_assistant.reminder_middleware import (
+    SenderAssessment,
+    assess_sender,
+    note_sender,
+)
+from email_assistant.eval.reminder_judge import evaluate_reminder_risk
 from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from dotenv import load_dotenv
 
@@ -82,6 +94,7 @@ def _eval_mode_enabled() -> bool:
 
 # Initialize the reminder store globally
 reminder_store = get_default_store()
+set_reminder_store(reminder_store)
 
 
 # Optional auto-accept for HITL in tests
@@ -337,6 +350,16 @@ def triage_router_task(
     if thread_id:
         metadata_payload.setdefault("thread_id", thread_id)
 
+    sender_assessment: SenderAssessment = assess_sender(
+        store,
+        author,
+        subject or "",
+        email_thread or "",
+    )
+    metadata_payload.setdefault("sender_email", sender_assessment.email)
+    metadata_payload.setdefault("sender_status", sender_assessment.status)
+    metadata_payload.setdefault("sender_risk", sender_assessment.risk_level)
+
     prime_parent_run(
         email_input=email_input,
         email_markdown=email_markdown,
@@ -365,6 +388,8 @@ def triage_router_task(
         "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
     }
 
+    reminder_actions: list[dict[str, Any]] = []
+
     with trace_stage(
         "triage_router",
         run_type="chain",
@@ -386,12 +411,17 @@ def triage_router_task(
         reply_detected = False
         user_email = os.getenv("REMINDER_NOTIFY_EMAIL")
         if user_email and user_email in author:
-            cancelled_count = reminder_store.cancel_reminder(thread_id=email_id)
-            if cancelled_count > 0:
-                print(
-                    f"🔔 Reminder cancelled for thread {email_id} because a reply from '{user_email}' was detected in the From header."
-                )
-                reply_detected = True
+            reminder_actions.append({
+                "action": "cancel",
+                "thread_id": email_id,
+                "reason": "reply detected",
+                "risk": sender_assessment.risk_level,
+            })
+            note_sender(store, sender_assessment.email, "trusted", "User replied to thread")
+            print(
+                f"🔔 Reminder cancellation enqueued for thread {email_id} after reply from '{user_email}'."
+            )
+            reply_detected = True
 
         # Try LLM triage; fall back to respond on failure
         try:
@@ -411,15 +441,61 @@ def triage_router_task(
         if classification in {"respond", "notify"}:
             print(f"🔔 Classification: {classification.upper()} - This email requires attention.")
             if not reply_detected:
+                decision = None
+                risk_level = sender_assessment.risk_level
+                reminder_reason = f"Triaged as '{classification}'"
+                if risk_level == "high":
+                    decision = evaluate_reminder_risk(
+                        sender_email=sender_assessment.email,
+                        sender_status=sender_assessment.status,
+                        risk_level=risk_level,
+                        risk_reason=sender_assessment.reason,
+                        email_summary=email_markdown,
+                        reminder_reason=reminder_reason,
+                    )
+                    metadata_payload.setdefault("reminder_judge", decision.model_dump())
+                    if decision.decision == "hitl":
+                        note_sender(store, sender_assessment.email, "flagged", decision.rationale)
+                        update = {
+                            "classification_decision": classification,
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Reminder flagged for manual review."
+                                        f" Sender: {sender_assessment.email or '(unknown)'} | Reason: {decision.rationale}"
+                                    ),
+                                }
+                            ],
+                        }
+                        if trace:
+                            trace.set_outputs(f"classification={classification}; goto=triage_interrupt_handler; judge=hitl")
+                        return Command(goto="triage_interrupt_handler", update=update)
+                    if decision.decision == "reject":
+                        note_sender(store, sender_assessment.email, "flagged", decision.rationale)
+                        update = {"classification_decision": "ignore"}
+                        if trace:
+                            trace.set_outputs("classification=ignore; goto=__end__; judge=reject")
+                        return Command(goto=END, update=update)
+                    note_sender(store, sender_assessment.email, "trusted", decision.rationale)
+                else:
+                    status_label = "trusted" if sender_assessment.status != "new" else "known"
+                    note_sender(store, sender_assessment.email, status_label, sender_assessment.reason)
+
                 default_hours = int(os.getenv("REMINDER_DEFAULT_HOURS", 48))
                 due_at = datetime.now(timezone.utc) + timedelta(hours=default_hours)
-                reminder_store.add_reminder(
-                    thread_id=email_id,
-                    subject=subject,
-                    due_at=due_at,
-                    reason=f"Triaged as '{classification}'",
+                reminder_actions.append(
+                    {
+                        "action": "create",
+                        "thread_id": email_id,
+                        "subject": subject,
+                        "due_at": due_at.isoformat(),
+                        "reason": reminder_reason,
+                        "risk": sender_assessment.risk_level,
+                        "sender": sender_assessment.email,
+                    }
                 )
-                print(f"INFO: Reminder set for thread {email_id} due at {due_at.isoformat()}")
+                print(f"INFO: Reminder creation enqueued for thread {email_id} due at {due_at.isoformat()}")
 
             if classification == "respond":
                 goto = "response_agent"
@@ -445,6 +521,12 @@ def triage_router_task(
 
         if trace:
             trace.set_outputs(f"classification={classification}; goto={goto}")
+    if reminder_actions:
+        update = dict(update)
+        register_reminder_actions(email_id or thread_id or "__default__", reminder_actions, goto)
+        update["reminder_next_node"] = goto
+        goto = "cancel_reminder_node"
+        goto = "cancel_reminder_node"
 
     return Command(goto=goto, update=update)
 
@@ -1797,11 +1879,21 @@ response_agent = agent_builder.compile()
 overall_workflow = (
     StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
+    .add_node("cancel_reminder_node", cancel_reminder_node)
+    .add_node("create_reminder_node", create_reminder_node)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
+    .add_edge("triage_router", "cancel_reminder_node")
     .add_edge("triage_router", "response_agent")
     .add_edge("triage_router", "triage_interrupt_handler")
+    .add_edge("cancel_reminder_node", "create_reminder_node")
+    .add_edge("cancel_reminder_node", "response_agent")
+    .add_edge("cancel_reminder_node", "triage_interrupt_handler")
+    .add_edge("cancel_reminder_node", END)
+    .add_edge("create_reminder_node", "response_agent")
+    .add_edge("create_reminder_node", "triage_interrupt_handler")
+    .add_edge("create_reminder_node", END)
     .add_edge("triage_interrupt_handler", "response_agent")
     .add_edge("response_agent", END)
 )
