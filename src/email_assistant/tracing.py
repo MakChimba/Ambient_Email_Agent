@@ -66,12 +66,80 @@ else:
 logger = logging.getLogger(__name__)
 
 
+_RUN_TREE_PATCHED = False
+
+
+def _resolve_current_root() -> Any | None:
+    """Return the active root run if available."""
+
+    if get_current_run_tree is not None:
+        try:
+            current = get_current_run_tree()
+        except Exception:
+            current = None
+        else:
+            if current is not None:
+                root = current
+                while getattr(root, "parent_run", None) is not None:
+                    root = getattr(root, "parent_run")
+                if root is not None:
+                    return root
+
+    try:
+        cached_root = _ROOT_RUN_TREE.get()
+    except LookupError:
+        cached_root = None
+    return cached_root
+
+
+def _patch_run_tree_parent_handling() -> None:
+    """Ensure RunTree defaults to the active root when no parent is provided."""
+
+    global _RUN_TREE_PATCHED
+
+    if _RUN_TREE_PATCHED or RunTree is None:
+        return
+
+    original_init = RunTree.__init__  # type: ignore[attr-defined]
+
+    def _patched_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        parent_provided = "parent_run" in kwargs or "parent_run_id" in kwargs
+        if not parent_provided:
+            parent = _resolve_current_root()
+            if parent is not None:
+                kwargs["parent_run"] = parent
+        elif kwargs.get("parent_run") is None and "parent_run_id" not in kwargs:
+            parent = _resolve_current_root()
+            if parent is not None:
+                kwargs["parent_run"] = parent
+
+        return original_init(self, *args, **kwargs)  # type: ignore[misc]
+
+    RunTree.__init__ = _patched_init  # type: ignore[assignment]
+    _RUN_TREE_PATCHED = True
+
+
 _TRACE_DEBUG = os.getenv("EMAIL_ASSISTANT_TRACE_DEBUG", "").lower() in ("1", "true", "yes")
 _TRACE_TIMEZONE_NAME = os.getenv("EMAIL_ASSISTANT_TRACE_TIMEZONE", "Australia/Sydney")
 
 _ROOT_RUN_TREE: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "email_assistant_root_run_tree", default=None
 )
+
+
+_patch_run_tree_parent_handling()
+
+
+def current_root_run_id() -> str | None:
+    """Return the active root run identifier if tracing is active."""
+
+    root = _resolve_current_root()
+    if root is None:
+        return None
+    run_id = getattr(root, "id", None)
+    if run_id is None:
+        return None
+    return str(run_id)
 
 
 def _debug_log(message: str) -> None:
@@ -1145,6 +1213,7 @@ def format_final_output(state: Mapping[str, Any]) -> str:
 __all__ = [
     "AGENT_PROJECT",
     "JUDGE_PROJECT",
+    "current_root_run_id",
     "init_project",
     "default_trace_tags",
     "default_root_metadata",

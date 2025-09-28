@@ -2,6 +2,7 @@ import logging
 import os
 import warnings
 from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, cast
 
 import pytest
 
@@ -10,6 +11,8 @@ from tests.trace_utils import configure_tracing_project, configure_judge_project
 from email_assistant.tracing import (
     invoke_with_root_run,
     summarize_email_for_grid,
+    trace_stage,
+    current_root_run_id,
 )
 from email_assistant.utils import format_messages_string
 from email_assistant.eval.judges import (
@@ -100,11 +103,110 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
     def _invoke_initial():
         return email_assistant.invoke(payload, config=thread_config, durability="sync")
 
-    invoke_with_root_run(_invoke_initial, root_name="agent:reminder:create", input_summary=summary)
-    initial_state = _extract_values(email_assistant.get_state(thread_config))
+    artifacts: dict[str, object] = {}
 
-    reminders = module.reminder_store.iter_active_reminders()
-    assert not reminders, "High-risk reminder should defer to HITL reviewer"
+    def _snapshot(reminders):
+        return [
+            {
+                "thread_id": r.thread_id,
+                "subject": r.subject,
+                "due_at": getattr(r.due_at, "isoformat", lambda: "")(),
+                "reason": r.reason,
+                "status": r.status,
+            }
+            for r in reminders
+        ]
+
+    def _invoke_stage(stage_name: str, stage_payload: dict, stage_summary: str) -> dict:
+        with trace_stage(stage_name, inputs_summary=stage_summary):
+            email_assistant.invoke(stage_payload, config=thread_config, durability="sync")
+        return _extract_values(email_assistant.get_state(thread_config))
+
+    def _run_flow():
+        root_run_id = current_root_run_id()
+        artifacts["root_run_id"] = root_run_id
+        initial_state = _invoke_stage("agent:reminder:create", payload, summary)
+        artifacts["initial_state"] = initial_state
+        reminders_initial = list(module.reminder_store.iter_active_reminders())
+        artifacts["initial_reminders"] = reminders_initial
+        _safe_log_outputs(
+            {
+                "case": "reminder_hitl",
+                "assistant_reply": initial_state.get("assistant_reply"),
+                "tool_trace": format_messages_string(initial_state.get("messages", [])),
+                "reminders": _snapshot(reminders_initial),
+            },
+            root_run_id,
+        )
+
+        monkeypatch.setenv("REMINDER_JUDGE_FORCE_DECISION", "approve")
+
+        followup_email = dict(first_email)
+        followup_email["id"] = "thread-reminder-invoice-approval"
+        followup_payload = {"email_input": followup_email}
+        followup_summary = summarize_email_for_grid(followup_email)
+        _safe_log_inputs({"case": "reminder_create", "email": followup_email}, root_run_id)
+
+        followup_state = _invoke_stage("agent:reminder:create:approve", followup_payload, followup_summary)
+        artifacts["followup_state"] = followup_state
+        reminders_followup = list(module.reminder_store.iter_active_reminders())
+        artifacts["followup_reminders"] = reminders_followup
+        _safe_log_outputs(
+            {
+                "case": "reminder_create",
+                "assistant_reply": followup_state.get("assistant_reply"),
+                "tool_trace": format_messages_string(followup_state.get("messages", [])),
+                "reminders": _snapshot(reminders_followup),
+            },
+            root_run_id,
+        )
+
+        monkeypatch.setenv("REMINDER_JUDGE_FORCE_DECISION", "approve")
+
+        reply_email = {
+            "from": "Assistant <assistant@example.com>",
+            "to": "Utility Billing <billing@example.com>",
+            "subject": "Re: Bill due October 1",
+            "body": "Payment processed today. Thanks for the reminder!",
+            "id": "thread-reminder-invoice-approval",
+        }
+
+        reply_payload = {"email_input": reply_email}
+        reply_summary = summarize_email_for_grid(reply_email)
+        _safe_log_inputs({"case": "reminder_cancel", "email": reply_email}, root_run_id)
+
+        reply_state = _invoke_stage("agent:reminder:cancel", reply_payload, reply_summary)
+        artifacts["reply_state"] = reply_state
+        reminders_after = list(module.reminder_store.iter_active_reminders())
+        artifacts["reminders_after"] = reminders_after
+        _safe_log_outputs(
+            {
+                "case": "reminder_cancel",
+                "assistant_reply": reply_state.get("assistant_reply"),
+                "tool_trace": format_messages_string(reply_state.get("messages", [])),
+                "reminders": _snapshot(reminders_after),
+            },
+            root_run_id,
+        )
+
+        return artifacts
+
+    invoke_with_root_run(_run_flow, root_name="agent:reminder:create", input_summary=summary)
+
+    root_run_id = cast(str | None, artifacts.get("root_run_id"))
+
+    initial_state = cast(Dict[str, Any], artifacts["initial_state"])  # type: ignore[arg-type]
+    reminders_initial = cast(List[Any], artifacts["initial_reminders"])  # type: ignore[arg-type]
+    assert not reminders_initial, "High-risk reminder should defer to HITL reviewer"
+
+    followup_state = cast(Dict[str, Any], artifacts["followup_state"])  # type: ignore[arg-type]
+    reminders_followup = cast(List[Any], artifacts["followup_reminders"])  # type: ignore[arg-type]
+    assert any(r.thread_id == "thread-reminder-invoice-approval" for r in reminders_followup)
+    due_delta = reminders_followup[0].due_at - datetime.now(timezone.utc)
+    assert timedelta(hours=23) <= due_delta <= timedelta(hours=25)
+
+    followup_email = dict(first_email)
+    followup_email["id"] = "thread-reminder-invoice-approval"
     creation_snapshot = [
         {
             "thread_id": r.thread_id,
@@ -113,92 +215,12 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
             "reason": r.reason,
             "status": r.status,
         }
-        for r in reminders
+        for r in reminders_followup
     ]
 
-    _safe_log_outputs(
-        {
-            "case": "reminder_hitl",
-            "assistant_reply": initial_state.get("assistant_reply"),
-            "tool_trace": format_messages_string(initial_state.get("messages", [])),
-            "reminders": creation_snapshot,
-        },
-        run_id,
-    )
-
-    # Judge approves on second attempt
-    monkeypatch.setenv("REMINDER_JUDGE_FORCE_DECISION", "approve")
-
-    followup_email = dict(first_email)
-    followup_email["id"] = "thread-reminder-invoice-approval"
-
-    followup_payload = {"email_input": followup_email}
-    followup_summary = summarize_email_for_grid(followup_email)
-    _safe_log_inputs({"case": "reminder_create", "email": followup_email}, run_id)
-
-    def _invoke_followup():
-        return email_assistant.invoke(followup_payload, config=thread_config, durability="sync")
-
-    invoke_with_root_run(_invoke_followup, root_name="agent:reminder:create:approve", input_summary=followup_summary)
-    followup_state = _extract_values(email_assistant.get_state(thread_config))
-
-    reminders = module.reminder_store.iter_active_reminders()
-    assert any(r.thread_id == followup_email["id"] for r in reminders)
-    due_delta = reminders[0].due_at - datetime.now(timezone.utc)
-    assert timedelta(hours=23) <= due_delta <= timedelta(hours=25)
-    creation_snapshot = [
-        {
-            "thread_id": r.thread_id,
-            "subject": r.subject,
-            "due_at": r.due_at.isoformat(),
-            "reason": r.reason,
-            "status": r.status,
-        }
-        for r in reminders
-    ]
-
-    _safe_log_outputs(
-        {
-            "case": "reminder_create",
-            "assistant_reply": followup_state.get("assistant_reply"),
-            "tool_trace": format_messages_string(followup_state.get("messages", [])),
-            "reminders": creation_snapshot,
-        },
-        run_id,
-    )
-
-    # Prepare forced decision for reminder judge evaluation
-    monkeypatch.setenv("REMINDER_JUDGE_FORCE_DECISION", "approve")
-
-    reply_email = {
-        "from": "Assistant <assistant@example.com>",
-        "to": "Utility Billing <billing@example.com>",
-        "subject": "Re: Bill due October 1",
-        "body": "Payment processed today. Thanks for the reminder!",
-        "id": "thread-reminder-invoice-approval",
-    }
-
-    reply_payload = {"email_input": reply_email}
-    reply_summary = summarize_email_for_grid(reply_email)
-    _safe_log_inputs({"case": "reminder_cancel", "email": reply_email}, run_id)
-
-    def _invoke_reply():
-        return email_assistant.invoke(reply_payload, config=thread_config, durability="sync")
-
-    invoke_with_root_run(_invoke_reply, root_name="agent:reminder:cancel", input_summary=reply_summary)
-    reply_state = _extract_values(email_assistant.get_state(thread_config))
-
-    reminders_after = module.reminder_store.iter_active_reminders()
-    assert not any(r.thread_id == followup_email["id"] for r in reminders_after)
-    _safe_log_outputs(
-        {
-            "case": "reminder_cancel",
-            "assistant_reply": reply_state.get("assistant_reply"),
-            "tool_trace": format_messages_string(reply_state.get("messages", [])),
-            "reminders": [],
-        },
-        run_id,
-    )
+    reply_state = cast(Dict[str, Any], artifacts["reply_state"])  # type: ignore[arg-type]
+    reminders_after = cast(List[Any], artifacts["reminders_after"])  # type: ignore[arg-type]
+    assert not any(r.thread_id == "thread-reminder-invoice-approval" for r in reminders_after)
 
     # Secondary correctness judge for the approval run
     messages = followup_state.get("messages", [])
@@ -224,6 +246,8 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
     if reminder_judge_project_override:
         os.environ["EMAIL_ASSISTANT_REMINDER_JUDGE_PROJECT"] = reminder_judge_project_override
 
+    judge_parent_run_id = root_run_id or run_id
+
     try:
         correctness_verdict = run_correctness_judge(
             email_markdown=followup_state.get("email_markdown", ""),
@@ -232,7 +256,7 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
             tool_calls_summary=tool_calls_summary,
             tool_calls_json=tool_calls_json,
             raw_output_optional=raw_payload,
-            parent_run_id=run_id,
+            parent_run_id=judge_parent_run_id,
         )
     except JudgeUnavailableError as exc:
         warnings.warn(f"Reminder judge unavailable: {exc}")
@@ -246,7 +270,7 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
             reminder_created=creation_snapshot,
             reminder_cleared=reminder_cleared,
             sender_email=followup_email.get("from", ""),
-            parent_run_id=run_id,
+            parent_run_id=judge_parent_run_id,
         )
     except JudgeUnavailableError as exc:
         warnings.warn(f"Reminder judge unavailable: {exc}")
@@ -256,7 +280,7 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
     composite = run_composite_judge(
         correctness=correctness_verdict,
         reminder=reminder_verdict,
-        parent_run_id=run_id,
+        parent_run_id=judge_parent_run_id,
         sender_email=followup_email.get("from", ""),
         email_markdown=followup_state.get("email_markdown", ""),
         email_input=followup_email,
@@ -271,7 +295,7 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
             "reminder_judge": reminder_verdict.model_dump(),
             "composite": composite.model_dump(),
         },
-        run_id,
+        root_run_id,
     )
 
     monkeypatch.setenv("REMINDER_JUDGE_FORCE_DECISION", "")
