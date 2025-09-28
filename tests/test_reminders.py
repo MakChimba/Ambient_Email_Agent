@@ -117,3 +117,32 @@ def test_list_reminders_uses_public_api(memory_store: SqliteReminderStore, capfd
 
     assert "Active Reminders" in captured.out
     assert "list_thread" in captured.out
+
+
+def test_apply_actions_batch(memory_store: SqliteReminderStore):
+    cancel_thread = "thread_to_batch_cancel"
+    create_thread = "thread_to_batch_create"
+    due_existing = datetime.now(timezone.utc) + timedelta(hours=6)
+    due_new = datetime.now(timezone.utc) + timedelta(hours=12)
+
+    memory_store.add_reminder(cancel_thread, "Existing", due_existing, "existing reminder")
+
+    actions = [
+        {"action": "cancel", "thread_id": cancel_thread},
+        {
+            "action": "create",
+            "thread_id": create_thread,
+            "subject": "Follow up",
+            "due_at": due_new.isoformat(),
+            "reason": "batch create",
+        },
+    ]
+
+    result = memory_store.apply_actions(actions)
+
+    assert result["cancelled"].get(cancel_thread) == 1
+    assert create_thread in result["created"]
+    assert memory_store.get_active_reminder_for_thread(cancel_thread) is None
+    created_reminder = memory_store.get_active_reminder_for_thread(create_thread)
+    assert created_reminder is not None
+    assert created_reminder.subject == "Follow up"

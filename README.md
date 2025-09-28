@@ -94,10 +94,15 @@ Select the graph that matches your use case (`langgraph.json` lists all availabl
 - Enable Gemini 2.5 Flash judging (`EMAIL_ASSISTANT_LLM_JUDGE=1`) to score correctness/tool usage; add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail on judge verdicts.
 
 ## Reminders & Follow-ups
-The reminder worker (`scripts/reminder_worker.py`) promotes important threads:
-- Configure labels and timings with `REMINDER_*` environment variables.
-- Run once: `python scripts/reminder_worker.py --once`
-- Continuous loop: `python scripts/reminder_worker.py --loop` (tmux/cron examples live in README_LOCAL.md)
+The reminder stack now includes a LangGraph dispatcher plus a background worker:
+- `triage_router` batches cancel/create intents and defers HITL-created reminders via `pending_reminder_actions`.
+- `apply_reminder_actions_node` executes batched operations atomically through `ReminderStore.apply_actions()` and exposes the outcome as `reminder_dispatch_outcome`.
+- `triage_interrupt_handler` replay pending reminder actions only after a reviewer chooses to respond, keeping notify flows HITL-first.
+- `scripts/reminder_worker.py` promotes due reminders:
+  - Configure labels/timers with `REMINDER_*` environment variables.
+  - Run once: `python scripts/reminder_worker.py --once`
+  - Continuous loop: `python scripts/reminder_worker.py --loop` (tmux/cron examples live in README_LOCAL.md)
+- See `notebooks/reminder_flow.ipynb` for a diagram + code sample showing the dispatcher in action.
 
 ## Repository Layout
 Path | Description

@@ -63,7 +63,10 @@ Notes
 
 ## Reminder Coverage & Live Tests
 
-- The reminder store now exposes `iter_active_reminders()` so scripts (and `scripts/reminder_worker.py --list`) enumerate pending reminders without touching SQLite internals. Use this helper instead of `_connect()` in custom tooling.
+- The reminder graph now routes cancel/create batches through `apply_reminder_actions_node`, powered by the new `ReminderStore.apply_actions()` helper. Cancels and recreations execute in one SQLite transaction, so partial failures no longer orphan reminders.
+- Notify/HITL flows queue reminder creations in `pending_reminder_actions` and only replay them once `triage_interrupt_handler` receives a "respond" decision. Ignore/accept clears the queue without touching the store.
+- Inspect dispatcher output via the `reminder_dispatch_outcome` key in the state or run the demonstration cell in `notebooks/reminder_flow.ipynb`.
+- The reminder store still exposes `iter_active_reminders()` so scripts (and `scripts/reminder_worker.py --list`) enumerate pending reminders without touching SQLite internals. Use this helper instead of `_connect()` in custom tooling.
 - Required environment variables for end-to-end reminder coverage:
   - `REMINDER_DB_PATH`: SQLite file for reminders (defaults to `.local/reminders.db`).
   - `REMINDER_DEFAULT_HOURS`: Hours until a new reminder becomes due (default `48`).
