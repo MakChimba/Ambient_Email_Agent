@@ -727,7 +727,13 @@ def resolve_feedback_targets(
                         if start_time and candidate_start:
                             try:
                                 delta = abs((candidate_start - start_time).total_seconds())
-                            except Exception:  # pragma: no cover - fallback to keep ordering stable
+                            except Exception as exc:  # pragma: no cover - fallback to keep ordering stable
+                                _debug_judge(
+                                    "resolve_feedback_targets: failed to compute time delta for %s vs %s: %s",
+                                    candidate_run.id,
+                                    start_id,
+                                    exc,
+                                )
                                 delta = float("inf")
                             else:
                                 if (

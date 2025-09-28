@@ -216,46 +216,6 @@ def parse_email(email_input: dict) -> tuple[str, str, str, str]:
 
     return (author or "", to or "", subject or "", thread or "")
 
-def parse_gmail(email_input: dict) -> tuple[str, str, str, str, str]:
-    """Parse a Gmail-style email dict flexibly and safely.
-
-    Accepts variations in key names and falls back to dataset-style keys so
-    experiments or older datasets don't break. Missing fields return empty strings.
-
-    Expected keys (preferred → fallbacks):
-      - from → From → author
-      - to → To
-      - subject → Subject
-      - body → Body → email_thread → page_content
-      - id → message_id → gmail_id
-    """
-    if not isinstance(email_input, dict):
-        return ("", "", "", "", "")
-
-    author = (
-        email_input.get("from")
-        or email_input.get("From")
-        or email_input.get("author")
-        or ""
-    )
-    to = email_input.get("to") or email_input.get("To") or ""
-    subject = email_input.get("subject") or email_input.get("Subject") or ""
-    body = (
-        email_input.get("body")
-        or email_input.get("Body")
-        or email_input.get("email_thread")
-        or email_input.get("page_content")
-        or ""
-    )
-    email_id = (
-        email_input.get("id")
-        or email_input.get("message_id")
-        or email_input.get("gmail_id")
-        or ""
-    )
-
-    return (author, to, subject, body, email_id)
-    
 def extract_message_content(message) -> str:
     """Extract content from different message types as clean string.
     
