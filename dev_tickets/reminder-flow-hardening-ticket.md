@@ -17,16 +17,16 @@ Eliminate reminder routing inconsistencies in the Gmail HITL workflow by (1) ali
   - `tests/test_reminders.py`
   - `tests/test_live_reminders.py`
   - `tests/test_response.py`
-- Docs/Notebooks
+- Readmes/Notebooks
   - `AGENTS.md`
-  - `docs/` (create or update a reminder-focused page)
+  - `README.md` / `README_LOCAL.md`
   - `notebooks/` (add or refresh reminder walkthrough)
 
 ## Scope
 - Align reminder action identifiers with the store’s canonical thread key (or explicit `reminder_id`).
 - Replace the two-step cancel→create flow with a durable, atomic dispatcher node that processes staged actions and persists outcomes safely.
 - Ensure triage HITL branches never register reminder actions before approval and that state transitions stay LangGraph-native.
-- Update documentation (AGENTS.md + dedicated doc + notebook) with an accurate Mermaid sequence diagram of the new flow.
+- Update documentation (AGENTS.md + README.md + README_LOCAL.md + notebook) with an accurate Mermaid sequence diagram of the new flow.
 - Validate with both offline (eval-mode) and live Gmail test suites to prevent regressions.
 
 ## Out of Scope
@@ -54,7 +54,7 @@ Eliminate reminder routing inconsistencies in the Gmail HITL workflow by (1) ali
 
 ### Phase 4 — Documentation & Diagram Refresh
 1. Revise `AGENTS.md` to describe the atomic reminder dispatcher and LangGraph 1.0 routing (remove Gmail-as-dispatcher language).
-2. Create or update a doc under `docs/` (e.g., `docs/reminder_flow.md`) including an updated Mermaid diagram showing `User → Gmail Adapter → LangGraph Runner → Triage → Apply Actions → Response Agent` along with HITL interrupts.
+2. Update `README.md` and `README_LOCAL.md` with a summary of the reminder flow changes, linking to the relevant notebook and embedding or referencing the refreshed Mermaid diagram.
 3. Update an existing notebook (recommend `notebooks/hitl.ipynb` or add `notebooks/reminder_flow.ipynb`) to demonstrate the new dispatcher, including an executable Mermaid render cell and sample reminder action walk-through.
 
 ### Phase 5 — Validation & Regression Testing
@@ -69,8 +69,8 @@ Eliminate reminder routing inconsistencies in the Gmail HITL workflow by (1) ali
 
 ## Documentation Deliverables
 - Updated `AGENTS.md` section referencing the atomic dispatcher and LangGraph 1.0 routing.
-- New/updated doc in `docs/` containing the refreshed sequence diagram and implementation overview.
-- Notebook showcasing the flow, with commentary on evaluation/live toggles.
+- Updated README files highlighting reminder flow behaviour and pointing to the notebook.
+- Notebook showcasing the flow, with commentary on evaluation/live toggles and the refreshed Mermaid diagram.
 - Inline code comments limited to essential clarifications per repo guidelines.
 
 ## Acceptance Criteria
