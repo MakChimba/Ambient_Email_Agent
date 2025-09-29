@@ -101,8 +101,13 @@ Eliminate reminder routing inconsistencies in the Gmail HITL workflow by (1) ali
 - [x] Introduced a pending reminder queue persisted in the LangGraph store so notify/HITL flows defer creation until a human approves the reminder.
 - [x] Added `tests/test_reminders.py::test_apply_actions_batch` to cover the new store helper.
 - [x] Documented the dispatcher changes in `AGENTS.md`, `README.md`, `README_LOCAL.md`, updated `notebooks/UPDATES.md`, and created `notebooks/reminder_flow.ipynb` with a mermaid diagram + code example.
-- [ ] Resolve recursion/looping in notify → HITL flows. With the current graph wiring the dispatcher is reached, but `triage_interrupt_handler` re-enters repeatedly causing the offline reminder test to fail and eventually hit the recursion limit.
+- [x] Resolve recursion/looping in notify → HITL flows. The dispatcher now clears pending reminder actions from the LangGraph store after a successful apply, which prevents `triage_router` from rehydrating the same batch and allows control to advance to `response_agent`.
 - [ ] Stabilise evaluation-mode behaviour: `tests/test_response.py -k tool_calls` still fails because the Gemini judge flags repeated `send_email_tool` + `Done` invocations. Needs investigation (likely unrelated to dispatcher, but still regressed in this branch).
+
+## Progress — 2025-09-29
+
+- Added store cleanup inside `apply_reminder_actions_node` so successful reminder batches empty `pending_actions` in the LangGraph store and state. Offline reminder pytest now completes without the triage loop.
+- Captured stack trace for the lingering evaluation-mode failure (`triage_interrupt_completed` double-write) while rerunning the response tool-call suite for diagnosis.
 
 ## Testing Notes — 2025-09-28
 
@@ -115,6 +120,13 @@ Command | Result | Notes
 
 ## Follow-ups
 
-1. Fix the dispatcher loop so HITL approvals progress to `apply_reminder_actions_node` exactly once and the reminder is persisted. Re-run `tests/test_live_reminders.py` afterwards.
+1. Schedule a live Gmail validation run (`tests/test_live_reminders.py`) to confirm the dispatcher fix under production settings once credentials are available.
 2. Audit the tool-plan synthesis in evaluation mode so `send_email_tool` executes once per email. Current suspicion is the deterministic fallback + HITL auto-accept (running without a live Gemini key) is replaying the plan repeatedly; confirm once live LLM access is available and tighten the offline heuristics accordingly.
 3. Remove temporary debug tracing once the above issues are resolved and re-run the offline + live tests.
+
+## Testing Notes — 2025-09-29
+
+Command | Result | Notes
+--- | --- | ---
+`uv run pytest tests/test_reminders.py` | ✅ | Confirmed after remapping the dispatcher routing — reminder apply node now exits cleanly to the response path without looping.
+`EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` | ⚠️ | Recursion loop resolved (suite now completes), but offline judge still flags unmet dataset expectations (missing scheduling tool usage/60 minute duration). Logged results for follow-up.

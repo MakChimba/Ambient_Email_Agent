@@ -397,6 +397,7 @@ def triage_router_task(
     update: dict[str, Any] = {
         "classification_decision": "respond",
         "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+        "deterministic_reply_emitted": False,
     }
 
     reminder_actions: list[dict[str, Any]] = []
@@ -449,6 +450,8 @@ def triage_router_task(
             classification = "respond"
 
         # --- Reminder Logic: Part 2: Create on Triage Decision ---
+        prev_deterministic_flag = bool(state.get("deterministic_reply_emitted", False))
+
         if classification in {"respond", "notify"}:
             print(f"🔔 Classification: {classification.upper()} - This email requires attention.")
             if not reply_detected:
@@ -478,13 +481,17 @@ def triage_router_task(
                                     ),
                                 }
                             ],
+                            "deterministic_reply_emitted": False,
                         }
                         if trace:
                             trace.set_outputs(f"classification={classification}; goto=triage_interrupt_handler; judge=hitl")
                         return Command(goto="triage_interrupt_handler", update=update)
                     if decision.decision == "reject":
                         note_sender(store, sender_assessment.email, "flagged", decision.rationale)
-                        update = {"classification_decision": "ignore"}
+                        update = {
+                            "classification_decision": "ignore",
+                            "deterministic_reply_emitted": False,
+                        }
                         if trace:
                             trace.set_outputs("classification=ignore; goto=__end__; judge=reject")
                         return Command(goto=END, update=update)
@@ -514,26 +521,32 @@ def triage_router_task(
             if classification == "respond":
                 goto = "response_agent"
                 update = {
-                    "classification_decision": classification,
+                    "classification_decision": "respond",
                     "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+                    "deterministic_reply_emitted": prev_deterministic_flag,
                 }
             else:
                 goto = "triage_interrupt_handler"
-                update = {"classification_decision": classification}
+                update = {
+                    "classification_decision": classification,
+                    "deterministic_reply_emitted": prev_deterministic_flag,
+                }
 
         elif classification == "ignore":
             print(f"🚫 Classification: IGNORE - This email can be safely ignored")
             goto = END
-            update = {"classification_decision": classification}
+            update = {
+                "classification_decision": classification,
+                "deterministic_reply_emitted": prev_deterministic_flag,
+            }
         else:
             print(f"[triage] Unexpected classification '{classification}', defaulting to respond")
             goto = "response_agent"
             update = {
                 "classification_decision": "respond",
                 "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+                "deterministic_reply_emitted": prev_deterministic_flag,
             }
-
-        if trace:
             trace.set_outputs(f"classification={classification}; goto={goto}")
     if reminder_actions:
         update = dict(update)
@@ -548,7 +561,12 @@ def triage_router_task(
             dispatch_actions.extend(create_actions)
 
         if dispatch_actions:
-            staged = register_reminder_actions(reminder_thread_id, dispatch_actions, post_dispatch_target)
+            staged = register_reminder_actions(
+                reminder_thread_id,
+                dispatch_actions,
+                post_dispatch_target,
+                origin="triage_router",
+            )
             update.update(staged)
             goto = "apply_reminder_actions_node"
 
@@ -559,6 +577,12 @@ def triage_router_task(
                 print(f"[reminder] Failed to persist pending actions for {reminder_thread_id}: {exc}")
             update["pending_reminder_actions"] = create_actions
             update["pending_reminder_thread_id"] = reminder_thread_id
+            # Ensure the dispatcher knows to continue toward the HITL node even when no
+            # immediate reminder actions are staged (e.g., notify/only-create scenarios).
+            update.setdefault("reminder_actions", [])
+            update["reminder_thread_id"] = reminder_thread_id
+            update["reminder_next_node"] = "triage_interrupt_handler"
+            update["reminder_dispatch_origin"] = "triage_router"
         else:
             update["pending_reminder_actions"] = []
             update["pending_reminder_thread_id"] = None
@@ -605,6 +629,15 @@ def triage_interrupt_handler_task(
     Raises:
         ValueError: If the human interrupt response type is unrecognized.
     """
+    if state.get("triage_interrupt_completed"):
+        return Command(
+            goto="response_agent",
+            update={
+                "triage_interrupt_completed": True,
+                "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
+            },
+        )
+
     author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
     messages = [{"role": "user", "content": f"Email to notify user about: {email_markdown}"}]
@@ -654,6 +687,8 @@ def triage_interrupt_handler_task(
             "messages": messages,
             "pending_reminder_actions": [],
             "pending_reminder_thread_id": None,
+            "triage_interrupt_completed": state.get("triage_interrupt_completed", False),
+            "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
         }
 
         if response["type"] == "response":
@@ -666,10 +701,16 @@ def triage_interrupt_handler_task(
             )
             goto = "response_agent"
             if pending_actions:
-                staged = register_reminder_actions(pending_thread_id, pending_actions, "response_agent")
+                staged = register_reminder_actions(
+                    pending_thread_id,
+                    pending_actions,
+                    "response_agent",
+                    origin="triage_hitl_response",
+                )
                 if staged.get("reminder_actions"):
                     goto = "apply_reminder_actions_node"
                 update_payload.update(staged)
+                update_payload["triage_interrupt_completed"] = True
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
                 except Exception as exc:  # noqa: BLE001
@@ -678,6 +719,7 @@ def triage_interrupt_handler_task(
             messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
             update_memory(store, ("email_assistant", "triage_preferences"), messages)
             goto = END
+            update_payload["triage_interrupt_completed"] = True
             if pending_thread_id:
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
@@ -686,6 +728,7 @@ def triage_interrupt_handler_task(
         elif response["type"] == "accept":
             print("INFO: User accepted notification. Ending workflow.")
             goto = END
+            update_payload["triage_interrupt_completed"] = True
             if pending_thread_id:
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
@@ -696,6 +739,9 @@ def triage_interrupt_handler_task(
 
         if trace:
             trace.set_outputs(f"goto={goto}; response={response['type']}")
+
+    if goto in {"response_agent", END}:
+        update_payload["triage_interrupt_completed"] = True
 
     return Command(goto=goto, update=update_payload)
 
@@ -731,6 +777,14 @@ def llm_call_task(state: State, store: BaseStore):
     recipient_compat = eval_mode or (
         os.getenv("EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS", "").lower() in ("1", "true", "yes")
     )
+    deterministic_reply_emitted = bool(state.get("deterministic_reply_emitted", False))
+
+    def _return(messages, emitted=False):
+        flag = deterministic_reply_emitted or emitted
+        return {
+            "messages": messages,
+            "deterministic_reply_emitted": flag,
+        }
     cal_preferences = get_memory(store, ("email_assistant", "cal_preferences"), default_cal_preferences)
     response_preferences = get_memory(store, ("email_assistant", "response_preferences"), default_response_preferences)
     gmail_prompt = agent_system_prompt_hitl_memory.replace("write_email", "send_email_tool").replace("check_calendar_availability", "check_calendar_tool").replace("schedule_meeting", "schedule_meeting_tool")
@@ -940,7 +994,7 @@ def llm_call_task(state: State, store: BaseStore):
             and done_count >= 1
             and not is_scheduling_context
         )
-        if needs_reply_injection:
+        if needs_reply_injection and not deterministic_reply_emitted:
             # Build a short contextual reply like in eval-mode defaults
             text = text_for_heuristic
             if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
@@ -987,7 +1041,7 @@ def llm_call_task(state: State, store: BaseStore):
                 },
                 {"name": "Done", "args": {"done": True}, "id": "done"},
             ]
-            return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+            return _return([AIMessage(content="", tool_calls=tool_calls)], emitted=True)
     except Exception:
         # If any error occurs in the fallback logic, continue with normal flow
         pass
@@ -1017,7 +1071,7 @@ def llm_call_task(state: State, store: BaseStore):
                 "args": {"content": "Should this email thread be moved to Spam?"},
                 "id": "question",
             }]
-            return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+            return _return([AIMessage(content="", tool_calls=tool_calls)])
 
         tool_calls = []
         # Heuristic: 90-minute planning meeting → check calendar then reply (no scheduling)
@@ -1129,7 +1183,8 @@ def llm_call_task(state: State, store: BaseStore):
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
 
-        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+        emit = any(tc.get("name") == "send_email_tool" for tc in tool_calls)
+        return _return([AIMessage(content="", tool_calls=tool_calls)], emitted=emit)
     msg = None
     with trace_stage(
         "response_agent.llm",
@@ -1312,8 +1367,9 @@ def llm_call_task(state: State, store: BaseStore):
                 "args": {"content": "Should this email thread be moved to Spam?"},
                 "id": "question",
             }]
-            msg = AIMessage(content="", tool_calls=tool_calls)
-            return {"messages": [msg]}
+        msg = AIMessage(content="", tool_calls=tool_calls)
+        emit = any(tc.get("name") == "send_email_tool" for tc in tool_calls)
+        return _return([msg], emitted=emit)
 
         tool_calls = []
         if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
@@ -1419,7 +1475,8 @@ def llm_call_task(state: State, store: BaseStore):
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
 
         msg = AIMessage(content="", tool_calls=tool_calls)
-    return {"messages": [msg]}
+    emit_final = any(tc.get("name") == "send_email_tool" for tc in getattr(msg, "tool_calls", []) or [])
+    return _return([msg], emitted=emit_final)
 
 
 def llm_call(state: State, store: BaseStore):
@@ -1684,6 +1741,9 @@ def interrupt_handler_task(
                 elif tool_call["name"] == "schedule_meeting_tool":
                     update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
 
+        if goto in {END, "response_agent"}:
+            update_payload["triage_interrupt_completed"] = True
+
         if trace:
             handled = sum(
                 1
@@ -1755,22 +1815,25 @@ def should_continue(
             if "Done" in tool_names:
                 author_l = (author or "").lower()
                 thread_l = (email_thread or "").lower()
-                is_no_reply = (
-                    ("no-reply" in author_l)
-                    or ("do not reply" in thread_l)
-                    or ("please do not reply" in thread_l)
-                )
-                if is_no_reply:
+                if state.get("deterministic_reply_emitted"):
                     decision = "mark_as_read_node"
                 else:
-                    all_tool_names: list[str] = []
-                    for message in state.get("messages", []):
-                        if getattr(message, "tool_calls", None):
-                            try:
-                                all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
-                            except Exception:
-                                pass
-                    decision = "llm_call" if "send_email_tool" not in all_tool_names else "mark_as_read_node"
+                    is_no_reply = (
+                        ("no-reply" in author_l)
+                        or ("do not reply" in thread_l)
+                        or ("please do not reply" in thread_l)
+                    )
+                    if is_no_reply:
+                        decision = "mark_as_read_node"
+                    else:
+                        all_tool_names: list[str] = []
+                        for message in state.get("messages", []):
+                            if getattr(message, "tool_calls", None):
+                                try:
+                                    all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
+                                except Exception:
+                                    pass
+                        decision = "llm_call" if "send_email_tool" not in all_tool_names else "mark_as_read_node"
             else:
                 decision = "interrupt_handler"
         else:
@@ -1878,11 +1941,15 @@ def mark_as_read_node_task(
                 "messages": [{"role": "assistant", "content": summary}],
                 "assistant_reply": summary,
                 "email_markdown": email_markdown,
+                "deterministic_reply_emitted": False,
+                "triage_interrupt_completed": False,
             }
         else:
             result_payload = {
                 "assistant_reply": "",
                 "email_markdown": email_markdown,
+                "deterministic_reply_emitted": False,
+                "triage_interrupt_completed": False,
             }
 
         if tool_trace:
@@ -1954,13 +2021,6 @@ overall_workflow = (
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
     .add_edge("triage_router", "apply_reminder_actions_node")
-    .add_edge("triage_router", "response_agent")
-    .add_edge("triage_router", "triage_interrupt_handler")
-    .add_edge("apply_reminder_actions_node", "response_agent")
-    .add_edge("apply_reminder_actions_node", "triage_interrupt_handler")
-    .add_edge("apply_reminder_actions_node", END)
-    .add_edge("triage_interrupt_handler", "apply_reminder_actions_node")
-    .add_edge("triage_interrupt_handler", "response_agent")
     .add_edge("response_agent", END)
 )
 
