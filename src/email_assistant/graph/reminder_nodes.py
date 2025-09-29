@@ -99,8 +99,8 @@ def register_reminder_actions(
 
 def apply_reminder_actions_node(
     state: Dict[str, Any],
-    store: Any = None,
-    runtime: Any = None,
+    _store: Any = None,
+    _runtime: Any = None,
 ) -> Command[Literal["response_agent", "triage_interrupt_handler", "__end__"]]:
     """Apply pending reminder actions atomically and route to the next node."""
 
@@ -140,16 +140,21 @@ def apply_reminder_actions_node(
             outcome.get("cancelled") if isinstance(outcome, dict) else None,
             outcome.get("created") if isinstance(outcome, dict) else None,
         )
-        if store is not None and thread_key:
+        # Clear staged actions so subsequent workflow steps do not re-dispatch the same batch.
+        state["reminder_actions"] = []  # type: ignore[index]
+        state["reminder_thread_id"] = None  # type: ignore[index]
+        state["reminder_next_node"] = None  # type: ignore[index]
+        state["reminder_dispatch_origin"] = None  # type: ignore[index]
+        if _store is not None and thread_key:
             try:
-                store.delete(("reminders", "pending_actions"), thread_key)
+                _store.delete(("reminders", "pending_actions"), thread_key)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Reminder dispatcher: failed clearing pending actions for %s: %s",
                     thread_key,
                     exc,
                 )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.exception("Reminder dispatcher: failed to apply actions for %s", thread_key)
         raise
 
@@ -158,10 +163,6 @@ def apply_reminder_actions_node(
     if origin == "triage_hitl_response" and has_create:
         target = "response_agent"
     update = {
-        "reminder_actions": [],
-        "reminder_thread_id": None,
-        "reminder_next_node": None,
         "reminder_dispatch_outcome": outcome,
-        "reminder_dispatch_origin": None,
     }
     return Command(goto=target, update=update)

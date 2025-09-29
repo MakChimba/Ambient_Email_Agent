@@ -6,4 +6,4 @@ version = "0.1.0"
 
 _LOG_PATH = _setup_logging()
 
-__all__ = ["version", "_LOG_PATH"]
+__all__ = ["_LOG_PATH", "version"]

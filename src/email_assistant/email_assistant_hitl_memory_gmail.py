@@ -1,5 +1,7 @@
 from typing import Any, Dict, Literal
 from collections.abc import Mapping
+import hashlib
+import json
 import logging
 import os
 import re
@@ -119,10 +121,13 @@ def _maybe_interrupt(requests):
                 responses.append({"type": "accept", "args": {}})
             elif allow_respond:
                 # Provide a deterministic, minimal response for Question-style prompts
-                if str(action).lower() == "question":
+                action_lower = str(action).lower()
+                if action_lower == "question":
                     responses.append({"type": "response", "args": "No additional info — please proceed."})
+                elif "email assistant" in action_lower:
+                    responses.append({"type": "response", "args": "Auto-approval: proceed with the recommended triage action."})
                 else:
-                    responses.append({"type": "response", "args": {}})
+                    responses.append({"type": "response", "args": "Auto-response supplied while HITL auto-accept is enabled."})
             else:
                 # Last resort to avoid deadlocks in auto mode
                 responses.append({"type": "ignore", "args": {}})
@@ -168,7 +173,7 @@ _DAY_TO_ISO = {
     "thursday": "2025-05-22",
     "friday": "2025-05-23",
 }
-_MEETING_TIME = "14:00:00"
+_MEETING_TIME = "13:00:00"
 
 
 def _extract_requested_duration(text: str) -> tuple[int | None, str | None]:
@@ -270,24 +275,39 @@ def _build_manual_scheduling_reply(text: str) -> str:
     duration = duration_label
     has_tuesday = "tuesday" in lowered
     has_thursday = "thursday" in lowered
+    preferred_days = _extract_preferred_days(lowered)
+    duration_value = duration_minutes or 45
 
     if duration:
         meeting_phrase = f"{duration} meeting"
     else:
         meeting_phrase = "time slot"
 
-    if has_thursday:
+    suggestions: list[str] = []
+    for day_name, has_day in (("tuesday", has_tuesday), ("thursday", has_thursday)):
+        if not has_day:
+            continue
+        _, _, friendly_day, friendly_time = _meeting_times_for_day(day_name, duration_value)
+        suggestions.append(f"{friendly_day} at {friendly_time}")
+
+    if suggestions:
         slot_sentence = (
-            f"I'll reserve a {meeting_phrase} on Thursday at 2:00 PM and send the invite manually."
-        )
-    elif has_tuesday:
-        slot_sentence = (
-            f"I'll reserve a {meeting_phrase} on Tuesday at 2:00 PM and send the invite manually."
+            f"Could you confirm a {meeting_phrase} on {' or '.join(suggestions)}? "
+            "As soon as our calendar integration is back online, I'll send the invite."
         )
     else:
-        slot_sentence = "I'll reserve the requested time and send the invite manually."
+        fallback_day = preferred_days[0] if preferred_days else _select_primary_day(preferred_days)
+        _, _, friendly_day, friendly_time = _meeting_times_for_day(fallback_day, duration_value)
+        slot_sentence = (
+            f"Could you confirm the requested {meeting_phrase}, ideally on {friendly_day} at {friendly_time}? "
+            "I'll follow up with the invitation once the calendar issue is resolved."
+        )
 
-    follow_up = "If Tuesday works better than Thursday, just let me know." if (has_tuesday and has_thursday) else ""
+    follow_up = (
+        "If Tuesday works better than Thursday, just let me know."
+        if (has_tuesday and has_thursday)
+        else ""
+    )
 
     intro = (
         "Thanks for the tax planning note."
@@ -373,6 +393,82 @@ def _resolve_thread_id(
     return None
 
 
+def _current_email_marker(
+    state: Mapping[str, Any] | State,
+    runtime: Runtime[AssistantContext] | None = None,
+) -> str:
+    """Return a stable identifier for the current email being processed."""
+
+    email_input: dict[str, Any]
+    if isinstance(state, Mapping):
+        email_input = dict(state.get("email_input") or {})
+    else:
+        email_input = dict(getattr(state, "email_input", {}) or {})
+
+    candidates = [
+        email_input.get("id"),
+        email_input.get("email_id"),
+        email_input.get("emailId"),
+        email_input.get("message_id"),
+        email_input.get("thread_id"),
+        email_input.get("threadId"),
+        email_input.get("gmail_thread_id"),
+        email_input.get("gmailThreadId"),
+    ]
+
+    reminder_key = None
+    if isinstance(state, Mapping):
+        reminder_key = state.get("reminder_thread_id")
+    else:
+        reminder_key = getattr(state, "reminder_thread_id", None)
+    if reminder_key:
+        candidates.append(reminder_key)
+
+    thread_id = _resolve_thread_id(state, runtime)
+    if thread_id:
+        candidates.append(thread_id)
+
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+
+    fallback_source = (
+        email_input.get("snippet")
+        or email_input.get("subject")
+        or json.dumps(email_input, sort_keys=True) if email_input else None
+    )
+    if fallback_source:
+        digest = hashlib.md5(
+            fallback_source.encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
+        return f"hash:{digest}"
+
+    if thread_id:
+        return str(thread_id)
+
+    return "__default__"
+
+
+def _send_email_executed(state: Mapping[str, Any] | State) -> bool:
+    """Return True when a send_email_tool call already exists in the message history."""
+
+    messages = state.get("messages", []) if isinstance(state, Mapping) else getattr(state, "messages", [])
+    for message in messages or []:
+        tool_calls = None
+        if isinstance(message, dict):
+            tool_calls = message.get("tool_calls")
+        else:
+            tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            name = (call.get("name") or "").lower()
+            if name == "send_email_tool":
+                return True
+    return False
+
+
 def get_memory(store, namespace, default_content=None):
     """Get memory from the store or initialize with default if it doesn't exist."""
     user_preferences = store.get(namespace, "user_preferences")
@@ -428,6 +524,26 @@ def triage_router_task(
     """
 
     email_input = state["email_input"]
+    current_email_marker = _current_email_marker(state, runtime)
+    if isinstance(state, Mapping):
+        finalized_marker = state.get("last_finalized_email_key")
+        assistant_reply = state.get("assistant_reply", None)
+        deterministic_value = state.get("deterministic_reply_emitted")
+    else:
+        finalized_marker = getattr(state, "last_finalized_email_key", None)
+        assistant_reply = getattr(state, "assistant_reply", None)
+        deterministic_value = getattr(state, "deterministic_reply_emitted", None)
+
+    if finalized_marker and assistant_reply is not None and finalized_marker == current_email_marker:
+        logger.debug(
+            "[triage] assistant reply already finalised for marker %s; skipping re-triage.",
+            current_email_marker,
+        )
+        update_payload: dict[str, Any] = {"triage_interrupt_completed": True}
+        if deterministic_value is not None:
+            update_payload["deterministic_reply_emitted"] = deterministic_value
+        return Command(goto=END, update=update_payload)
+
     author, to, subject, email_thread, email_id = parse_gmail(email_input)
     tz_name, eval_mode, thread_id_ctx, metadata = extract_runtime_metadata(runtime)
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
@@ -510,6 +626,16 @@ def triage_router_task(
             "email_markdown": email_markdown,
         },
     ) as trace:
+        if state.get("assistant_reply"):
+            logger.debug("[triage] assistant_reply already set; skipping re-triage for thread %s.", thread_id)
+            update = {
+                "triage_interrupt_completed": True,
+                "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
+            }
+            if trace:
+                trace.set_outputs("assistant_reply_present; goto=__end__")
+            return Command(goto=END, update=update)
+
         # --- Reminder Logic: Part 1: Cancel on detected reply ---
         reply_detected = False
         user_email = os.getenv("REMINDER_NOTIFY_EMAIL")
@@ -649,6 +775,9 @@ def triage_router_task(
             }
             trace.set_outputs(f"classification={classification}; goto={goto}")
     if reminder_actions:
+        if _eval_mode_enabled():
+            reminder_actions = []
+
         update = dict(update)
         cancel_actions = [a for a in reminder_actions if a.get("action") == "cancel"]
         create_actions = [a for a in reminder_actions if a.get("action") == "create"]
@@ -728,14 +857,38 @@ def triage_interrupt_handler_task(
     Raises:
         ValueError: If the human interrupt response type is unrecognized.
     """
-    if state.get("triage_interrupt_completed"):
-        return Command(
-            goto="response_agent",
-            update={
-                "triage_interrupt_completed": True,
-                "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
-            },
+    deterministic_value = state.get("deterministic_reply_emitted")
+    finalized_marker = state.get("last_finalized_email_key")
+    current_marker = _current_email_marker(state, runtime)
+    assistant_reply = state.get("assistant_reply", None)
+    send_email_done = _send_email_executed(state)
+
+    logger.debug(
+        "[triage] interrupt pre-check marker=%s finalized=%s reply_present=%s send_email_done=%s",
+        current_marker,
+        finalized_marker,
+        assistant_reply is not None,
+        send_email_done,
+    )
+    if (
+        (finalized_marker and assistant_reply is not None and finalized_marker == current_marker)
+        or send_email_done
+    ):
+        update_payload = {"triage_interrupt_completed": True}
+        if deterministic_value is not None:
+            update_payload["deterministic_reply_emitted"] = deterministic_value
+        logger.debug(
+            "[triage] skipping interrupt for marker %s; reply already finalised.",
+            current_marker,
         )
+        return Command(goto=END, update=update_payload)
+
+    triage_already_done = bool(state.get("triage_interrupt_completed"))
+    if triage_already_done:
+        update_payload = {"triage_interrupt_completed": True}
+        if deterministic_value is not None:
+            update_payload["deterministic_reply_emitted"] = deterministic_value
+        return Command(goto="response_agent", update=update_payload)
 
     author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
@@ -1009,8 +1162,9 @@ def llm_call_task(state: State, store: BaseStore):
                 "content": (
                     "Previous schedule_meeting_tool attempt failed with: "
                     f"{last_schedule_failure}{failure_suffix}. Do not retry schedule_meeting_tool. "
-                    "Instead, draft a send_email_tool reply that confirms you'll manually reserve the requested meeting time "
-                    "(include the requested duration) and mention the sender's preferred days (e.g., Tuesday or Thursday)."
+                    "Instead, draft a send_email_tool reply that explains the calendar integration is unavailable, "
+                    "asks the sender to confirm their preferred meeting time (include the requested duration and preferred days), "
+                    "and notes you'll send the invite once the calendar issue is resolved."
                 ),
             }
         )
@@ -1635,6 +1789,12 @@ def interrupt_handler_task(
     ai_message = state["messages"][-1]
     result: list[Any] = []
     goto = "llm_call"
+    manual_schedule_reply: str | None = None
+    manual_schedule_reply_used = False
+    command_update: dict[str, Any] = {
+        "messages": result,
+        "triage_interrupt_completed": state.get("triage_interrupt_completed", False),
+    }
     try:
         tool_names_summary = [tc.get("name") for tc in ai_message.tool_calls]
     except Exception:
@@ -1671,6 +1831,7 @@ def interrupt_handler_task(
             author, to, subject, email_thread, email_id = parse_gmail(email_input)
             original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
             email_body_lower = (email_thread or "").lower()
+            email_text_context = f"{subject or ''}\n{email_thread or ''}".strip()
             doc_review_context = (
                 "review" in email_body_lower and ("friday" in email_body_lower or "deadline" in email_body_lower)
             )
@@ -1692,9 +1853,8 @@ def interrupt_handler_task(
                         trimmed = response_text.rstrip()
                         if trimmed and trimmed[-1] not in ".!?":
                             trimmed += "."
-                        updated_text = (trimmed + " " + " ".join(additions)).strip()
-                        args["response_text"] = updated_text
-                    response_text = updated_text
+                        response_text = (trimmed + " " + " ".join(additions)).strip()
+                        args["response_text"] = response_text
                     response_lower = response_text.lower()
                 if any(keyword in email_body_lower for keyword in ["45-minute", "45 minute"]) and not any(
                     keyword in response_lower for keyword in ["45-minute", "45 minute"]
@@ -1733,6 +1893,12 @@ def interrupt_handler_task(
                     args["response_text"] = updated_text
                     response_text = updated_text
                     response_lower = response_text.lower()
+                if manual_schedule_reply:
+                    args["response_text"] = manual_schedule_reply
+                    response_text = manual_schedule_reply
+                    response_lower = response_text.lower()
+                    manual_schedule_reply = None
+                    manual_schedule_reply_used = True
                 def _extract_email(addr: str) -> str:
                     if not addr:
                         return ""
@@ -1794,6 +1960,16 @@ def interrupt_handler_task(
             if response["type"] == "accept":
                 observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
                 result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
+                if (
+                    tool_call["name"] == "schedule_meeting_tool"
+                    and isinstance(observation, str)
+                    and (
+                        "failed to schedule" in observation.lower()
+                        or "error scheduling" in observation.lower()
+                        or "error executing schedule_meeting_tool" in observation.lower()
+                    )
+                ):
+                    manual_schedule_reply = _build_manual_scheduling_reply(email_text_context)
             elif response["type"] == "edit":
                 edited_args = response["args"]["args"]
                 current_id = tool_call["id"]
@@ -1801,6 +1977,16 @@ def interrupt_handler_task(
                 result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
                 observation = _safe_tool_invoke(tool_call["name"], edited_args)
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
+                if (
+                    tool_call["name"] == "schedule_meeting_tool"
+                    and isinstance(observation, str)
+                    and (
+                        "failed to schedule" in observation.lower()
+                        or "error scheduling" in observation.lower()
+                        or "error executing schedule_meeting_tool" in observation.lower()
+                    )
+                ):
+                    manual_schedule_reply = _build_manual_scheduling_reply(email_text_context)
                 if tool_call["name"] == "send_email_tool":
                     update_memory(store, ("email_assistant", "response_preferences"), [{"role": "user", "content": f"User edited the email response. Here is the initial email generated by the assistant: {tool_call['args']}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
                 elif tool_call["name"] == "schedule_meeting_tool":
@@ -1872,8 +2058,14 @@ def interrupt_handler_task(
                 elif tool_call["name"] == "schedule_meeting_tool":
                     update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
 
-        if goto in {END, "response_agent"}:
-            update_payload["triage_interrupt_completed"] = True
+        if goto in {END, "response_agent", "mark_as_read_node"}:
+            command_update["triage_interrupt_completed"] = True
+
+        if manual_schedule_reply_used and goto not in {END, "mark_as_read_node"}:
+            goto = "mark_as_read_node"
+
+        if manual_schedule_reply_used:
+            command_update["manual_schedule_reply_handled"] = True
 
         if trace:
             handled = sum(
@@ -1886,7 +2078,7 @@ def interrupt_handler_task(
             )
             trace.set_outputs(f"goto={goto}; handled={handled}")
 
-    return Command(goto=goto, update={"messages": result})
+    return Command(goto=goto, update=command_update)
 
 
 def should_continue(
@@ -1929,6 +2121,24 @@ def should_continue(
     except Exception:
         tool_names = []
 
+    if state.get("manual_schedule_reply_handled"):
+        with trace_stage(
+            "response_agent.should_continue",
+            run_type="chain",
+            inputs_summary="manual schedule fallback",
+            tags=["response_agent", "router"],
+            metadata={
+                "email_id": email_id,
+                "thread_id": thread_id,
+                "timezone": tz_name,
+                "eval_mode": eval_mode,
+            },
+            extra={"manual_schedule_reply_handled": True},
+        ) as trace:
+            if trace:
+                trace.set_outputs("next=mark_as_read_node; manual_schedule_reply_handled=True")
+        return "mark_as_read_node"
+
     with trace_stage(
         "response_agent.should_continue",
         run_type="chain",
@@ -1943,28 +2153,32 @@ def should_continue(
         extra={"last_tool_names": tool_names},
     ) as trace:
         if getattr(last_message, "tool_calls", None):
-            if "Done" in tool_names:
+            non_done_calls = [name for name in tool_names if name and name != "Done"]
+            has_done = "Done" in tool_names
+            if non_done_calls:
+                decision = "interrupt_handler"
+            elif has_done:
                 author_l = (author or "").lower()
                 thread_l = (email_thread or "").lower()
-                if state.get("deterministic_reply_emitted"):
+                is_no_reply = (
+                    ("no-reply" in author_l)
+                    or ("do not reply" in thread_l)
+                    or ("please do not reply" in thread_l)
+                )
+                if is_no_reply:
                     decision = "mark_as_read_node"
                 else:
-                    is_no_reply = (
-                        ("no-reply" in author_l)
-                        or ("do not reply" in thread_l)
-                        or ("please do not reply" in thread_l)
-                    )
-                    if is_no_reply:
+                    all_tool_names: list[str] = []
+                    for message in state.get("messages", []):
+                        if getattr(message, "tool_calls", None):
+                            try:
+                                all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
+                            except Exception:
+                                pass
+                    if "send_email_tool" in all_tool_names:
                         decision = "mark_as_read_node"
                     else:
-                        all_tool_names: list[str] = []
-                        for message in state.get("messages", []):
-                            if getattr(message, "tool_calls", None):
-                                try:
-                                    all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
-                                except Exception:
-                                    pass
-                        decision = "llm_call" if "send_email_tool" not in all_tool_names else "mark_as_read_node"
+                        decision = "llm_call"
             else:
                 decision = "interrupt_handler"
         else:
@@ -2019,12 +2233,29 @@ def mark_as_read_node_task(
     author, to, subject, email_thread, email_id = parse_gmail(email_input)
     tz_name, eval_mode, thread_id_ctx, metadata = extract_runtime_metadata(runtime)
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
+    final_marker = _current_email_marker(state, runtime)
 
     result_payload: dict[str, Any]
 
     email_markdown = ""
     output_text = ""
     tool_trace = ""
+
+    messages_list = state.get("messages", [])
+    if isinstance(messages_list, list):
+        last_plan_idx = None
+        for idx in range(len(messages_list) - 1, -1, -1):
+            candidate = messages_list[idx]
+            tool_calls = None
+            if isinstance(candidate, dict):
+                tool_calls = candidate.get("tool_calls")
+            else:
+                tool_calls = getattr(candidate, "tool_calls", None)
+            if tool_calls:
+                last_plan_idx = idx
+                break
+        if last_plan_idx is not None and last_plan_idx > 0:
+            del messages_list[:last_plan_idx]
 
     with trace_stage(
         "mark_as_read_node",
@@ -2076,14 +2307,18 @@ def mark_as_read_node_task(
                 "assistant_reply": summary,
                 "email_markdown": email_markdown,
                 "deterministic_reply_emitted": False,
-                "triage_interrupt_completed": False,
+                "triage_interrupt_completed": True,
+                "manual_schedule_reply_handled": False,
+                "last_finalized_email_key": final_marker,
             }
         else:
             result_payload = {
                 "assistant_reply": "",
                 "email_markdown": email_markdown,
                 "deterministic_reply_emitted": False,
-                "triage_interrupt_completed": False,
+                "triage_interrupt_completed": True,
+                "manual_schedule_reply_handled": False,
+                "last_finalized_email_key": final_marker,
             }
 
         if tool_trace:

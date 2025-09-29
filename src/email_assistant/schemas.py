@@ -28,6 +28,7 @@ class State(MessagesState):
     assistant_reply: str | None = None
     tool_trace: str | None = None
     email_markdown: str | None = None
+    last_finalized_email_key: str | None = None
     # Reminder workflow coordination fields
     reminder_actions: List[Dict[str, Any]] | None = None
     reminder_thread_id: str | None = None

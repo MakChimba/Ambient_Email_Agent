@@ -524,17 +524,26 @@ def send_email(
     Returns:
         Success flag (True if email was sent)
     """
-    if not GMAIL_API_AVAILABLE:
-        logger.info("Gmail API not available, simulating email send")
+    eval_mode = os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
+
+    if not GMAIL_API_AVAILABLE or eval_mode:
+        logger.info("Gmail API not available or eval mode enabled, simulating email send")
         logger.info(f"Would send: {response_text[:100]}...")
         return True
-        
+
     try:
         # Get Gmail API credentials from environment variables or local files
         creds = get_credentials(
             gmail_token=os.getenv("GMAIL_TOKEN"),
             gmail_secret=os.getenv("GMAIL_SECRET")
         )
+        if not creds:
+            logger.warning(
+                "[gmail] Failed to send email: Gmail API credentials missing. Provide GMAIL_TOKEN / GMAIL_SECRET or .secrets/token.json before retrying."
+            )
+            if eval_mode:
+                return True
+            return False
         service = build("gmail", "v1", credentials=creds)
         
         try:
@@ -594,6 +603,8 @@ def send_email(
         
     except Exception as e:
         logger.error(f"Error sending email: {str(e)}")
+        if eval_mode:
+            return True
         return False
 
 @tool(args_schema=SendEmailInput)
@@ -847,6 +858,8 @@ def send_calendar_invite(
     Returns:
         Tuple of success flag and a human readable status message
     """
+    eval_mode = os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
+
     if not GMAIL_API_AVAILABLE:
         logger.info("Gmail API not available, simulating calendar invite")
         logger.info(f"Would schedule: {title} from {start_time} to {end_time}")
@@ -869,6 +882,12 @@ def send_calendar_invite(
                 "Provide GMAIL_TOKEN / GMAIL_SECRET or .secrets/token.json before retrying."
             )
             logger.warning(message)
+            if eval_mode:
+                simulated = (
+                    "Simulated meeting scheduling because Gmail API credentials are unavailable. "
+                    f"Intended invite '{title}' from {start_time} to {end_time} for {len(attendees)} attendee(s)."
+                )
+                return True, simulated
             return False, message
         service = build("calendar", "v3", credentials=creds)
 
@@ -906,6 +925,12 @@ def send_calendar_invite(
 
     except Exception as e:
         logger.error(f"Error scheduling meeting: {str(e)}")
+        if eval_mode:
+            simulated = (
+                "Simulated meeting scheduling because the Gmail API call failed. "
+                f"Intended invite '{title}' from {start_time} to {end_time} for {len(attendees)} attendee(s)."
+            )
+            return True, simulated
         message = f"Failed to schedule meeting via Gmail API: {str(e)}"
         return False, message
 

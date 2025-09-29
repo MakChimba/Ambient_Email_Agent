@@ -31,12 +31,40 @@ def _fallback_basic_config(level: int) -> None:
 
 
 def _to_level(value: str | None) -> int:
-    if not value:
+    if value is None:
         return logging.INFO
-    try:
-        return logging.getLevelName(value.upper())  # type: ignore[arg-type]
-    except Exception:
+
+    token = value.strip()
+    if not token:
         return logging.INFO
+
+    numeric_token = token.lstrip("+-")
+    if numeric_token.isdigit():
+        try:
+            return int(token)
+        except ValueError:
+            return logging.INFO
+
+    check_level = getattr(logging, "_checkLevel", None)
+    if callable(check_level):  # pragma: no branch - CPython exposes _checkLevel
+        try:
+            resolved = check_level(token)  # type: ignore[misc]
+        except (TypeError, ValueError):
+            resolved = None
+        else:
+            if isinstance(resolved, int):
+                return resolved
+            try:
+                return int(resolved)
+            except (TypeError, ValueError):
+                resolved = None
+
+    name = token.upper()
+    level = getattr(logging, "_nameToLevel", {}).get(name)  # type: ignore[attr-defined]
+    if isinstance(level, int):
+        return level
+
+    return logging.INFO
 
 
 def setup_logging() -> Path:

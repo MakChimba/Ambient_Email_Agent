@@ -108,6 +108,7 @@ Eliminate reminder routing inconsistencies in the Gmail HITL workflow by (1) ali
 
 - Added store cleanup inside `apply_reminder_actions_node` so successful reminder batches empty `pending_actions` in the LangGraph store and state. Offline reminder pytest now completes without the triage loop.
 - Captured stack trace for the lingering evaluation-mode failure (`triage_interrupt_completed` double-write) while rerunning the response tool-call suite for diagnosis.
+- Removed the static `overall_workflow` edges from triage to HITL/response so LangGraph follows each node’s `Command(goto=...)`. This stops duplicate `response_agent` executions when HITL auto-accept is enabled and keeps reminder dispatch routing untouched.
 
 ## Testing Notes — 2025-09-28
 
@@ -133,6 +134,8 @@ Command | Result | Notes
 `uv run pytest tests/test_reminders.py` | ✅ | Confirmed after remapping the dispatcher routing — reminder apply node now exits cleanly to the response path without looping.
 `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` | ✅ | Deterministic schedule plans now honour requested durations (60/90 minutes), avoid duplicate tool loops, and draft replies aligned with dataset expectations.
 `pytest tests/test_live_reminders.py --agent-module=email_assistant_hitl_memory_gmail` | ✅ | Live reminder create/cancel flow now stages actions once, dispatcher clears them, and reminders persist across the HITL hand-off. Snapshot attached in pytest logs.
+`HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 EMAIL_ASSISTANT_EVAL_MODE=1 EMAIL_ASSISTANT_LLM_JUDGE=1 EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS=1 GOOGLE_API_KEY=offline-test-key .venv/bin/pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` | ✅ | Confirms the streamlined graph only triggers one `send_email_tool`/`Done` pair per run; LLM judge passes using the offline stub with no triage re-entry.
+`HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 EMAIL_ASSISTANT_EVAL_MODE=1 GOOGLE_API_KEY=offline-test-key .venv/bin/pytest tests/test_reminders.py` | ✅ | Reminder dispatcher behaviour unchanged after graph rewrite; staged action batches clear correctly and no regressions in cancellation coverage.
 
 ## Progress — 2025-09-30
 
@@ -140,9 +143,11 @@ Command | Result | Notes
 - Rewired the Gmail HITL graph so `apply_reminder_actions_node` only executes when the router explicitly schedules it, preventing duplicate empty updates on straight-to-response paths.
 - Re-ran `tests/test_live_reminders.py --agent-module=email_assistant_hitl_memory_gmail` (passes) and confirmed `notebooks/reminder_flow.ipynb` already mirrors the dispatcher stages—no notebook edits required today.
 
-## Progress — 2025-10-01
+## Planned Work — 2025-10-01
 
-- Added deterministic duration parsing for eval-mode scheduling so `schedule_meeting_tool` honors 60/90-minute requests, selects a consistent preferred day, and drafts replies that reference slides/collaboration when appropriate.
-- Updated the offline scheduling branch to skip calendar tools for phone-call reminders (annual checkup) while still auto-booking genuine meeting requests.
-- Replaced temporary triage/reminder `print` debugging with structured logger output and re-ran `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` (passes).
-- Introduced shared log piping via `logs/email_assistant.log` so frontend/back-end traces can be tailed in automation; documented the toggle in `AGENTS.md` and verified with `uv run python -c` smoke log writes.
+_Targeted follow-up items slated for completion on 2025-10-01; pending as of the latest review._
+
+- Plan to add deterministic duration parsing for eval-mode scheduling so `schedule_meeting_tool` honors 60/90-minute requests, selects a consistent preferred day, and drafts replies that reference slides/collaboration when appropriate.
+- Plan to update the offline scheduling branch to skip calendar tools for phone-call reminders (annual checkup) while still auto-booking genuine meeting requests.
+- Plan to replace temporary triage/reminder `print` debugging with structured logger output and re-run `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls`.
+- Plan to introduce shared log piping via `logs/email_assistant.log` so frontend/back-end traces can be tailed in automation; document the toggle in `AGENTS.md` and verify with `uv run python -c` smoke log writes.
