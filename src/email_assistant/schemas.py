@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict, Literal
@@ -25,9 +25,15 @@ class State(MessagesState):
     email_input: dict
     classification_decision: Literal["ignore", "respond", "notify"]
     # Optional fields populated at finalization for evaluators/Studio mapping
-    assistant_reply: str | None
-    tool_trace: str | None
-    email_markdown: str | None
+    assistant_reply: str | None = None
+    tool_trace: str | None = None
+    email_markdown: str | None = None
+    # Reminder workflow coordination fields
+    reminder_actions: List[Dict[str, Any]] | None = None
+    reminder_thread_id: str | None = None
+    reminder_next_node: str | None = None
+    reminder_dispatch_origin: str | None = None
+    reminder_dispatch_outcome: Dict[str, Any] | None = None
 
 class EmailData(TypedDict):
     id: str

@@ -575,17 +575,12 @@ def triage_router_task(
                 store.put(("reminders", "pending_actions"), reminder_thread_id, create_actions)
             except Exception as exc:  # noqa: BLE001
                 print(f"[reminder] Failed to persist pending actions for {reminder_thread_id}: {exc}")
-            update["pending_reminder_actions"] = create_actions
-            update["pending_reminder_thread_id"] = reminder_thread_id
             # Ensure the dispatcher knows to continue toward the HITL node even when no
             # immediate reminder actions are staged (e.g., notify/only-create scenarios).
             update.setdefault("reminder_actions", [])
             update["reminder_thread_id"] = reminder_thread_id
             update["reminder_next_node"] = "triage_interrupt_handler"
             update["reminder_dispatch_origin"] = "triage_router"
-        else:
-            update["pending_reminder_actions"] = []
-            update["pending_reminder_thread_id"] = None
 
     return Command(goto=goto, update=update)
 
@@ -642,16 +637,15 @@ def triage_interrupt_handler_task(
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
     messages = [{"role": "user", "content": f"Email to notify user about: {email_markdown}"}]
     tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
-    pending_actions = list(state.get("pending_reminder_actions") or [])
-    pending_thread_id = state.get("pending_reminder_thread_id") or resolve_thread_key(state)
-    if not pending_actions and pending_thread_id:
-        record = store.get(("reminders", "pending_actions"), pending_thread_id)
-        payload = getattr(record, "value", None)
-        if payload:
-            try:
-                pending_actions = list(payload)
-            except TypeError:
-                pending_actions = [payload]
+    pending_actions: list[dict[str, Any]] = []
+    pending_thread_id = resolve_thread_key(state)
+    record = store.get(("reminders", "pending_actions"), pending_thread_id)
+    payload = getattr(record, "value", None)
+    if payload:
+        try:
+            pending_actions = list(payload)
+        except TypeError:
+            pending_actions = [payload]
     request: HumanInterrupt = HumanInterrupt(
         action_request=ActionRequest(
             action=f"Email Assistant: {state['classification_decision']}",
@@ -667,6 +661,8 @@ def triage_interrupt_handler_task(
     )
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
     goto: str = END
+
+    triage_completed = bool(state.get("triage_interrupt_completed", False))
 
     with trace_stage(
         "triage_interrupt_handler",
@@ -685,9 +681,6 @@ def triage_interrupt_handler_task(
 
         update_payload: Dict[str, Any] = {
             "messages": messages,
-            "pending_reminder_actions": [],
-            "pending_reminder_thread_id": None,
-            "triage_interrupt_completed": state.get("triage_interrupt_completed", False),
             "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
         }
 
@@ -710,7 +703,7 @@ def triage_interrupt_handler_task(
                 if staged.get("reminder_actions"):
                     goto = "apply_reminder_actions_node"
                 update_payload.update(staged)
-                update_payload["triage_interrupt_completed"] = True
+                triage_completed = True
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
                 except Exception as exc:  # noqa: BLE001
@@ -719,7 +712,7 @@ def triage_interrupt_handler_task(
             messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
             update_memory(store, ("email_assistant", "triage_preferences"), messages)
             goto = END
-            update_payload["triage_interrupt_completed"] = True
+            triage_completed = True
             if pending_thread_id:
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
@@ -728,7 +721,7 @@ def triage_interrupt_handler_task(
         elif response["type"] == "accept":
             print("INFO: User accepted notification. Ending workflow.")
             goto = END
-            update_payload["triage_interrupt_completed"] = True
+            triage_completed = True
             if pending_thread_id:
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
@@ -741,7 +734,9 @@ def triage_interrupt_handler_task(
             trace.set_outputs(f"goto={goto}; response={response['type']}")
 
     if goto in {"response_agent", END}:
-        update_payload["triage_interrupt_completed"] = True
+        triage_completed = True
+
+    update_payload["triage_interrupt_completed"] = triage_completed
 
     return Command(goto=goto, update=update_payload)
 
@@ -2020,7 +2015,6 @@ overall_workflow = (
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
-    .add_edge("triage_router", "apply_reminder_actions_node")
     .add_edge("response_agent", END)
 )
 

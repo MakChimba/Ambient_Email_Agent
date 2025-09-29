@@ -126,8 +126,6 @@ def apply_reminder_actions_node(
             "reminder_thread_id": None,
             "reminder_next_node": None,
             "reminder_dispatch_origin": None,
-            "pending_reminder_actions": [],
-            "pending_reminder_thread_id": None,
         }
         safe_next = _fallback_target()
         return Command(goto=safe_next, update=update)
@@ -165,7 +163,5 @@ def apply_reminder_actions_node(
         "reminder_next_node": None,
         "reminder_dispatch_outcome": outcome,
         "reminder_dispatch_origin": None,
-        "pending_reminder_actions": [],
-        "pending_reminder_thread_id": None,
     }
     return Command(goto=target, update=update)

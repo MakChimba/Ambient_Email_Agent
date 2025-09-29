@@ -130,3 +130,10 @@ Command | Result | Notes
 --- | --- | ---
 `uv run pytest tests/test_reminders.py` | ✅ | Confirmed after remapping the dispatcher routing — reminder apply node now exits cleanly to the response path without looping.
 `EMAIL_ASSISTANT_EVAL_MODE=1 HITL_AUTO_ACCEPT=1 EMAIL_ASSISTANT_SKIP_MARK_AS_READ=1 uv run pytest tests/test_response.py --agent-module=email_assistant_hitl_memory_gmail -k tool_calls` | ⚠️ | Recursion loop resolved (suite now completes), but offline judge still flags unmet dataset expectations (missing scheduling tool usage/60 minute duration). Logged results for follow-up.
+`pytest tests/test_live_reminders.py --agent-module=email_assistant_hitl_memory_gmail` | ✅ | Live reminder create/cancel flow now stages actions once, dispatcher clears them, and reminders persist across the HITL hand-off. Snapshot attached in pytest logs.
+
+## Progress — 2025-09-30
+
+- Persisted notify-branch reminder creations in the reminder store and trimmed the redundant `pending_reminder_actions` state so LangGraph no longer raises multi-write errors when the dispatcher runs.
+- Rewired the Gmail HITL graph so `apply_reminder_actions_node` only executes when the router explicitly schedules it, preventing duplicate empty updates on straight-to-response paths.
+- Re-ran `tests/test_live_reminders.py --agent-module=email_assistant_hitl_memory_gmail` (passes) and confirmed `notebooks/reminder_flow.ipynb` already mirrors the dispatcher stages—no notebook edits required today.

@@ -201,7 +201,7 @@ Reminders promote important Gmail threads that still need attention. The LangGra
 - `triage_router` gathers reminder intents whenever it classifies a thread as `respond` or `notify`.
   - Cancel actions (e.g., when the user replies to their own reminder) are dispatched immediately.
   - Create actions are dispatched right away only when the workflow continues straight to `response_agent`.
-  - Notify/HITL paths stash create actions in `pending_reminder_actions` until the reviewer approves the reminder.
+  - Notify/HITL paths persist create actions in the reminder store's pending queue until the reviewer approves the reminder.
 - `apply_reminder_actions_node` executes the batch inside a single durable step and clears the queue. It logs results under `reminder_dispatch_outcome` for downstream debugging.
 - `triage_interrupt_handler` replays pending reminder actions after a human chooses to respond; ignore/accept decisions drop the queue without touching the store.
 - `ReminderStore.apply_actions()` guarantees cancel + create sequences execute in one SQLite transaction, preventing orphaned reminders when crashes occur between steps.

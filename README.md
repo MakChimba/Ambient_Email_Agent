@@ -95,7 +95,7 @@ Select the graph that matches your use case (`langgraph.json` lists all availabl
 
 ## Reminders & Follow-ups
 The reminder stack now includes a LangGraph dispatcher plus a background worker:
-- `triage_router` batches cancel/create intents and defers HITL-created reminders via `pending_reminder_actions`.
+- `triage_router` batches cancel/create intents and defers HITL-created reminders by persisting create actions to the reminder store's pending queue until the reviewer approves them.
 - `apply_reminder_actions_node` executes batched operations atomically through `ReminderStore.apply_actions()` and exposes the outcome as `reminder_dispatch_outcome`.
 - `triage_interrupt_handler` replay pending reminder actions only after a reviewer chooses to respond, keeping notify flows HITL-first.
 - `scripts/reminder_worker.py` promotes due reminders:
