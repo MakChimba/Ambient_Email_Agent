@@ -21,6 +21,16 @@ Upgrade context and open follow-ups are tracked in `dev_tickets/LangChain-LangGr
 - `EMAIL_ASSISTANT_TRACE_STAGE` and `EMAIL_ASSISTANT_TRACE_TAGS` feed through to LangSmith so replayed runs carry rollout metadata. Combine with `EMAIL_ASSISTANT_TRACE_PROJECT` to pin traces to a specific workspace bucket.
 - `scripts/run_real_outputs.py --stream` mirrors the production streaming surface outside of Jupyter. Use it to sanity check custom events before recording screenshots or videos. Set `EMAIL_ASSISTANT_TRACE_PROJECT` when you need an alternate LangSmith project base name (the helper still appends the daily suffix automatically).
 
+## Unified Logging
+
+- Importing `email_assistant` now installs a shared file handler so every module (frontend notebook, backend worker, reminder node) writes to `logs/email_assistant.log`.
+- Override the location with `EMAIL_ASSISTANT_LOG_PATH` and adjust verbosity with `EMAIL_ASSISTANT_LOG_LEVEL` (defaults to INFO).
+- The helper only adds the handler once per process, so repeated imports are safe.
+- Tail the file while running tests or LangGraph Studio to get a combined view of router decisions, reminder dispatcher output, and Gmail finalisation:
+  ```bash
+  tail -f logs/email_assistant.log
+  ```
+
 ## Running the Reminder Worker
 
 The reminder worker is a standalone script that should run as a persistent background process to check for due reminders.

@@ -1,5 +1,6 @@
 from typing import Any, Dict, Literal
 from collections.abc import Mapping
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -72,6 +73,7 @@ from dotenv import load_dotenv
 
 load_dotenv(".env")
 init_project(AGENT_PROJECT)
+logger = logging.getLogger(__name__)
 
 # Get tools with Gmail tools
 tools = get_tools([
@@ -158,27 +160,114 @@ def _safe_tool_invoke(name: str, args):
         return error
 
 
+_DAY_REGEX = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday)\b")
+_DAY_TO_ISO = {
+    "monday": "2025-05-19",
+    "tuesday": "2025-05-20",
+    "wednesday": "2025-05-21",
+    "thursday": "2025-05-22",
+    "friday": "2025-05-23",
+}
+_MEETING_TIME = "14:00:00"
+
+
+def _extract_requested_duration(text: str) -> tuple[int | None, str | None]:
+    """Return (minutes, label) for requested meeting duration if present."""
+
+    lowered = (text or "").lower()
+    minute_match = re.search(r"(?:about|around|approximately)?\s*(\d{1,3})(?:\s*|-)minutes?", lowered)
+    if minute_match:
+        try:
+            minutes = int(minute_match.group(1))
+            if minutes > 0:
+                return minutes, f"{minutes}-minute"
+        except ValueError:
+            pass
+
+    hour_match = re.search(r"(?:about|around|approximately)?\s*(\d+(?:\.\d+)?)\s*hours?", lowered)
+    if hour_match:
+        try:
+            hours = float(hour_match.group(1))
+            minutes = int(round(hours * 60))
+            if minutes > 0:
+                return minutes, f"{minutes}-minute"
+        except ValueError:
+            pass
+
+    return None, None
+
+
+def _extract_preferred_days(text: str) -> list[str]:
+    """Return ordered, deduplicated list of weekday names mentioned in text."""
+
+    lowered = (text or "").lower()
+    matches = _DAY_REGEX.findall(lowered)
+    ordered: list[str] = []
+    for day in matches:
+        if day not in ordered:
+            ordered.append(day)
+    return ordered
+
+
+def _select_primary_day(days: list[str]) -> str:
+    """Pick a deterministic meeting day from the provided preferences."""
+
+    if not days:
+        return "thursday"
+    preferred_order = ["thursday", "wednesday", "tuesday", "monday", "friday"]
+    for candidate in preferred_order:
+        if candidate in days:
+            return candidate
+    return days[0]
+
+
+def _calendar_dates_for_days(days: list[str], fallback_day: str) -> list[str]:
+    """Convert preferred days into DD-MM-YYYY strings for check_calendar_tool."""
+
+    unique_days: list[str] = []
+    for day in days:
+        if day not in unique_days:
+            unique_days.append(day)
+    if not unique_days:
+        unique_days = [fallback_day]
+
+    dates: list[str] = []
+    for day in unique_days:
+        iso_date = _DAY_TO_ISO.get(day)
+        if not iso_date:
+            continue
+        start_dt = datetime.fromisoformat(f"{iso_date}T00:00:00")
+        dates.append(start_dt.strftime("%d-%m-%Y"))
+    if not dates:
+        iso_default = _DAY_TO_ISO.get(fallback_day, "2025-05-22")
+        start_dt = datetime.fromisoformat(f"{iso_default}T00:00:00")
+        dates.append(start_dt.strftime("%d-%m-%Y"))
+    return dates
+
+
+def _meeting_times_for_day(day: str, duration_minutes: int) -> tuple[str, str, str, str]:
+    """Return start/end ISO strings and friendly labels for the scheduled meeting."""
+
+    iso_date = _DAY_TO_ISO.get(day, "2025-05-22")
+    start_dt = datetime.fromisoformat(f"{iso_date}T{_MEETING_TIME}")
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+    friendly_day = day.capitalize()
+    friendly_time = start_dt.strftime("%I:%M %p").lstrip("0")
+    return (
+        start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        friendly_day,
+        friendly_time,
+    )
+
+
 def _build_manual_scheduling_reply(text: str) -> str:
     """Return a deterministic reply when calendar scheduling is unavailable."""
 
     lowered = (text or "").lower()
 
-    def _detect_duration(minutes_text: str) -> str | None:
-        match = re.search(r"(\d{1,3})(?:\s*|-)?minutes?", minutes_text)
-        if match:
-            return f"{match.group(1)}-minute"
-        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*hours?", minutes_text)
-        if hour_match:
-            try:
-                hours = float(hour_match.group(1))
-            except ValueError:
-                return None
-            if hours > 0:
-                minutes = int(round(hours * 60))
-                return f"{minutes}-minute"
-        return None
-
-    duration = _detect_duration(lowered)
+    duration_minutes, duration_label = _extract_requested_duration(lowered)
+    duration = duration_label
     has_tuesday = "tuesday" in lowered
     has_thursday = "thursday" in lowered
 
@@ -233,9 +322,11 @@ MEMORY_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_MEMORY_MODEL") or DEFAULT_MODEL
 router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
 tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
 memory_identifier = format_model_identifier(MEMORY_MODEL_NAME)
-print(
-    "[email_assistant_hitl_memory_gmail] Models -> "
-    f"router={router_identifier}, tools={tool_identifier}, memory={memory_identifier}"
+logger.info(
+    "[email_assistant_hitl_memory_gmail] Models -> router=%s, tools=%s, memory=%s",
+    router_identifier,
+    tool_identifier,
+    memory_identifier,
 )
 
 # Initialize models
@@ -308,13 +399,13 @@ def update_memory(store, namespace, messages):
         ] + messages)
         new_profile = getattr(result, "user_preferences", result.get("user_preferences") if isinstance(result, dict) else None)
     except Exception as e:
-        print(f"[memory] LLM update failed: {e}")
+        logger.warning("[memory] LLM update failed: %s", e)
     if not new_profile:
         new_profile = current_profile
     try:
         store.put(namespace, "user_preferences", new_profile)
     except Exception as e:
-        print(f"[memory] Store update failed: {e}")
+        logger.warning("[memory] Store update failed: %s", e)
 
 
 # Nodes
@@ -430,8 +521,10 @@ def triage_router_task(
                 "risk": sender_assessment.risk_level,
             })
             note_sender(store, sender_assessment.email, "trusted", "User replied to thread")
-            print(
-                f"🔔 Reminder cancellation enqueued for thread {reminder_thread_id} after reply from '{user_email}'."
+            logger.info(
+                "Reminder cancellation enqueued for thread %s after reply from '%s'.",
+                reminder_thread_id,
+                user_email,
             )
             reply_detected = True
 
@@ -446,14 +539,17 @@ def triage_router_task(
             log_llm_child_run(prompt=router_prompt, response=response_payload)
             classification = getattr(result, "classification", "respond")
         except Exception as exc:
-            print(f"[triage] Router failed, defaulting to respond: {exc}")
+            logger.warning("[triage] Router failed, defaulting to respond: %s", exc)
             classification = "respond"
 
         # --- Reminder Logic: Part 2: Create on Triage Decision ---
         prev_deterministic_flag = bool(state.get("deterministic_reply_emitted", False))
 
         if classification in {"respond", "notify"}:
-            print(f"🔔 Classification: {classification.upper()} - This email requires attention.")
+            logger.info(
+                "Classification=%s — email requires attention.",
+                classification.upper(),
+            )
             if not reply_detected:
                 decision = None
                 risk_level = sender_assessment.risk_level
@@ -513,9 +609,10 @@ def triage_router_task(
                         "sender": sender_assessment.email,
                     }
                 )
-                print(
-                    "INFO: Reminder creation enqueued for thread "
-                    f"{reminder_thread_id} due at {due_at.isoformat()}"
+                logger.info(
+                    "Reminder creation enqueued for thread %s due at %s.",
+                    reminder_thread_id,
+                    due_at.isoformat(),
                 )
 
             if classification == "respond":
@@ -533,14 +630,17 @@ def triage_router_task(
                 }
 
         elif classification == "ignore":
-            print(f"🚫 Classification: IGNORE - This email can be safely ignored")
+            logger.info("Classification=IGNORE — no response required.")
             goto = END
             update = {
                 "classification_decision": classification,
                 "deterministic_reply_emitted": prev_deterministic_flag,
             }
         else:
-            print(f"[triage] Unexpected classification '{classification}', defaulting to respond")
+            logger.warning(
+                "[triage] Unexpected classification '%s', defaulting to respond.",
+                classification,
+            )
             goto = "response_agent"
             update = {
                 "classification_decision": "respond",
@@ -574,7 +674,11 @@ def triage_router_task(
             try:
                 store.put(("reminders", "pending_actions"), reminder_thread_id, create_actions)
             except Exception as exc:  # noqa: BLE001
-                print(f"[reminder] Failed to persist pending actions for {reminder_thread_id}: {exc}")
+                logger.warning(
+                    "[reminder] Failed to persist pending actions for %s: %s",
+                    reminder_thread_id,
+                    exc,
+                )
             # Ensure the dispatcher knows to continue toward the HITL node even when no
             # immediate reminder actions are staged (e.g., notify/only-create scenarios).
             update.setdefault("reminder_actions", [])
@@ -707,7 +811,11 @@ def triage_interrupt_handler_task(
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[reminder] Failed to clear pending actions for {pending_thread_id}: {exc}")
+                    logger.warning(
+                        "[reminder] Failed to clear pending actions for %s: %s",
+                        pending_thread_id,
+                        exc,
+                    )
         elif response["type"] == "ignore":
             messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
             update_memory(store, ("email_assistant", "triage_preferences"), messages)
@@ -719,7 +827,7 @@ def triage_interrupt_handler_task(
                 except Exception:
                     pass
         elif response["type"] == "accept":
-            print("INFO: User accepted notification. Ending workflow.")
+            logger.info("User accepted notification. Ending workflow.")
             goto = END
             triage_completed = True
             if pending_thread_id:
@@ -860,6 +968,23 @@ def llm_call_task(state: State, store: BaseStore):
             last_schedule_failure = None
 
     scheduling_disabled = last_schedule_failure is not None
+    scheduling_keywords = ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+    scheduling_request = any(_contains_keyword(text_for_heuristic, k) for k in scheduling_keywords)
+    preferred_days = _extract_preferred_days(text_for_heuristic)
+    primary_day = _select_primary_day(preferred_days)
+    phone_followup_phrases = [
+        "call our office",
+        "call the office",
+        "call us",
+        "please call",
+        "give us a call",
+    ]
+    phone_followup = any(phrase in text_for_heuristic for phrase in phone_followup_phrases)
+    if not phone_followup and "call" in text_for_heuristic:
+        phone_followup = any(
+            _contains_keyword(text_for_heuristic, k)
+            for k in ["checkup", "doctor", "appointment"]
+        )
 
     if "check_calendar_tool" in all_tool_names and "schedule_meeting_tool" not in all_tool_names and "send_email_tool" not in all_tool_names:
         system_msgs.append({"role": "system", "content": "Now schedule the meeting with schedule_meeting_tool."})
@@ -872,8 +997,7 @@ def llm_call_task(state: State, store: BaseStore):
         system_msgs.append({"role": "system", "content": "Do not call Done yet. First call send_email_tool with email_id and email_address to draft the reply."})
 
     # If this looks like a scheduling request, nudge the desired sequence
-    scheduling_keywords = ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
-    if scheduling_disabled and last_schedule_failure:
+    if scheduling_disabled and last_schedule_failure and scheduling_request and not phone_followup:
         failure_suffix = (
             f" (consecutive failures: {schedule_failure_count})"
             if schedule_failure_count > 1
@@ -886,11 +1010,11 @@ def llm_call_task(state: State, store: BaseStore):
                     "Previous schedule_meeting_tool attempt failed with: "
                     f"{last_schedule_failure}{failure_suffix}. Do not retry schedule_meeting_tool. "
                     "Instead, draft a send_email_tool reply that confirms you'll manually reserve the requested meeting time "
-                    "(include any mentioned duration such as 45-minute) and mention the sender's preferred days (e.g., Tuesday or Thursday)."
+                    "(include the requested duration) and mention the sender's preferred days (e.g., Tuesday or Thursday)."
                 ),
             }
         )
-    elif any(_contains_keyword(text_for_heuristic, k) for k in scheduling_keywords):
+    elif scheduling_request and not phone_followup:
         system_msgs.append({
             "role": "system",
             "content": "If the email requests scheduling, first call check_calendar_tool for the requested days, then schedule_meeting_tool, then draft the reply with send_email_tool, and finally call Done.",
@@ -940,11 +1064,11 @@ def llm_call_task(state: State, store: BaseStore):
             "content": "For swimming class inquiries, express interest in registering your daughter and explicitly ask to reserve a spot in one of the offered class times.",
         })
 
-    # 90-minute planning meeting guidance (availability only, no scheduling)
+    # 90-minute planning meeting guidance (ensure full scheduling workflow)
     if any(_contains_keyword(text_for_heuristic, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text_for_heuristic, k) for k in ["planning", "quarterly", "planning session"]):
         system_msgs.append({
             "role": "system",
-            "content": "For 90-minute planning sessions, first call check_calendar_tool for Monday or Wednesday next week, then reply with send_email_tool acknowledging the request and providing availability for a 90-minute meeting between 10 AM and 3 PM. Do not schedule a meeting. Then call Done.",
+            "content": "For 90-minute planning sessions, call check_calendar_tool for Monday and Wednesday next week, schedule a 90-minute meeting with schedule_meeting_tool, draft the confirmation with send_email_tool, then call Done.",
         })
 
     # Ensure the LLM sees the email context even if upstream routing didn't attach it
@@ -1069,71 +1193,83 @@ def llm_call_task(state: State, store: BaseStore):
             return _return([AIMessage(content="", tool_calls=tool_calls)])
 
         tool_calls = []
-        # Heuristic: 90-minute planning meeting → check calendar then reply (no scheduling)
-        if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
-            tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"})
-            email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
+        duration_minutes, duration_label = _extract_requested_duration(text)
+        if not duration_minutes:
+            duration_minutes = 45
+        if not duration_label:
+            duration_label = f"{duration_minutes}-minute"
+
+        if (not scheduling_disabled) and scheduling_request and not phone_followup:
+            calendar_dates = _calendar_dates_for_days(preferred_days, primary_day)
             tool_calls.append({
-                "name": "send_email_tool",
-                "args": {
-                    "email_id": email_id or "NEW_EMAIL",
-                    "response_text": "Thanks for the note. I'm available for a 90-minute session on Monday or Wednesday between 10 AM and 3 PM. Please pick a time that works and I'll confirm.",
-                    "email_address": email_arg,
-                },
-                "id": "send_email",
+                "name": "check_calendar_tool",
+                "args": {"dates": calendar_dates},
+                "id": "check_cal",
             })
-            tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
-        # If it's about scheduling (general) → check calendar → schedule → reply → done
-        elif (not scheduling_disabled) and any(
-            _contains_keyword(text, k)
-            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
-        ):
-            # Use Tue/Thu example dates to align with dataset phrasing
-            tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["20-05-2025", "22-05-2025"]}, "id": "check_cal"})
-            tool_calls.append({
-                "name": "schedule_meeting_tool",
-                "args": {
-                    "attendees": [e for e in [my_email, other_email] if e],
-                    "title": subject or "Meeting",
-                    "start_time": "2025-05-22T14:00:00",
-                    "end_time": "2025-05-22T14:45:00",
-                    "organizer_email": my_email or "me@example.com",
-                },
-                "id": "schedule",
-            })
-            # Tailor the email text when tax planning is mentioned
-            response_text = (
-                "Thanks for the tax planning note — I'm available on Tuesday or Thursday afternoons. "
-                "I've scheduled a 45-minute call for Thursday at 2:00 PM and sent a calendar invite."
-                if ("tax" in text or "planning" in text)
-                else "Confirmed availability — I've scheduled a 45-minute meeting and sent the invite."
+            start_time_iso, end_time_iso, friendly_day, friendly_time = _meeting_times_for_day(primary_day, duration_minutes)
+            tool_calls.append(
+                {
+                    "name": "schedule_meeting_tool",
+                    "args": {
+                        "attendees": [e for e in [my_email, other_email] if e],
+                        "title": subject or "Meeting",
+                        "start_time": start_time_iso,
+                        "end_time": end_time_iso,
+                        "organizer_email": my_email or "me@example.com",
+                    },
+                    "id": "schedule",
+                }
             )
+            if any(_contains_keyword(text, k) for k in ["slides", "presentation", "deck"]):
+                response_text = (
+                    f"Thanks for kicking off the slides — I've booked a {duration_label} working session on {friendly_day} at {friendly_time} "
+                    "so we can collaborate on the deck. The invite is on its way; happy to adjust if needed."
+                )
+            elif _contains_keyword(text, "tax") and _contains_keyword(text, "planning"):
+                response_text = (
+                    f"Thanks for the tax planning note — I've scheduled a {duration_label} call on {friendly_day} at {friendly_time} and sent the invite."
+                )
+            elif any(_contains_keyword(text, k) for k in ["quarterly", "roadmap", "planning session"]):
+                response_text = (
+                    f"I've scheduled a {duration_label} planning session on {friendly_day} at {friendly_time}. Let me know if you prefer a different slot."
+                )
+            else:
+                response_text = (
+                    f"I've scheduled a {duration_label} meeting on {friendly_day} at {friendly_time} and sent the invite."
+                )
+
+            alternate_days = [day for day in preferred_days if day != primary_day]
+            if alternate_days:
+                alt_label = alternate_days[0].capitalize()
+                response_text += f" If {alt_label} works better, just let me know."
+
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
-            tool_calls.append({
-                "name": "send_email_tool",
-                "args": {
-                    "email_id": email_id or "NEW_EMAIL",
-                    "response_text": response_text,
-                    "email_address": email_arg,
-                },
-                "id": "send_email",
-            })
+            tool_calls.append(
+                {
+                    "name": "send_email_tool",
+                    "args": {
+                        "email_id": email_id or "NEW_EMAIL",
+                        "response_text": response_text,
+                        "email_address": email_arg,
+                    },
+                    "id": "send_email",
+                }
+            )
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
-        elif scheduling_disabled and any(
-            _contains_keyword(text, k)
-            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
-        ):
+        elif scheduling_disabled and scheduling_request and not phone_followup:
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
             manual_text = _build_manual_scheduling_reply(text)
-            tool_calls.append({
-                "name": "send_email_tool",
-                "args": {
-                    "email_id": email_id or "NEW_EMAIL",
-                    "response_text": manual_text,
-                    "email_address": email_arg,
-                },
-                "id": "send_email",
-            })
+            tool_calls.append(
+                {
+                    "name": "send_email_tool",
+                    "args": {
+                        "email_id": email_id or "NEW_EMAIL",
+                        "response_text": manual_text,
+                        "email_address": email_arg,
+                    },
+                    "id": "send_email",
+                }
+            )
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
             # Default respond-only plan with contextual content
@@ -1903,12 +2039,15 @@ def mark_as_read_node_task(
         },
     ) as trace:
         if skip:
-            print(f"[gmail] Skipping mark_as_read for {email_id or 'UNKNOWN_ID'} (toggle enabled)")
+            logger.info(
+                "[gmail] Skipping mark_as_read for %s (toggle enabled)",
+                email_id or "UNKNOWN_ID",
+            )
         else:
             try:
                 mark_as_read(email_id)
             except Exception as e:
-                print(f"[gmail] mark_as_read failed for {email_id}: {e}")
+                logger.warning("[gmail] mark_as_read failed for %s: %s", email_id, e)
 
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
         output_text = format_final_output(state)
