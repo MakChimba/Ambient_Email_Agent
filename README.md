@@ -27,6 +27,22 @@ See `AGENTS.md` for a deep dive into routing, tool behavior, and the latest feat
 4. **Memory & Checkpoints** – SQLite checkpoints and stores persist agent state and preference history across runs.
 5. **Human Interrupts** – HITL agents pause on tool calls using `HumanInterrupt`. Auto-accept can be enabled for demos/tests.
 
+### Main Gmail Agent Flow
+
+```mermaid
+flowchart TD
+    START --> TRIAGE[triage_router]
+    TRIAGE --> APPLY[apply_reminder_actions_node]
+    TRIAGE -->|notify/HITL| HITL[triage_interrupt_handler]
+    APPLY --> RESPONSE[response_agent]
+    RESPONSE --> MARK[mark_as_read_node]
+    MARK --> END
+    HITL -->|respond| APPLY
+    HITL -->|ignore / accept| END
+```
+
+This diagram reflects the production `email_assistant_hitl_memory_gmail` graph: every run starts in triage, optionally pauses for HITL before reminder actions are applied, and exits after finalising the Gmail thread. Additional diagrams for the other agents live in `DIAGRAMS.md`.
+
 ## Getting Started
 ### Prerequisites
 - Python 3.11+
@@ -63,6 +79,7 @@ Helpful toggles (leave unset for live runs):
 - `EMAIL_ASSISTANT_TRACE_STAGE` / `EMAIL_ASSISTANT_TRACE_TAGS` – append rollout metadata to LangSmith runs for multi-stage deploys.
 - `EMAIL_ASSISTANT_TIMEZONE=Australia/Melbourne` – default runtime timezone used by scripts and reminders when no explicit timezone is provided.
 - `EMAIL_ASSISTANT_JUDGE_PROJECT=email-assistant:judge` – base LangSmith project name for Gemini judge evaluations (date suffix appended automatically).
+- `EMAIL_ASSISTANT_LOG_PATH=...` / `EMAIL_ASSISTANT_LOG_LEVEL=DEBUG` – configure the shared log file (`logs/email_assistant.log` by default) that captures both frontend and backend logger output when the package is imported.
 
 ### Streaming & Tracing
 - All notebooks, scripts, and tests request `stream_mode=["updates","messages","custom"]`; the `custom` channel surfaces `stream_progress` events for live demos and automated logs.
@@ -94,10 +111,15 @@ Select the graph that matches your use case (`langgraph.json` lists all availabl
 - Enable Gemini 2.5 Flash judging (`EMAIL_ASSISTANT_LLM_JUDGE=1`) to score correctness/tool usage; add `EMAIL_ASSISTANT_JUDGE_STRICT=1` to fail on judge verdicts.
 
 ## Reminders & Follow-ups
-The reminder worker (`scripts/reminder_worker.py`) promotes important threads:
-- Configure labels and timings with `REMINDER_*` environment variables.
-- Run once: `python scripts/reminder_worker.py --once`
-- Continuous loop: `python scripts/reminder_worker.py --loop` (tmux/cron examples live in README_LOCAL.md)
+The reminder stack now includes a LangGraph dispatcher plus a background worker:
+- `triage_router` batches cancel/create intents and defers HITL-created reminders by persisting create actions to the reminder store's pending queue until the reviewer approves them.
+- `apply_reminder_actions_node` executes batched operations atomically through `ReminderStore.apply_actions()` and exposes the outcome as `reminder_dispatch_outcome`.
+- `triage_interrupt_handler` replay pending reminder actions only after a reviewer chooses to respond, keeping notify flows HITL-first.
+- `scripts/reminder_worker.py` promotes due reminders:
+  - Configure labels/timers with `REMINDER_*` environment variables.
+  - Run once: `python scripts/reminder_worker.py --once`
+  - Continuous loop: `python scripts/reminder_worker.py --loop` (tmux/cron examples live in README_LOCAL.md)
+- See `notebooks/reminder_flow.ipynb` for a diagram + code sample showing the dispatcher in action.
 
 ## Repository Layout
 Path | Description

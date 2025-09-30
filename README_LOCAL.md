@@ -14,12 +14,33 @@ This document contains recipes and notes for running the Email Assistant compone
 
 Upgrade context and open follow-ups are tracked in `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md`; log checklist updates there whenever you touch the notebooks, docs, or test flows referenced below.
 
+## LangGraph Developer Server & Agent Inbox
+
+- The `langgraph dev` CLI now mirrors the hosted runtime and refuses custom checkpoint stores. Before launching the local Agent Inbox, export `LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER=1` so the email assistant graphs skip attaching their SQLite checkpointer/store and rely on the platform-managed persistence.
+- Example session:
+  ```bash
+  source .venv/bin/activate
+  LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER=1 langgraph dev
+  ```
+- The CLI prints a Studio/Agent Inbox URL (e.g. `http://127.0.0.1:2024/devtools/inbox/...`). Open it in a browser to approve HITL cards manually. Leave `HITL_AUTO_ACCEPT` unset so interrupts pause for input.
+- When running pytest, notebooks, or other SDK-style scripts, the SQLite checkpointer remains enabled by default (no extra env required). Unset `LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER` when you return to those flows so deterministic eval mode retains local durability.
+
 ## Streaming Instrumentation
 
 - Tests, scripts, and notebooks request `stream_mode=["updates","messages","custom"]`; the `custom` channel carries progress payloads emitted by the `stream_progress` tool in `email_assistant.tools.default.progress_tools`.
 - Set `EMAIL_ASSISTANT_TRACE_DEBUG=1` when you need to print raw stream payloads and LangSmith metadata while verifying notebook/CLI demos.
 - `EMAIL_ASSISTANT_TRACE_STAGE` and `EMAIL_ASSISTANT_TRACE_TAGS` feed through to LangSmith so replayed runs carry rollout metadata. Combine with `EMAIL_ASSISTANT_TRACE_PROJECT` to pin traces to a specific workspace bucket.
 - `scripts/run_real_outputs.py --stream` mirrors the production streaming surface outside of Jupyter. Use it to sanity check custom events before recording screenshots or videos. Set `EMAIL_ASSISTANT_TRACE_PROJECT` when you need an alternate LangSmith project base name (the helper still appends the daily suffix automatically).
+
+## Unified Logging
+
+- Importing `email_assistant` now installs a shared file handler so every module (frontend notebook, backend worker, reminder node) writes to `logs/email_assistant.log`.
+- Override the location with `EMAIL_ASSISTANT_LOG_PATH` and adjust verbosity with `EMAIL_ASSISTANT_LOG_LEVEL` (defaults to INFO).
+- The helper only adds the handler once per process, so repeated imports are safe.
+- Tail the file while running tests or LangGraph Studio to get a combined view of router decisions, reminder dispatcher output, and Gmail finalisation:
+  ```bash
+  tail -f logs/email_assistant.log
+  ```
 
 ## Running the Reminder Worker
 
@@ -63,7 +84,10 @@ Notes
 
 ## Reminder Coverage & Live Tests
 
-- The reminder store now exposes `iter_active_reminders()` so scripts (and `scripts/reminder_worker.py --list`) enumerate pending reminders without touching SQLite internals. Use this helper instead of `_connect()` in custom tooling.
+- The reminder graph now routes cancel/create batches through `apply_reminder_actions_node`, powered by the new `ReminderStore.apply_actions()` helper. Cancels and recreations execute in one SQLite transaction, so partial failures no longer orphan reminders.
+- Notify/HITL flows queue reminder creations in the reminder store and only replay them once `triage_interrupt_handler` receives a "respond" decision. Ignore/accept clears the queue without touching the store.
+- Inspect dispatcher output via the `reminder_dispatch_outcome` key in the state or run the demonstration cell in `notebooks/reminder_flow.ipynb`.
+- The reminder store still exposes `iter_active_reminders()` so scripts (and `scripts/reminder_worker.py --list`) enumerate pending reminders without touching SQLite internals. Use this helper instead of `_connect()` in custom tooling.
 - Required environment variables for end-to-end reminder coverage:
   - `REMINDER_DB_PATH`: SQLite file for reminders (defaults to `.local/reminders.db`).
   - `REMINDER_DEFAULT_HOURS`: Hours until a new reminder becomes due (default `48`).

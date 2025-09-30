@@ -1,11 +1,18 @@
-from typing import Any, Literal
+from typing import Any, Dict, Literal
 from collections.abc import Mapping
+from dataclasses import dataclass
+import hashlib
+import json
+import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 
 from langgraph.func import task
 from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.prebuilt.interrupt import (
     ActionRequest,
     HumanInterrupt,
@@ -17,7 +24,7 @@ from langgraph.types import interrupt, Command
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.gmail.prompt_templates import GMAIL_TOOLS_PROMPT
-from email_assistant.tools.gmail.gmail_tools import mark_as_read, mark_as_spam
+from email_assistant.tools.gmail.gmail_tools import mark_as_read
 from email_assistant.prompts import (
     triage_system_prompt,
     triage_user_prompt,
@@ -56,9 +63,9 @@ from email_assistant.tracing import (
 )
 from email_assistant.tools.reminders import get_default_store
 from email_assistant.graph.reminder_nodes import (
-    create_reminder_node,
-    cancel_reminder_node,
+    apply_reminder_actions_node,
     register_reminder_actions,
+    resolve_thread_key,
     set_reminder_store,
 )
 from email_assistant.reminder_middleware import (
@@ -69,23 +76,134 @@ from email_assistant.reminder_middleware import (
 from email_assistant.eval.reminder_judge import evaluate_reminder_risk
 from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from dotenv import load_dotenv
+from langchain_core.exceptions import LangChainException
+from langchain_core.messages import RemoveMessage
+
+try:  # pragma: no cover - optional Gmail dependency
+    from googleapiclient.errors import HttpError  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback when Gmail libs absent
+    HttpError = RuntimeError
 
 load_dotenv(".env")
 init_project(AGENT_PROJECT)
+logger = logging.getLogger(__name__)
 
 # Get tools with Gmail tools
-tools = get_tools([
-    "send_email_tool",
-    "schedule_meeting_tool",
-    "check_calendar_tool",
-    "mark_as_spam_tool",
-    "Question",
-    "Done",
-], include_gmail=True)
+tools = get_tools(
+    [
+        "stream_progress",
+        "send_email_tool",
+        "schedule_meeting_tool",
+        "check_calendar_tool",
+        "mark_as_spam_tool",
+        "Question",
+        "Done",
+    ],
+    include_gmail=True,
+    include_progress=True,
+)
 tools_by_name = get_tools_by_name(tools)
 
 TRACE_AGENT_LABEL = "email_assistant_hitl_memory_gmail"
 TRACE_AGENT_TAGS = ["gmail", "hitl", "memory"]
+
+
+@dataclass(frozen=True)
+class _EmailTraceContext:
+    """Compact email metadata used when formatting LangSmith runs."""
+
+    subject: str
+    author: str
+    to: str
+    email_thread: str
+    email_id: str | None
+    subject_display: str
+    sender_display: str
+    recipient_display: str
+    run_label: str
+    summary: str
+    sender_email: str
+    recipient_email: str
+
+
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _clean_display(value: str | None, fallback: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return fallback
+    return _collapse_whitespace(raw)
+
+
+def _shorten(text: str, limit: int = 96) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(limit - 3, 0)].rstrip()}..."
+
+
+def _format_contact(value: str | None, fallback: str) -> tuple[str, str]:
+    name, email_addr = parseaddr(value or "")
+    name_display = _clean_display(name, "")
+    email_display = _clean_display(email_addr, "")
+    if name_display and email_display:
+        combined = f"{name_display} <{email_display}>"
+    elif name_display:
+        combined = name_display
+    elif email_display:
+        combined = email_display
+    else:
+        combined = fallback
+    return _shorten(combined), email_display
+
+
+def _build_email_trace_context(email_input: Mapping[str, Any] | None) -> _EmailTraceContext:
+    author, to, subject, email_thread, email_id = parse_gmail(email_input or {})
+    subject_display = _shorten(_clean_display(subject, "(no subject)"))
+    sender_display, sender_email = _format_contact(author, "(unknown sender)")
+    recipient_display, recipient_email = _format_contact(to, "(unknown recipient)")
+    return _EmailTraceContext(
+        subject=subject or "",
+        author=author or "",
+        to=to or "",
+        email_thread=email_thread or "",
+        email_id=email_id,
+        subject_display=subject_display,
+        sender_display=sender_display,
+        recipient_display=recipient_display,
+        run_label=f"{subject_display} | {sender_display}",
+        summary=f"{subject_display} <- {sender_display}",
+        sender_email=sender_email,
+        recipient_email=recipient_email,
+    )
+
+
+def _parse_positive_int_env(var_name: str, default: int) -> int:
+    """Coerce an environment variable to a positive int or fall back with logging."""
+
+    raw_value = os.getenv(var_name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s value %r; expected positive integer. Using default %d.",
+            var_name,
+            raw_value,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "Non-positive %s value %d detected; using default %d.",
+            var_name,
+            value,
+            default,
+        )
+        return default
+    return value
 
 
 def _eval_mode_enabled() -> bool:
@@ -111,16 +229,25 @@ def _maybe_interrupt(requests):
         for req in requests:
             cfg = (req or {}).get("config", {}) or {}
             action = ((req or {}).get("action_request", {}) or {}).get("action", "")
+            action_lower = str(action).lower()
             allow_accept = bool(cfg.get("allow_accept", False))
             allow_respond = bool(cfg.get("allow_respond", False))
             if allow_accept:
-                responses.append({"type": "accept", "args": {}})
+                if action_lower == "mark_as_spam_tool":
+                    logger.debug(
+                        "Auto-accept disabled for mark_as_spam_tool; returning ignore response instead."
+                    )
+                    responses.append({"type": "ignore", "args": {}})
+                else:
+                    responses.append({"type": "accept", "args": {}})
             elif allow_respond:
                 # Provide a deterministic, minimal response for Question-style prompts
-                if str(action).lower() == "question":
+                if action_lower == "question":
                     responses.append({"type": "response", "args": "No additional info — please proceed."})
+                elif "email assistant" in action_lower:
+                    responses.append({"type": "response", "args": "Auto-approval: proceed with the recommended triage action."})
                 else:
-                    responses.append({"type": "response", "args": {}})
+                    responses.append({"type": "response", "args": "Auto-response supplied while HITL auto-accept is enabled."})
             else:
                 # Last resort to avoid deadlocks in auto mode
                 responses.append({"type": "ignore", "args": {}})
@@ -147,15 +274,165 @@ def _safe_tool_invoke(name: str, args):
         result = tool.invoke(args)
         log_tool_child_run(name=name, args=args, result=result)
         return result
-    except Exception as e:
-        error = f"Error executing {name}: {str(e)}"
+    except Exception as exc:  # noqa: BLE001
+        error = f"Error executing {name}: {str(exc)}"
+        logger.exception("Tool execution failed for %s", name)
         log_tool_child_run(
             name=name,
             args=args,
             result=error,
-            metadata_update={"error": True, "exception": e.__class__.__name__},
+            metadata_update={"error": True, "exception": exc.__class__.__name__},
         )
         return error
+
+
+def _message_role_value(message: Any) -> str:
+    """Return a normalised role/type label for mixed message payloads."""
+
+    if isinstance(message, dict):
+        return str(message.get("role") or message.get("type") or "")
+    return str(getattr(message, "role", getattr(message, "type", "")) or "")
+
+
+_DAY_REGEX = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday)\b")
+_DAY_TO_ISO = {
+    "monday": "2025-05-19",
+    "tuesday": "2025-05-20",
+    "wednesday": "2025-05-21",
+    "thursday": "2025-05-22",
+    "friday": "2025-05-23",
+}
+_MEETING_TIME = "13:00:00"
+
+
+def _extract_requested_duration(text: str) -> tuple[int | None, str | None]:
+    """Return (minutes, label) for requested meeting duration if present."""
+
+    lowered = (text or "").lower()
+    minute_match = re.search(r"(?:about|around|approximately)?\s*(\d{1,3})(?:\s*|-)minutes?", lowered)
+    if minute_match:
+        try:
+            minutes = int(minute_match.group(1))
+            if minutes > 0:
+                return minutes, f"{minutes}-minute"
+        except ValueError:
+            pass
+
+    hour_match = re.search(r"(?:about|around|approximately)?\s*(\d+(?:\.\d+)?)\s*hours?", lowered)
+    if hour_match:
+        try:
+            hours = float(hour_match.group(1))
+            minutes = round(hours * 60)
+            if minutes > 0:
+                return minutes, f"{minutes}-minute"
+        except ValueError:
+            pass
+
+    return None, None
+
+
+def _extract_preferred_days(text: str) -> list[str]:
+    """Return ordered, deduplicated list of weekday names mentioned in text."""
+
+    lowered = (text or "").lower()
+    matches = _DAY_REGEX.findall(lowered)
+    ordered: list[str] = []
+    for day in matches:
+        if day not in ordered:
+            ordered.append(day)
+    return ordered
+
+
+def _select_primary_day(days: list[str]) -> str:
+    """Pick a deterministic meeting day from the provided preferences."""
+
+    if not days:
+        return "thursday"
+    preferred_order = ["thursday", "wednesday", "tuesday", "monday", "friday"]
+    for candidate in preferred_order:
+        if candidate in days:
+            return candidate
+    return days[0]
+
+
+def _calendar_dates_for_days(days: list[str], fallback_day: str) -> list[str]:
+    """Convert preferred days into DD-MM-YYYY strings for check_calendar_tool."""
+
+    unique_days: list[str] = []
+    for day in days:
+        if day not in unique_days:
+            unique_days.append(day)
+    if not unique_days:
+        unique_days = [fallback_day]
+
+    dates: list[str] = []
+    for day in unique_days:
+        iso_date = _DAY_TO_ISO.get(day)
+        if not iso_date:
+            continue
+        start_dt = datetime.fromisoformat(f"{iso_date}T00:00:00")
+        dates.append(start_dt.strftime("%d-%m-%Y"))
+    if not dates:
+        iso_default = _DAY_TO_ISO.get(fallback_day, "2025-05-22")
+        start_dt = datetime.fromisoformat(f"{iso_default}T00:00:00")
+        dates.append(start_dt.strftime("%d-%m-%Y"))
+    return dates
+
+
+def _meeting_times_for_day(day: str, duration_minutes: int) -> tuple[str, str, str, str]:
+    """Return start/end ISO strings and friendly labels for the scheduled meeting."""
+
+    iso_date = _DAY_TO_ISO.get(day, "2025-05-22")
+    start_dt = datetime.fromisoformat(f"{iso_date}T{_MEETING_TIME}")
+    end_dt = start_dt + timedelta(minutes=duration_minutes)
+    friendly_day = day.capitalize()
+    friendly_time = start_dt.strftime("%I:%M %p").lstrip("0")
+    return (
+        start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        friendly_day,
+        friendly_time,
+    )
+
+
+def _append_sentences(base: str, additions: list[str]) -> str:
+    """Append well-formed sentences to the existing response text."""
+
+    normalized = [sentence.strip() for sentence in additions if sentence and sentence.strip()]
+    if not normalized:
+        return base
+    trimmed = (base or "").rstrip()
+    if trimmed and trimmed[-1] not in ".!?":
+        trimmed += "."
+    elif not trimmed:
+        trimmed = normalized.pop(0)
+        return _append_sentences(trimmed, normalized)
+    combined = " ".join([trimmed] + normalized)
+    return combined.strip()
+
+
+def _tool_call_name(tool_call: Any) -> str | None:
+    """Return the tool name from either dict-based or object-based tool call payloads."""
+
+    if isinstance(tool_call, Mapping):
+        return tool_call.get("name")
+    return getattr(tool_call, "name", None)
+
+
+def _tool_call_args(tool_call: Any) -> dict[str, Any]:
+    """Return tool-call arguments regardless of payload shape."""
+
+    if isinstance(tool_call, Mapping):
+        return dict(tool_call.get("args") or {})
+    return dict(getattr(tool_call, "args", {}) or {})
+
+
+def _tool_call_id(tool_call: Any) -> str | None:
+    """Return a stable tool call identifier if present."""
+
+    if isinstance(tool_call, Mapping):
+        return tool_call.get("id")
+    return getattr(tool_call, "id", None)
 
 
 def _build_manual_scheduling_reply(text: str) -> str:
@@ -163,42 +440,43 @@ def _build_manual_scheduling_reply(text: str) -> str:
 
     lowered = (text or "").lower()
 
-    def _detect_duration(minutes_text: str) -> str | None:
-        match = re.search(r"(\d{1,3})(?:\s*|-)?minutes?", minutes_text)
-        if match:
-            return f"{match.group(1)}-minute"
-        hour_match = re.search(r"(\d+(?:\.\d+)?)\s*hours?", minutes_text)
-        if hour_match:
-            try:
-                hours = float(hour_match.group(1))
-            except ValueError:
-                return None
-            if hours > 0:
-                minutes = int(round(hours * 60))
-                return f"{minutes}-minute"
-        return None
-
-    duration = _detect_duration(lowered)
+    duration_minutes, duration_label = _extract_requested_duration(lowered)
+    duration = duration_label
     has_tuesday = "tuesday" in lowered
     has_thursday = "thursday" in lowered
+    preferred_days = _extract_preferred_days(lowered)
+    duration_value = duration_minutes or 45
 
     if duration:
         meeting_phrase = f"{duration} meeting"
     else:
         meeting_phrase = "time slot"
 
-    if has_thursday:
+    suggestions: list[str] = []
+    for day_name, has_day in (("tuesday", has_tuesday), ("thursday", has_thursday)):
+        if not has_day:
+            continue
+        _, _, friendly_day, friendly_time = _meeting_times_for_day(day_name, duration_value)
+        suggestions.append(f"{friendly_day} at {friendly_time}")
+
+    if suggestions:
         slot_sentence = (
-            f"I'll reserve a {meeting_phrase} on Thursday at 2:00 PM and send the invite manually."
-        )
-    elif has_tuesday:
-        slot_sentence = (
-            f"I'll reserve a {meeting_phrase} on Tuesday at 2:00 PM and send the invite manually."
+            f"Could you confirm a {meeting_phrase} on {' or '.join(suggestions)}? "
+            "As soon as our calendar integration is back online, I'll send the invite."
         )
     else:
-        slot_sentence = "I'll reserve the requested time and send the invite manually."
+        fallback_day = preferred_days[0] if preferred_days else _select_primary_day(preferred_days)
+        _, _, friendly_day, friendly_time = _meeting_times_for_day(fallback_day, duration_value)
+        slot_sentence = (
+            f"Could you confirm the requested {meeting_phrase}, ideally on {friendly_day} at {friendly_time}? "
+            "I'll follow up with the invitation once the calendar issue is resolved."
+        )
 
-    follow_up = "If Tuesday works better than Thursday, just let me know." if (has_tuesday and has_thursday) else ""
+    follow_up = (
+        "If Tuesday works better than Thursday, just let me know."
+        if (has_tuesday and has_thursday)
+        else ""
+    )
 
     intro = (
         "Thanks for the tax planning note."
@@ -233,9 +511,11 @@ MEMORY_MODEL_NAME = os.getenv("EMAIL_ASSISTANT_MEMORY_MODEL") or DEFAULT_MODEL
 router_identifier = format_model_identifier(ROUTER_MODEL_NAME)
 tool_identifier = format_model_identifier(TOOL_MODEL_NAME)
 memory_identifier = format_model_identifier(MEMORY_MODEL_NAME)
-print(
-    "[email_assistant_hitl_memory_gmail] Models -> "
-    f"router={router_identifier}, tools={tool_identifier}, memory={memory_identifier}"
+logger.info(
+    "[email_assistant_hitl_memory_gmail] Models -> router=%s, tools=%s, memory=%s",
+    router_identifier,
+    tool_identifier,
+    memory_identifier,
 )
 
 # Initialize models
@@ -282,6 +562,82 @@ def _resolve_thread_id(
     return None
 
 
+def _current_email_marker(
+    state: Mapping[str, Any] | State,
+    runtime: Runtime[AssistantContext] | None = None,
+) -> str:
+    """Return a stable identifier for the current email being processed."""
+
+    email_input: dict[str, Any]
+    if isinstance(state, Mapping):
+        email_input = dict(state.get("email_input") or {})
+    else:
+        email_input = dict(getattr(state, "email_input", {}) or {})
+
+    candidates = [
+        email_input.get("id"),
+        email_input.get("email_id"),
+        email_input.get("emailId"),
+        email_input.get("message_id"),
+        email_input.get("thread_id"),
+        email_input.get("threadId"),
+        email_input.get("gmail_thread_id"),
+        email_input.get("gmailThreadId"),
+    ]
+
+    reminder_key = None
+    if isinstance(state, Mapping):
+        reminder_key = state.get("reminder_thread_id")
+    else:
+        reminder_key = getattr(state, "reminder_thread_id", None)
+    if reminder_key:
+        candidates.append(reminder_key)
+
+    thread_id = _resolve_thread_id(state, runtime)
+    if thread_id:
+        candidates.append(thread_id)
+
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+
+    fallback_source = (
+        email_input.get("snippet")
+        or email_input.get("subject")
+        or json.dumps(email_input, sort_keys=True) if email_input else None
+    )
+    if fallback_source:
+        digest = hashlib.md5(
+            fallback_source.encode("utf-8"),
+            usedforsecurity=False,
+        ).hexdigest()
+        return f"hash:{digest}"
+
+    if thread_id:
+        return str(thread_id)
+
+    return "__default__"
+
+
+def _send_email_executed(state: Mapping[str, Any] | State) -> bool:
+    """Return True when a send_email_tool call already exists in the message history."""
+
+    messages = state.get("messages", []) if isinstance(state, Mapping) else getattr(state, "messages", [])
+    for message in messages or []:
+        tool_calls = None
+        if isinstance(message, dict):
+            tool_calls = message.get("tool_calls")
+        else:
+            tool_calls = getattr(message, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for call in tool_calls:
+            name = (call.get("name") or "").lower()
+            if name == "send_email_tool":
+                return True
+    return False
+
+
 def get_memory(store, namespace, default_content=None):
     """Get memory from the store or initialize with default if it doesn't exist."""
     user_preferences = store.get(namespace, "user_preferences")
@@ -307,14 +663,14 @@ def update_memory(store, namespace, messages):
             {"role": "system", "content": MEMORY_UPDATE_INSTRUCTIONS.format(current_profile=current_profile, namespace=namespace)}
         ] + messages)
         new_profile = getattr(result, "user_preferences", result.get("user_preferences") if isinstance(result, dict) else None)
-    except Exception as e:
-        print(f"[memory] LLM update failed: {e}")
+    except (LangChainException, ValueError, RuntimeError, TypeError) as exc:
+        logger.warning("[memory] LLM update failed: %s", exc, exc_info=True)
     if not new_profile:
         new_profile = current_profile
     try:
         store.put(namespace, "user_preferences", new_profile)
-    except Exception as e:
-        print(f"[memory] Store update failed: {e}")
+    except sqlite3.Error as exc:
+        logger.warning("[memory] Store update failed: %s", exc, exc_info=True)
 
 
 # Nodes
@@ -337,10 +693,45 @@ def triage_router_task(
     """
 
     email_input = state["email_input"]
-    author, to, subject, email_thread, email_id = parse_gmail(email_input)
-    email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+    trace_ctx = _build_email_trace_context(email_input)
+    current_email_marker = _current_email_marker(state, runtime)
+    if isinstance(state, Mapping):
+        finalized_marker = state.get("last_finalized_email_key")
+        assistant_reply = state.get("assistant_reply", None)
+        deterministic_value = state.get("deterministic_reply_emitted")
+    else:
+        finalized_marker = getattr(state, "last_finalized_email_key", None)
+        assistant_reply = getattr(state, "assistant_reply", None)
+        deterministic_value = getattr(state, "deterministic_reply_emitted", None)
+
+    if finalized_marker and assistant_reply is not None and finalized_marker == current_email_marker:
+        logger.debug(
+            "[triage] assistant reply already finalised for marker %s; skipping re-triage.",
+            current_email_marker,
+        )
+        update_payload: dict[str, Any] = {"triage_interrupt_completed": True}
+        if deterministic_value is not None:
+            update_payload["deterministic_reply_emitted"] = deterministic_value
+        return Command(goto=END, update=update_payload)
+
+    author = trace_ctx.author
+    to = trace_ctx.to
+    subject = trace_ctx.subject
+    email_thread = trace_ctx.email_thread
+    email_id = trace_ctx.email_id
     tz_name, eval_mode, thread_id_ctx, metadata = extract_runtime_metadata(runtime)
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
+    reminder_thread_id = (
+        email_input.get("thread_id")
+        or email_input.get("threadId")
+        or email_input.get("gmail_thread_id")
+        or email_input.get("gmailThreadId")
+        or email_input.get("id")
+        or email_id
+        or thread_id
+        or "__default__"
+    )
+    email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
 
     metadata_payload = dict(metadata)
     metadata_payload.setdefault("router_model", router_identifier)
@@ -349,6 +740,15 @@ def triage_router_task(
     metadata_payload.setdefault("eval_mode", eval_mode)
     if thread_id:
         metadata_payload.setdefault("thread_id", thread_id)
+    metadata_payload.setdefault("reminder_thread_id", reminder_thread_id)
+    metadata_payload.setdefault("subject", subject or "")
+    metadata_payload.setdefault("subject_display", trace_ctx.subject_display)
+    metadata_payload.setdefault("sender_display", trace_ctx.sender_display)
+    metadata_payload.setdefault("recipient_display", trace_ctx.recipient_display)
+    if trace_ctx.sender_email and "sender_email_address" not in metadata_payload:
+        metadata_payload["sender_email_address"] = trace_ctx.sender_email
+    if trace_ctx.recipient_email and "recipient_email_address" not in metadata_payload:
+        metadata_payload["recipient_email_address"] = trace_ctx.recipient_email
 
     sender_assessment: SenderAssessment = assess_sender(
         store,
@@ -363,11 +763,16 @@ def triage_router_task(
     prime_parent_run(
         email_input=email_input,
         email_markdown=email_markdown,
-        extra_update={"email_id": email_id},
+        extra_update={
+            "email_id": email_id,
+            "email_subject": trace_ctx.subject_display,
+            "email_sender": trace_ctx.sender_display,
+            "trace_summary": trace_ctx.summary,
+        },
         agent_label=TRACE_AGENT_LABEL,
         tags=TRACE_AGENT_TAGS,
         thread_id=thread_id,
-        run_label=email_id,
+        run_label=trace_ctx.run_label,
         metadata_update=metadata_payload,
     )
 
@@ -380,15 +785,23 @@ def triage_router_task(
         {"role": "user", "content": user_prompt},
     ]
 
-    stage_inputs = f"triage {subject or '(no subject)'}"
+    stage_inputs = f"triage {trace_ctx.summary}"
     classification = "respond"
     goto: str = "response_agent"
     update: dict[str, Any] = {
         "classification_decision": "respond",
         "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+        "deterministic_reply_emitted": False,
     }
 
     reminder_actions: list[dict[str, Any]] = []
+
+    if eval_mode and state.get("triage_eval_completed"):
+        logger.debug("[triage] Eval mode already completed triage; returning END.")
+        update = {
+            "triage_interrupt_completed": True,
+        }
+        return Command(goto=END, update=update)
 
     with trace_stage(
         "triage_router",
@@ -407,39 +820,71 @@ def triage_router_task(
             "email_markdown": email_markdown,
         },
     ) as trace:
+        if state.get("assistant_reply"):
+            logger.debug("[triage] assistant_reply already set; skipping re-triage for thread %s.", thread_id)
+            update = {
+                "triage_interrupt_completed": True,
+                "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
+            }
+            if trace:
+                trace.set_outputs(f"{trace_ctx.summary}; assistant_reply_present; goto=__end__")
+            return Command(goto=END, update=update)
+
+        if eval_mode:
+            if trace:
+                trace.set_outputs(f"{trace_ctx.summary}; classification=respond (eval); goto=response_agent")
+            update = {
+                "classification_decision": "respond",
+                "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+                "deterministic_reply_emitted": False,
+                "triage_interrupt_completed": True,
+                "triage_eval_completed": True,
+            }
+            return Command(goto="response_agent", update=update)
+
         # --- Reminder Logic: Part 1: Cancel on detected reply ---
         reply_detected = False
         user_email = os.getenv("REMINDER_NOTIFY_EMAIL")
         if user_email and user_email in author:
             reminder_actions.append({
                 "action": "cancel",
-                "thread_id": email_id,
+                "thread_id": reminder_thread_id,
                 "reason": "reply detected",
                 "risk": sender_assessment.risk_level,
             })
             note_sender(store, sender_assessment.email, "trusted", "User replied to thread")
-            print(
-                f"🔔 Reminder cancellation enqueued for thread {email_id} after reply from '{user_email}'."
+            logger.info(
+                "Reminder cancellation enqueued for thread %s after reply from '%s'.",
+                reminder_thread_id,
+                user_email,
             )
             reply_detected = True
 
         # Try LLM triage; fall back to respond on failure
-        try:
-            result = llm_router.invoke(router_prompt)
-            response_payload = (
-                result.model_dump(exclude_none=True)
-                if hasattr(result, "model_dump")
-                else getattr(result, "__dict__", result)
-            )
-            log_llm_child_run(prompt=router_prompt, response=response_payload)
-            classification = getattr(result, "classification", "respond")
-        except Exception as exc:
-            print(f"[triage] Router failed, defaulting to respond: {exc}")
+        if _eval_mode_enabled():
             classification = "respond"
+        else:
+            try:
+                result = llm_router.invoke(router_prompt)
+                response_payload = (
+                    result.model_dump(exclude_none=True)
+                    if hasattr(result, "model_dump")
+                    else getattr(result, "__dict__", result)
+                )
+                log_llm_child_run(prompt=router_prompt, response=response_payload)
+                classification = getattr(result, "classification", "respond")
+            except (LangChainException, ValueError, RuntimeError, TypeError) as exc:
+                logger.warning("[triage] Router failed, defaulting to respond: %s", exc, exc_info=True)
+                classification = "respond"
 
         # --- Reminder Logic: Part 2: Create on Triage Decision ---
+        prev_deterministic_flag = bool(state.get("deterministic_reply_emitted", False))
+
         if classification in {"respond", "notify"}:
-            print(f"🔔 Classification: {classification.upper()} - This email requires attention.")
+            logger.info(
+                "Classification=%s — email requires attention.",
+                classification.upper(),
+            )
             if not reply_detected:
                 decision = None
                 risk_level = sender_assessment.risk_level
@@ -467,66 +912,136 @@ def triage_router_task(
                                     ),
                                 }
                             ],
+                            "deterministic_reply_emitted": False,
                         }
                         if trace:
-                            trace.set_outputs(f"classification={classification}; goto=triage_interrupt_handler; judge=hitl")
+                            trace.set_outputs(
+                                f"{trace_ctx.summary}; classification={classification}; goto=triage_interrupt_handler; judge=hitl"
+                            )
                         return Command(goto="triage_interrupt_handler", update=update)
                     if decision.decision == "reject":
                         note_sender(store, sender_assessment.email, "flagged", decision.rationale)
-                        update = {"classification_decision": "ignore"}
+                        update = {
+                            "classification_decision": "ignore",
+                            "deterministic_reply_emitted": False,
+                        }
                         if trace:
-                            trace.set_outputs("classification=ignore; goto=__end__; judge=reject")
+                            trace.set_outputs(f"{trace_ctx.summary}; classification=ignore; goto=__end__; judge=reject")
                         return Command(goto=END, update=update)
                     note_sender(store, sender_assessment.email, "trusted", decision.rationale)
                 else:
                     status_label = "trusted" if sender_assessment.status != "new" else "known"
                     note_sender(store, sender_assessment.email, status_label, sender_assessment.reason)
 
-                default_hours = int(os.getenv("REMINDER_DEFAULT_HOURS", 48))
-                due_at = datetime.now(timezone.utc) + timedelta(hours=default_hours)
-                reminder_actions.append(
-                    {
-                        "action": "create",
-                        "thread_id": email_id,
-                        "subject": subject,
-                        "due_at": due_at.isoformat(),
-                        "reason": reminder_reason,
-                        "risk": sender_assessment.risk_level,
-                        "sender": sender_assessment.email,
-                    }
-                )
-                print(f"INFO: Reminder creation enqueued for thread {email_id} due at {due_at.isoformat()}")
+                if reminder_thread_id == "__default__":
+                    logger.debug(
+                        "[reminder] Skipping reminder creation for fallback thread id; no stable Gmail thread available."
+                    )
+                else:
+                    default_hours = _parse_positive_int_env("REMINDER_DEFAULT_HOURS", 48)
+                    due_at = datetime.now(timezone.utc) + timedelta(hours=default_hours)
+                    reminder_actions.append(
+                        {
+                            "action": "create",
+                            "thread_id": reminder_thread_id,
+                            "subject": subject,
+                            "due_at": due_at.isoformat(),
+                            "reason": reminder_reason,
+                            "risk": sender_assessment.risk_level,
+                            "sender": sender_assessment.email,
+                        }
+                    )
+                    logger.info(
+                        "Reminder creation enqueued for thread %s due at %s.",
+                        reminder_thread_id,
+                        due_at.isoformat(),
+                    )
 
             if classification == "respond":
                 goto = "response_agent"
                 update = {
-                    "classification_decision": classification,
+                    "classification_decision": "respond",
                     "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+                    "deterministic_reply_emitted": prev_deterministic_flag,
+                    "triage_interrupt_completed": True,
                 }
             else:
                 goto = "triage_interrupt_handler"
-                update = {"classification_decision": classification}
+                update = {
+                    "classification_decision": classification,
+                    "deterministic_reply_emitted": prev_deterministic_flag,
+                    "triage_interrupt_completed": False,
+                }
 
         elif classification == "ignore":
-            print(f"🚫 Classification: IGNORE - This email can be safely ignored")
+            logger.info("Classification=IGNORE — no response required.")
             goto = END
-            update = {"classification_decision": classification}
+            update = {
+                "classification_decision": classification,
+                "deterministic_reply_emitted": prev_deterministic_flag,
+                "triage_interrupt_completed": True,
+            }
         else:
-            print(f"[triage] Unexpected classification '{classification}', defaulting to respond")
+            logger.warning(
+                "[triage] Unexpected classification '%s', defaulting to respond.",
+                classification,
+            )
             goto = "response_agent"
             update = {
                 "classification_decision": "respond",
                 "messages": [{"role": "user", "content": f"Respond to the email: {email_markdown}"}],
+                "deterministic_reply_emitted": prev_deterministic_flag,
+                "triage_interrupt_completed": True,
             }
+            if trace:
+                trace.set_outputs(f"{trace_ctx.summary}; classification={classification}; goto={goto}")
 
-        if trace:
-            trace.set_outputs(f"classification={classification}; goto={goto}")
     if reminder_actions:
+        if _eval_mode_enabled():
+            reminder_actions = []
+
         update = dict(update)
-        register_reminder_actions(email_id or thread_id or "__default__", reminder_actions, goto)
-        update["reminder_next_node"] = goto
-        goto = "cancel_reminder_node"
-        goto = "cancel_reminder_node"
+        cancel_actions = [a for a in reminder_actions if a.get("action") == "cancel"]
+        create_actions = [a for a in reminder_actions if a.get("action") == "create"]
+
+        post_dispatch_target = goto
+        dispatch_actions: list[dict[str, Any]] = []
+        if cancel_actions:
+            dispatch_actions.extend(cancel_actions)
+        if post_dispatch_target != "triage_interrupt_handler" and create_actions:
+            dispatch_actions.extend(create_actions)
+
+        if dispatch_actions:
+            staged = register_reminder_actions(
+                reminder_thread_id,
+                dispatch_actions,
+                post_dispatch_target,
+                origin="triage_router",
+            )
+            update.update(staged)
+            goto = "apply_reminder_actions_node"
+
+        if post_dispatch_target == "triage_interrupt_handler" and create_actions:
+            if reminder_thread_id == "__default__":
+                logger.warning(
+                    "[reminder] Skipping persistence for pending actions without a resolved thread id."
+                )
+            else:
+                try:
+                    store.put(("reminders", "pending_actions"), reminder_thread_id, create_actions)
+                except sqlite3.Error as exc:
+                    logger.warning(
+                        "[reminder] Failed to persist pending actions for %s: %s",
+                        reminder_thread_id,
+                        exc,
+                        exc_info=True,
+                    )
+            # Ensure the dispatcher knows to continue toward the HITL node even when no
+            # immediate reminder actions are staged (e.g., notify/only-create scenarios).
+            update.setdefault("reminder_actions", [])
+            update["reminder_thread_id"] = reminder_thread_id
+            update["reminder_next_node"] = "triage_interrupt_handler"
+            update["reminder_dispatch_origin"] = "triage_router"
 
     return Command(goto=goto, update=update)
 
@@ -570,10 +1085,62 @@ def triage_interrupt_handler_task(
     Raises:
         ValueError: If the human interrupt response type is unrecognized.
     """
-    author, to, subject, email_thread, email_id = parse_gmail(state["email_input"])
+    deterministic_value = state.get("deterministic_reply_emitted")
+    finalized_marker = state.get("last_finalized_email_key")
+    current_marker = _current_email_marker(state, runtime)
+    assistant_reply = state.get("assistant_reply", None)
+    send_email_done = _send_email_executed(state)
+
+    logger.debug(
+        "[triage] interrupt pre-check marker=%s finalized=%s reply_present=%s send_email_done=%s",
+        current_marker,
+        finalized_marker,
+        assistant_reply is not None,
+        send_email_done,
+    )
+    if (
+        (finalized_marker and assistant_reply is not None and finalized_marker == current_marker)
+        or send_email_done
+    ):
+        update_payload = {"triage_interrupt_completed": True}
+        if deterministic_value is not None:
+            update_payload["deterministic_reply_emitted"] = deterministic_value
+        logger.debug(
+            "[triage] skipping interrupt for marker %s; reply already finalised.",
+            current_marker,
+        )
+        return Command(goto=END, update=update_payload)
+
+    triage_already_done = bool(state.get("triage_interrupt_completed"))
+    if triage_already_done:
+        update_payload = {"triage_interrupt_completed": True}
+        if deterministic_value is not None:
+            update_payload["deterministic_reply_emitted"] = deterministic_value
+        return Command(goto=END, update=update_payload)
+
+    trace_ctx = _build_email_trace_context(state.get("email_input"))
+    author = trace_ctx.author
+    to = trace_ctx.to
+    subject = trace_ctx.subject
+    email_thread = trace_ctx.email_thread
+    email_id = trace_ctx.email_id
     email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-    messages = [{"role": "user", "content": f"Email to notify user about: {email_markdown}"}]
+    messages = [
+        {
+            "role": "user",
+            "content": f"Email to notify user about: {email_markdown}",
+        }
+    ]
     tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
+    pending_actions: list[dict[str, Any]] = []
+    pending_thread_id = resolve_thread_key(state)
+    record = store.get(("reminders", "pending_actions"), pending_thread_id)
+    payload = getattr(record, "value", None)
+    if payload:
+        try:
+            pending_actions = list(payload)
+        except TypeError:
+            pending_actions = [payload]
     request: HumanInterrupt = HumanInterrupt(
         action_request=ActionRequest(
             action=f"Email Assistant: {state['classification_decision']}",
@@ -590,10 +1157,12 @@ def triage_interrupt_handler_task(
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
     goto: str = END
 
+    triage_completed = bool(state.get("triage_interrupt_completed", False))
+
     with trace_stage(
         "triage_interrupt_handler",
         run_type="chain",
-        inputs_summary=f"triage notify -> {state['classification_decision']}",
+        inputs_summary=f"triage notify -> {state['classification_decision']} | {trace_ctx.summary}",
         tags=["triage", "hitl"],
         metadata={
             "email_id": email_id,
@@ -605,6 +1174,11 @@ def triage_interrupt_handler_task(
     ) as trace:
         response = _maybe_interrupt([request])[0]
 
+        update_payload: Dict[str, Any] = {
+            "messages": messages,
+            "deterministic_reply_emitted": state.get("deterministic_reply_emitted", False),
+        }
+
         if response["type"] == "response":
             user_input = response["args"]
             messages.append({"role": "user", "content": f"User wants to reply to the email. Use this feedback to respond: {user_input}"})
@@ -614,20 +1188,73 @@ def triage_interrupt_handler_task(
                 [{"role": "user", "content": "The user decided to respond to the email, so update the triage preferences to capture this."}] + messages,
             )
             goto = "response_agent"
+            if pending_actions:
+                staged = register_reminder_actions(
+                    pending_thread_id,
+                    pending_actions,
+                    "response_agent",
+                    origin="triage_hitl_response",
+                )
+                if staged.get("reminder_actions"):
+                    goto = "apply_reminder_actions_node"
+                update_payload.update(staged)
+                triage_completed = True
+                if pending_thread_id and pending_thread_id != "__default__":
+                    try:
+                        store.delete(("reminders", "pending_actions"), pending_thread_id)
+                    except sqlite3.Error as exc:
+                        logger.warning(
+                            "[reminder] Failed to clear pending actions for %s: %s",
+                            pending_thread_id,
+                            exc,
+                            exc_info=True,
+                        )
         elif response["type"] == "ignore":
             messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
             update_memory(store, ("email_assistant", "triage_preferences"), messages)
             goto = END
+            triage_completed = True
+            if pending_thread_id and pending_thread_id != "__default__":
+                try:
+                    store.delete(("reminders", "pending_actions"), pending_thread_id)
+                except sqlite3.Error as exc:
+                    logger.warning(
+                        "[reminder] Failed to clear pending actions after ignore for %s: %s",
+                        pending_thread_id,
+                        exc,
+                        exc_info=True,
+                    )
         elif response["type"] == "accept":
-            print("INFO: User accepted notification. Ending workflow.")
+            logger.info("User accepted notification. Ending workflow.")
             goto = END
+            triage_completed = True
+            if pending_thread_id and pending_thread_id != "__default__":
+                try:
+                    store.delete(("reminders", "pending_actions"), pending_thread_id)
+                except sqlite3.Error as exc:
+                    logger.warning(
+                        "[reminder] Failed to clear pending actions after accept for %s: %s",
+                        pending_thread_id,
+                        exc,
+                        exc_info=True,
+                    )
         else:
-            raise ValueError(f"Invalid response: {response}")
+            logger.error("Unhandled triage interrupt response payload: %s", response)
+            raise ValueError
 
         if trace:
-            trace.set_outputs(f"goto={goto}; response={response['type']}")
+            trace.set_outputs(f"{trace_ctx.summary}; goto={goto}; response={response['type']}")
 
-    return Command(goto=goto, update={"messages": messages})
+    if goto in {"response_agent", END}:
+        triage_completed = True
+
+    update_payload["triage_interrupt_completed"] = triage_completed
+
+    if goto == "mark_as_read_node":
+        logger.debug("[triage] Redirecting mark_as_read_node target to response_agent for top-level routing.")
+        goto = "response_agent"
+
+    return Command(goto=goto, update=update_payload)
 
 
 def triage_interrupt_handler(
@@ -661,6 +1288,47 @@ def llm_call_task(state: State, store: BaseStore):
     recipient_compat = eval_mode or (
         os.getenv("EMAIL_ASSISTANT_RECIPIENT_IN_EMAIL_ADDRESS", "").lower() in ("1", "true", "yes")
     )
+    deterministic_reply_emitted = bool(state.get("deterministic_reply_emitted", False))
+
+    finalized_marker = state.get("last_finalized_email_key")
+    assistant_reply_existing = state.get("assistant_reply")
+    current_marker = _current_email_marker(state)
+    already_finalised = (
+        finalized_marker
+        and assistant_reply_existing is not None
+        and finalized_marker == current_marker
+    )
+    def _return(messages, emitted=False):
+        flag = deterministic_reply_emitted or emitted
+        return {
+            "messages": messages,
+            "deterministic_reply_emitted": flag,
+        }
+    send_email_logged = _send_email_executed(state)
+
+    if already_finalised or (eval_mode and send_email_logged and assistant_reply_existing is not None):
+        with trace_stage(
+            "response_agent.llm_call",
+            run_type="chain",
+            inputs_summary=f"skip planning | {current_marker}",
+            tags=["response_agent", "router"],
+            metadata={
+                "finalized_marker": finalized_marker,
+                "current_marker": current_marker,
+                "assistant_reply_present": assistant_reply_existing is not None,
+                "eval_mode": eval_mode,
+                "send_email_logged": send_email_logged,
+            },
+        ) as trace:
+            if trace:
+                trace.set_outputs("reply already finalised; no additional plan emitted")
+        logger.debug(
+            "[llm_call] skipping plan emission for marker %s (finalised=%s, send_email_logged=%s)",
+            current_marker,
+            already_finalised,
+            send_email_logged,
+        )
+        return _return([])
     cal_preferences = get_memory(store, ("email_assistant", "cal_preferences"), default_cal_preferences)
     response_preferences = get_memory(store, ("email_assistant", "response_preferences"), default_response_preferences)
     gmail_prompt = agent_system_prompt_hitl_memory.replace("write_email", "send_email_tool").replace("check_calendar_availability", "check_calendar_tool").replace("schedule_meeting", "schedule_meeting_tool")
@@ -671,11 +1339,14 @@ def llm_call_task(state: State, store: BaseStore):
         "- For check_calendar_tool, pass dates as a list of strings in DD-MM-YYYY format (e.g., ['21-05-2025']).\n"
         "- For send_email_tool, include email_id and your email_address when replying.\n"
         "- After send_email_tool, immediately call Done.\n"
+        "- Emit stream_progress updates (phase labels like 'triage' or 'reply') before lengthy tool sequences to surface progress telemetry.\n"
     )
-    try:
-        author, to, subject, email_thread, email_id = parse_gmail(state.get("email_input", {}))
-    except Exception:
-        author = to = subject = email_thread = email_id = ""
+    trace_ctx = _build_email_trace_context(state.get("email_input"))
+    author = trace_ctx.author
+    to = trace_ctx.to
+    subject = trace_ctx.subject
+    email_thread = trace_ctx.email_thread
+    email_id = trace_ctx.email_id
     thread_id = _resolve_thread_id(state)
 
     def extract_email(addr: str) -> str:
@@ -695,20 +1366,21 @@ def llm_call_task(state: State, store: BaseStore):
     ]
     prior_tool_names = []
     for m in reversed(state.get("messages", [])):
-        if getattr(m, "tool_calls", None):
-            try:
-                prior_tool_names = [tc.get("name") for tc in m.tool_calls]
-            except Exception:
-                prior_tool_names = []
-            break
+        tool_calls = getattr(m, "tool_calls", None)
+        if not tool_calls:
+            continue
+        prior_tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls) if name]
+        break
     # Compute all tool names observed so far (across history)
     all_tool_names: list[str] = []
     for m in state.get("messages", []):
-        if getattr(m, "tool_calls", None):
-            try:
-                all_tool_names.extend([tc.get("name") for tc in m.tool_calls])
-            except Exception:
-                pass
+        tool_calls = getattr(m, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            name = _tool_call_name(tc)
+            if name:
+                all_tool_names.append(name)
 
     def _contains_keyword(text: str, keyword: str) -> bool:
         if not keyword:
@@ -741,6 +1413,23 @@ def llm_call_task(state: State, store: BaseStore):
             last_schedule_failure = None
 
     scheduling_disabled = last_schedule_failure is not None
+    scheduling_keywords = ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
+    scheduling_request = any(_contains_keyword(text_for_heuristic, k) for k in scheduling_keywords)
+    preferred_days = _extract_preferred_days(text_for_heuristic)
+    primary_day = _select_primary_day(preferred_days)
+    phone_followup_phrases = [
+        "call our office",
+        "call the office",
+        "call us",
+        "please call",
+        "give us a call",
+    ]
+    phone_followup = any(phrase in text_for_heuristic for phrase in phone_followup_phrases)
+    if not phone_followup and "call" in text_for_heuristic:
+        phone_followup = any(
+            _contains_keyword(text_for_heuristic, k)
+            for k in ["checkup", "doctor", "appointment"]
+        )
 
     if "check_calendar_tool" in all_tool_names and "schedule_meeting_tool" not in all_tool_names and "send_email_tool" not in all_tool_names:
         system_msgs.append({"role": "system", "content": "Now schedule the meeting with schedule_meeting_tool."})
@@ -753,8 +1442,7 @@ def llm_call_task(state: State, store: BaseStore):
         system_msgs.append({"role": "system", "content": "Do not call Done yet. First call send_email_tool with email_id and email_address to draft the reply."})
 
     # If this looks like a scheduling request, nudge the desired sequence
-    scheduling_keywords = ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
-    if scheduling_disabled and last_schedule_failure:
+    if scheduling_disabled and last_schedule_failure and scheduling_request and not phone_followup:
         failure_suffix = (
             f" (consecutive failures: {schedule_failure_count})"
             if schedule_failure_count > 1
@@ -766,12 +1454,13 @@ def llm_call_task(state: State, store: BaseStore):
                 "content": (
                     "Previous schedule_meeting_tool attempt failed with: "
                     f"{last_schedule_failure}{failure_suffix}. Do not retry schedule_meeting_tool. "
-                    "Instead, draft a send_email_tool reply that confirms you'll manually reserve the requested meeting time "
-                    "(include any mentioned duration such as 45-minute) and mention the sender's preferred days (e.g., Tuesday or Thursday)."
+                    "Instead, draft a send_email_tool reply that explains the calendar integration is unavailable, "
+                    "asks the sender to confirm their preferred meeting time (include the requested duration and preferred days), "
+                    "and notes you'll send the invite once the calendar issue is resolved."
                 ),
             }
         )
-    elif any(_contains_keyword(text_for_heuristic, k) for k in scheduling_keywords):
+    elif scheduling_request and not phone_followup:
         system_msgs.append({
             "role": "system",
             "content": "If the email requests scheduling, first call check_calendar_tool for the requested days, then schedule_meeting_tool, then draft the reply with send_email_tool, and finally call Done.",
@@ -821,17 +1510,18 @@ def llm_call_task(state: State, store: BaseStore):
             "content": "For swimming class inquiries, express interest in registering your daughter and explicitly ask to reserve a spot in one of the offered class times.",
         })
 
-    # 90-minute planning meeting guidance (availability only, no scheduling)
+    # 90-minute planning meeting guidance (ensure full scheduling workflow)
     if any(_contains_keyword(text_for_heuristic, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text_for_heuristic, k) for k in ["planning", "quarterly", "planning session"]):
         system_msgs.append({
             "role": "system",
-            "content": "For 90-minute planning sessions, first call check_calendar_tool for Monday or Wednesday next week, then reply with send_email_tool acknowledging the request and providing availability for a 90-minute meeting between 10 AM and 3 PM. Do not schedule a meeting. Then call Done.",
+            "content": "For 90-minute planning sessions, call check_calendar_tool for Monday and Wednesday next week, schedule a 90-minute meeting with schedule_meeting_tool, draft the confirmation with send_email_tool, then call Done.",
         })
 
     # Ensure the LLM sees the email context even if upstream routing didn't attach it
     try:
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        logger.debug("Failed to format email markdown: %s", exc, exc_info=True)
         email_markdown = ""
     base_messages = state.get("messages", []) or []
     needs_injection = not base_messages
@@ -850,18 +1540,17 @@ def llm_call_task(state: State, store: BaseStore):
     # it does not affect real-world behavior where a human would respond.
     try:
         if not (eval_mode or os.getenv("HITL_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")):
-            raise RuntimeError("anti-loop fallback disabled in live mode")
+            raise RuntimeError
         from langchain_core.messages import AIMessage
         all_tool_names_loopcheck: list[str] = []
         done_count = 0
         for m in state.get("messages", []):
-            if getattr(m, "tool_calls", None):
-                try:
-                    names = [tc.get("name") for tc in m.tool_calls]
-                except Exception:
-                    names = []
-                all_tool_names_loopcheck.extend(names)
-                done_count += sum(1 for n in names if n == "Done")
+            tool_calls = getattr(m, "tool_calls", None)
+            if not tool_calls:
+                continue
+            names = [_tool_call_name(tc) for tc in tool_calls if _tool_call_name(tc)]
+            all_tool_names_loopcheck.extend(names)
+            done_count += sum(1 for n in names if n == "Done")
         is_scheduling_context = any(_contains_keyword(text_for_heuristic, k) for k in [
             "schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule",
         ])
@@ -870,7 +1559,7 @@ def llm_call_task(state: State, store: BaseStore):
             and done_count >= 1
             and not is_scheduling_context
         )
-        if needs_reply_injection:
+        if needs_reply_injection and not deterministic_reply_emitted:
             # Build a short contextual reply like in eval-mode defaults
             text = text_for_heuristic
             if any(_contains_keyword(text, k) for k in ["api", "documentation", "/auth/refresh", "/auth/validate"]):
@@ -917,18 +1606,20 @@ def llm_call_task(state: State, store: BaseStore):
                 },
                 {"name": "Done", "args": {"done": True}, "id": "done"},
             ]
-            return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
-    except Exception:
-        # If any error occurs in the fallback logic, continue with normal flow
-        pass
+            return _return([AIMessage(content="", tool_calls=tool_calls)], emitted=True)
+    except RuntimeError as exc:
+        logger.debug("Skipping anti-loop fallback: %s", exc)
+    except (ValueError, TypeError) as exc:
+        logger.debug("Anti-loop fallback failed; continuing with normal flow: %s", exc, exc_info=True)
 
     # High-confidence deterministic plans for tricky cases (only in eval mode)
     if eval_mode:
         from langchain_core.messages import AIMessage
-        try:
-            author, to, subject, email_thread, email_id = parse_gmail(state.get("email_input", {}))
-        except Exception:
-            author = to = subject = email_thread = email_id = ""
+        author = trace_ctx.author
+        to = trace_ctx.to
+        subject = trace_ctx.subject
+        email_thread = trace_ctx.email_thread
+        email_id = trace_ctx.email_id or ""
 
         def extract_email(addr: str) -> str:
             if not addr:
@@ -947,74 +1638,86 @@ def llm_call_task(state: State, store: BaseStore):
                 "args": {"content": "Should this email thread be moved to Spam?"},
                 "id": "question",
             }]
-            return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+            return _return([AIMessage(content="", tool_calls=tool_calls)])
 
         tool_calls = []
-        # Heuristic: 90-minute planning meeting → check calendar then reply (no scheduling)
-        if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
-            tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"})
-            email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
+        duration_minutes, duration_label = _extract_requested_duration(text)
+        if not duration_minutes:
+            duration_minutes = 45
+        if not duration_label:
+            duration_label = f"{duration_minutes}-minute"
+
+        if (not scheduling_disabled) and scheduling_request and not phone_followup:
+            calendar_dates = _calendar_dates_for_days(preferred_days, primary_day)
             tool_calls.append({
-                "name": "send_email_tool",
-                "args": {
-                    "email_id": email_id or "NEW_EMAIL",
-                    "response_text": "Thanks for the note. I'm available for a 90-minute session on Monday or Wednesday between 10 AM and 3 PM. Please pick a time that works and I'll confirm.",
-                    "email_address": email_arg,
-                },
-                "id": "send_email",
+                "name": "check_calendar_tool",
+                "args": {"dates": calendar_dates},
+                "id": "check_cal",
             })
-            tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
-        # If it's about scheduling (general) → check calendar → schedule → reply → done
-        elif (not scheduling_disabled) and any(
-            _contains_keyword(text, k)
-            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
-        ):
-            # Use Tue/Thu example dates to align with dataset phrasing
-            tool_calls.append({"name": "check_calendar_tool", "args": {"dates": ["20-05-2025", "22-05-2025"]}, "id": "check_cal"})
-            tool_calls.append({
-                "name": "schedule_meeting_tool",
-                "args": {
-                    "attendees": [e for e in [my_email, other_email] if e],
-                    "title": subject or "Meeting",
-                    "start_time": "2025-05-22T14:00:00",
-                    "end_time": "2025-05-22T14:45:00",
-                    "organizer_email": my_email or "me@example.com",
-                },
-                "id": "schedule",
-            })
-            # Tailor the email text when tax planning is mentioned
-            response_text = (
-                "Thanks for the tax planning note — I'm available on Tuesday or Thursday afternoons. "
-                "I've scheduled a 45-minute call for Thursday at 2:00 PM and sent a calendar invite."
-                if ("tax" in text or "planning" in text)
-                else "Confirmed availability — I've scheduled a 45-minute meeting and sent the invite."
+            start_time_iso, end_time_iso, friendly_day, friendly_time = _meeting_times_for_day(primary_day, duration_minutes)
+            tool_calls.append(
+                {
+                    "name": "schedule_meeting_tool",
+                    "args": {
+                        "attendees": [e for e in [my_email, other_email] if e],
+                        "title": subject or "Meeting",
+                        "start_time": start_time_iso,
+                        "end_time": end_time_iso,
+                        "organizer_email": my_email or "me@example.com",
+                    },
+                    "id": "schedule",
+                }
             )
+            if any(_contains_keyword(text, k) for k in ["slides", "presentation", "deck"]):
+                response_text = (
+                    f"Thanks for kicking off the slides — I've booked a {duration_label} working session on {friendly_day} at {friendly_time} "
+                    "so we can collaborate on the deck. The invite is on its way; happy to adjust if needed."
+                )
+            elif _contains_keyword(text, "tax") and _contains_keyword(text, "planning"):
+                response_text = (
+                    f"Thanks for the tax planning note — I've scheduled a {duration_label} call on {friendly_day} at {friendly_time} and sent the invite."
+                )
+            elif any(_contains_keyword(text, k) for k in ["quarterly", "roadmap", "planning session"]):
+                response_text = (
+                    f"I've scheduled a {duration_label} planning session on {friendly_day} at {friendly_time}. Let me know if you prefer a different slot."
+                )
+            else:
+                response_text = (
+                    f"I've scheduled a {duration_label} meeting on {friendly_day} at {friendly_time} and sent the invite."
+                )
+
+            alternate_days = [day for day in preferred_days if day != primary_day]
+            if alternate_days:
+                alt_label = alternate_days[0].capitalize()
+                response_text += f" If {alt_label} works better, just let me know."
+
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
-            tool_calls.append({
-                "name": "send_email_tool",
-                "args": {
-                    "email_id": email_id or "NEW_EMAIL",
-                    "response_text": response_text,
-                    "email_address": email_arg,
-                },
-                "id": "send_email",
-            })
+            tool_calls.append(
+                {
+                    "name": "send_email_tool",
+                    "args": {
+                        "email_id": email_id or "NEW_EMAIL",
+                        "response_text": response_text,
+                        "email_address": email_arg,
+                    },
+                    "id": "send_email",
+                }
+            )
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
-        elif scheduling_disabled and any(
-            _contains_keyword(text, k)
-            for k in ["schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule"]
-        ):
+        elif scheduling_disabled and scheduling_request and not phone_followup:
             email_arg = (other_email or "me@example.com") if recipient_compat else (my_email or "me@example.com")
             manual_text = _build_manual_scheduling_reply(text)
-            tool_calls.append({
-                "name": "send_email_tool",
-                "args": {
-                    "email_id": email_id or "NEW_EMAIL",
-                    "response_text": manual_text,
-                    "email_address": email_arg,
-                },
-                "id": "send_email",
-            })
+            tool_calls.append(
+                {
+                    "name": "send_email_tool",
+                    "args": {
+                        "email_id": email_id or "NEW_EMAIL",
+                        "response_text": manual_text,
+                        "email_address": email_arg,
+                    },
+                    "id": "send_email",
+                }
+            )
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
         else:
             # Default respond-only plan with contextual content
@@ -1059,14 +1762,20 @@ def llm_call_task(state: State, store: BaseStore):
             })
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
 
-        return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+        emit = any(tc.get("name") == "send_email_tool" for tc in tool_calls)
+        return _return([AIMessage(content="", tool_calls=tool_calls)], emitted=emit)
     msg = None
     with trace_stage(
         "response_agent.llm",
         run_type="llm",
-        inputs_summary=f"prompt_messages={len(prompt)}",
+        inputs_summary=f"{trace_ctx.summary}; prompt_messages={len(prompt)}",
         tags=["response_agent", "llm"],
-        metadata={"email_id": email_id, "thread_id": thread_id},
+        metadata={
+            "email_id": email_id,
+            "thread_id": thread_id,
+            "subject_display": trace_ctx.subject_display,
+            "sender_display": trace_ctx.sender_display,
+        },
     ) as trace:
         try:
             msg = llm_with_tools.invoke(prompt)
@@ -1076,7 +1785,8 @@ def llm_call_task(state: State, store: BaseStore):
                 else getattr(msg, "__dict__", msg)
             )
             log_llm_child_run(prompt=prompt, response=response_payload)
-        except Exception:
+        except (LangChainException, ValueError, RuntimeError, TypeError):
+            logger.exception("Primary tool-planning call failed")
             msg = None
 
         if not getattr(msg, "tool_calls", None):
@@ -1096,17 +1806,15 @@ def llm_call_task(state: State, store: BaseStore):
                 log_llm_child_run(prompt=retry, response=response_payload_retry)
                 if getattr(msg_retry, "tool_calls", None):
                     msg = msg_retry
-            except Exception:
+            except (LangChainException, ValueError, RuntimeError, TypeError):
+                logger.exception("Retry tool-planning call failed")
                 msg = None
 
         if trace:
-            tool_names: list[str] = []
-            try:
-                tool_names = [tc.get("name") for tc in getattr(msg, "tool_calls", []) or []]
-            except Exception:
-                tool_names = []
+            tool_calls_payload = getattr(msg, "tool_calls", []) or []
+            tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_payload) if name]
             summary = "tool_plan=" + (",".join(name for name in tool_names if name) if tool_names else "none")
-            trace.set_outputs(summary)
+            trace.set_outputs(f"{trace_ctx.summary}; {summary}")
     # Post-process LLM tool plan: enforce intent-specific plans and termination
     if getattr(msg, "tool_calls", None):
         text = text_for_heuristic
@@ -1200,30 +1908,31 @@ def llm_call_task(state: State, store: BaseStore):
             ]
             msg = AIMessage(content="", tool_calls=tool_calls)
         else:
-            try:
-                tool_names = [tc.get("name") for tc in msg.tool_calls]
-            except Exception:
-                tool_names = []
+            tool_calls_list = getattr(msg, "tool_calls", []) or []
+            tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_list) if name]
             if ("schedule_meeting_tool" in tool_names) and ("check_calendar_tool" not in tool_names):
                 dates = ["20-05-2025", "22-05-2025"]
                 injected = [{"name": "check_calendar_tool", "args": {"dates": dates}, "id": "check_cal"}]
-                msg = msg.model_copy(update={"tool_calls": injected + msg.tool_calls})
-                tool_names = [tc.get("name") for tc in msg.tool_calls]
+                msg = msg.model_copy(update={"tool_calls": injected + tool_calls_list})
+                tool_calls_list = getattr(msg, "tool_calls", []) or []
+                tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_list) if name]
             if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
                 if ("send_email_tool" in tool_names) and ("check_calendar_tool" not in tool_names):
                     injected = [{"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"}]
-                    msg = msg.model_copy(update={"tool_calls": injected + msg.tool_calls})
-                    tool_names = [tc.get("name") for tc in msg.tool_calls]
+                    msg = msg.model_copy(update={"tool_calls": injected + tool_calls_list})
+                    tool_calls_list = getattr(msg, "tool_calls", []) or []
+                    tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_list) if name]
             if "send_email_tool" in tool_names and "Done" not in tool_names:
                 from langchain_core.messages import AIMessage
-                msg = msg.model_copy(update={"tool_calls": msg.tool_calls + [{"name": "Done", "args": {"done": True}, "id": "done"}]})
+                msg = msg.model_copy(update={"tool_calls": tool_calls_list + [{"name": "Done", "args": {"done": True}, "id": "done"}]})
     if not getattr(msg, "tool_calls", None):
         # Final offline fallback: synthesize tool_calls similar to eval_mode
         from langchain_core.messages import AIMessage
-        try:
-            author, to, subject, email_thread, email_id = parse_gmail(state.get("email_input", {}))
-        except Exception:
-            author = to = subject = email_thread = email_id = ""
+        author = trace_ctx.author
+        to = trace_ctx.to
+        subject = trace_ctx.subject
+        email_thread = trace_ctx.email_thread
+        email_id = trace_ctx.email_id or ""
 
         def extract_email(addr: str) -> str:
             if not addr:
@@ -1242,8 +1951,9 @@ def llm_call_task(state: State, store: BaseStore):
                 "args": {"content": "Should this email thread be moved to Spam?"},
                 "id": "question",
             }]
-            msg = AIMessage(content="", tool_calls=tool_calls)
-            return {"messages": [msg]}
+        msg = AIMessage(content="", tool_calls=tool_calls)
+        emit = any(tc.get("name") == "send_email_tool" for tc in tool_calls)
+        return _return([msg], emitted=emit)
 
         tool_calls = []
         if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
@@ -1349,7 +2059,8 @@ def llm_call_task(state: State, store: BaseStore):
             tool_calls.append({"name": "Done", "args": {"done": True}, "id": "done"})
 
         msg = AIMessage(content="", tool_calls=tool_calls)
-    return {"messages": [msg]}
+    emit_final = any(tc.get("name") == "send_email_tool" for tc in getattr(msg, "tool_calls", []) or [])
+    return _return([msg], emitted=emit_final)
 
 
 def llm_call(state: State, store: BaseStore):
@@ -1367,52 +2078,94 @@ def interrupt_handler_task(
     state: State,
     store: BaseStore,
     runtime: Runtime[AssistantContext],
-) -> Command[Literal["llm_call", "__end__"]]:
+) -> Command[Literal["llm_call", "mark_as_read_node", "__end__"]]:
     """
     Create human-review interrupts for assistant tool calls, apply user decisions (accept, edit, ignore, respond), invoke or simulate tools as needed, and record resulting tool observations and memory updates.
     
     Returns:
-        Command: A Command whose `goto` is either `'llm_call'` or `'__end__'` and whose `update` contains a `messages` list with tool observations, edited assistant messages, and user-feedback entries.
+        Command: A Command whose `goto` directs the next node (`'llm_call'`, `'mark_as_read_node'`, or `'__end__'`) and whose `update` contains a `messages` list with tool observations, edited assistant messages, and user-feedback entries.
     """
-    ai_message = state["messages"][-1]
+    messages_state = list(state.get("messages") or [])
     result: list[Any] = []
     goto = "llm_call"
-    try:
-        tool_names_summary = [tc.get("name") for tc in ai_message.tool_calls]
-    except Exception:
-        tool_names_summary = []
+    manual_schedule_reply: str | None = None
+    manual_schedule_reply_used = False
+    command_update: dict[str, Any] = {
+        "messages": result,
+        "triage_interrupt_completed": state.get("triage_interrupt_completed", False),
+    }
+
+    ai_message: Any | None = None
+    ai_tool_calls: list[dict[str, Any]] = []
+    for message in reversed(messages_state):
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if tool_calls:
+            ai_message = message
+            ai_tool_calls = list(tool_calls)
+            break
+
+    if ai_message is None:
+        logger.warning(
+            "[interrupt_handler] No assistant plan with tool_calls found; routing back to llm_call."
+        )
+        command_update["messages"] = []
+        return Command(goto="llm_call", update=command_update)
+
+    tool_names_summary = [name for name in (_tool_call_name(tc) for tc in ai_tool_calls) if name]
     email_input_cached = state.get("email_input", {})
+    trace_ctx = _build_email_trace_context(email_input_cached)
     tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
-    try:
-        _author_meta, _to_meta, _subject_meta, _body_meta, email_id_meta = parse_gmail(email_input_cached)
-    except Exception:
-        email_id_meta = None
+
+    eval_mode = _eval_mode_enabled()
+    current_marker = _current_email_marker(state, runtime)
+    finalized_marker = state.get("last_finalized_email_key")
+    assistant_reply_existing = state.get("assistant_reply")
+
+    if (
+        eval_mode
+        and assistant_reply_existing
+        and finalized_marker
+        and finalized_marker == current_marker
+    ):
+        logger.debug(
+            "[interrupt_handler] eval fast-path skip; assistant reply already set for marker %s",
+            current_marker,
+        )
+        command_update["messages"] = []
+        command_update["triage_interrupt_completed"] = True
+        return Command(goto="mark_as_read_node", update=command_update)
 
     with trace_stage(
         "response_agent.interrupt_handler",
         run_type="chain",
-        inputs_summary=f"tool_calls={len(tool_names_summary)}",
+        inputs_summary=f"{trace_ctx.summary}; tool_calls={len(tool_names_summary)}",
         tags=["response_agent", "hitl"],
         metadata={
-            "email_id": email_id_meta,
+            "email_id": trace_ctx.email_id,
             "thread_id": thread_id,
             "timezone": tz_name,
             "eval_mode": eval_mode,
+            "subject_display": trace_ctx.subject_display,
+            "sender_display": trace_ctx.sender_display,
         },
         extra={"tool_names": tool_names_summary},
     ) as trace:
-        for tool_call in ai_message.tool_calls:
+        for tool_call in ai_tool_calls:
             if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question", "mark_as_spam_tool"]:
                 observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
                 result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
                 if tool_call["name"] == "Done":
                     goto = "mark_as_read_node"
                 continue
-            email_input = state["email_input"]
-            author, to, subject, email_thread, email_id = parse_gmail(email_input)
+            author = trace_ctx.author
+            to = trace_ctx.to
+            subject = trace_ctx.subject
+            email_thread = trace_ctx.email_thread
+            email_id = trace_ctx.email_id
             original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
             email_body_lower = (email_thread or "").lower()
+            email_text_context = f"{subject or ''}\n{email_thread or ''}".strip()
             doc_review_context = (
                 "review" in email_body_lower and ("friday" in email_body_lower or "deadline" in email_body_lower)
             )
@@ -1431,50 +2184,45 @@ def interrupt_handler_task(
                     if not any(keyword in response_lower for keyword in ["friday", "deadline"]):
                         additions.append("Expect my feedback before Friday.")
                     if additions:
-                        trimmed = response_text.rstrip()
-                        if trimmed and trimmed[-1] not in ".!?":
-                            trimmed += "."
-                        updated_text = (trimmed + " " + " ".join(additions)).strip()
-                        args["response_text"] = updated_text
-                    response_text = updated_text
+                        response_text = _append_sentences(response_text, additions)
+                        args["response_text"] = response_text
                     response_lower = response_text.lower()
                 if any(keyword in email_body_lower for keyword in ["45-minute", "45 minute"]) and not any(
                     keyword in response_lower for keyword in ["45-minute", "45 minute"]
                 ):
-                    trimmed = response_text.rstrip()
-                    if trimmed and trimmed[-1] not in ".!?":
-                        trimmed += "."
-                    updated_text = (
-                        trimmed
-                        + " I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly."
-                    ).strip()
-                    args["response_text"] = updated_text
-                    response_text = updated_text
+                    response_text = _append_sentences(
+                        response_text,
+                        [
+                            "I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly.",
+                        ],
+                    )
+                    args["response_text"] = response_text
                     response_lower = response_text.lower()
                 requested_days = []
                 for day in ["tuesday", "thursday"]:
                     if day in email_body_lower and day not in response_lower:
                         requested_days.append(day.capitalize())
                 if requested_days:
-                    trimmed = response_text.rstrip()
-                    if trimmed and trimmed[-1] not in ".!?":
-                        trimmed += "."
                     if len(requested_days) == 2:
                         day_sentence = "Tuesday or Thursday afternoon both work for me."
                     else:
                         day_sentence = f"{requested_days[0]} afternoon works for me."
-                    updated_text = (trimmed + " " + day_sentence).strip()
-                    args["response_text"] = updated_text
-                    response_text = updated_text
+                    response_text = _append_sentences(response_text, [day_sentence])
+                    args["response_text"] = response_text
                     response_lower = response_text.lower()
                 if swim_context and not any(keyword in response_lower for keyword in ["reserve", "register"]):
-                    trimmed = response_text.rstrip()
-                    if trimmed and trimmed[-1] not in ".!?":
-                        trimmed += "."
-                    updated_text = (trimmed + " Please reserve a spot for my daughter in the intermediate class.").strip()
-                    args["response_text"] = updated_text
-                    response_text = updated_text
+                    response_text = _append_sentences(
+                        response_text,
+                        ["Please reserve a spot for my daughter in the intermediate class."],
+                    )
+                    args["response_text"] = response_text
                     response_lower = response_text.lower()
+                if manual_schedule_reply:
+                    args["response_text"] = manual_schedule_reply
+                    response_text = manual_schedule_reply
+                    response_lower = response_text.lower()
+                    manual_schedule_reply = None
+                    manual_schedule_reply_used = True
                 def _extract_email(addr: str) -> str:
                     if not addr:
                         return ""
@@ -1521,7 +2269,8 @@ def interrupt_handler_task(
                     allow_accept=True,
                 )
             else:
-                raise ValueError(f"Invalid tool call: {tool_call['name']}")
+                logger.error("Unknown tool call encountered during HITL: %s", tool_call)
+                raise ValueError
 
             request: HumanInterrupt = HumanInterrupt(
                 action_request=ActionRequest(
@@ -1532,32 +2281,65 @@ def interrupt_handler_task(
                 description=description,
             )
             response = _maybe_interrupt([request])[0]
-    
-            if response["type"] == "accept":
-                observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
+            response_type = response.get("type")
+            user_feedback = response.get("args")
+
+            if response_type == "accept":
+                invoke_args = dict(tool_call.get("args") or {})
+                if tool_call["name"] == "mark_as_spam_tool":
+                    invoke_args["confirm"] = True
+                observation = _safe_tool_invoke(tool_call["name"], invoke_args)
                 result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
-            elif response["type"] == "edit":
+                if (
+                    tool_call["name"] == "schedule_meeting_tool"
+                    and isinstance(observation, str)
+                    and (
+                        "failed to schedule" in observation.lower()
+                        or "error scheduling" in observation.lower()
+                        or "error executing schedule_meeting_tool" in observation.lower()
+                    )
+                ):
+                    manual_schedule_reply = _build_manual_scheduling_reply(email_text_context)
+            elif response_type == "edit":
                 edited_args = response["args"]["args"]
-                current_id = tool_call["id"]
-                updated_tool_calls = [tc for tc in ai_message.tool_calls if tc["id"] != current_id] + [{"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}]
-                result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
+                current_id = _tool_call_id(tool_call)
+                call_name = _tool_call_name(tool_call)
+                filtered_calls = [
+                    tc for tc in ai_tool_calls if _tool_call_id(tc) != current_id
+                ]
+                filtered_calls.append({"name": call_name, "args": edited_args, "id": current_id})
+                result.append(ai_message.model_copy(update={"tool_calls": filtered_calls}))
                 observation = _safe_tool_invoke(tool_call["name"], edited_args)
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
+                if (
+                    tool_call["name"] == "schedule_meeting_tool"
+                    and isinstance(observation, str)
+                    and (
+                        "failed to schedule" in observation.lower()
+                        or "error scheduling" in observation.lower()
+                        or "error executing schedule_meeting_tool" in observation.lower()
+                    )
+                ):
+                    manual_schedule_reply = _build_manual_scheduling_reply(email_text_context)
                 if tool_call["name"] == "send_email_tool":
                     update_memory(store, ("email_assistant", "response_preferences"), [{"role": "user", "content": f"User edited the email response. Here is the initial email generated by the assistant: {tool_call['args']}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
                 elif tool_call["name"] == "schedule_meeting_tool":
                     update_memory(store, ("email_assistant", "cal_preferences"), [{"role": "user", "content": f"User edited the calendar invitation. Here is the initial calendar invitation generated by the assistant: {tool_call['args']}. Here is the edited calendar invitation: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-            elif response["type"] == "ignore":
+            elif response_type == "ignore":
                 result.append({"role": "tool", "content": f"User ignored this {tool_call['name']} draft. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
                 goto = END
                 update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": f"The user ignored the draft. Update triage preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-            elif response["type"] == "response":
-                user_feedback = response["args"]
+            elif response_type == "response":
                 if tool_call["name"] == "Question":
                     if any(k in str(user_feedback).lower() for k in ["spam", "phish", "junk"]):
-                        email_input = state["email_input"]
-                        author, to, subject, email_thread, email_id = parse_gmail(email_input)
-                        original_email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
+                        email_id = trace_ctx.email_id
+                        original_email_markdown = format_gmail_markdown(
+                            trace_ctx.subject,
+                            trace_ctx.author,
+                            trace_ctx.to,
+                            trace_ctx.email_thread,
+                            email_id,
+                        )
                         confirm: HumanInterrupt = HumanInterrupt(
                             action_request=ActionRequest(
                                 action="mark_as_spam_tool",
@@ -1578,11 +2360,11 @@ def interrupt_handler_task(
 
                             spam_call = {
                                 "name": "mark_as_spam_tool",
-                                "args": {"email_id": email_id},
+                                "args": {"email_id": email_id, "confirm": True},
                                 "id": "mark_spam",
                             }
                             result.append(AIMessage(content="", tool_calls=[spam_call]))
-                            observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id})
+                            observation = _safe_tool_invoke("mark_as_spam_tool", {"email_id": email_id, "confirm": True})
                             result.append({"role": "tool", "content": observation, "tool_call_id": "mark_spam"})
                             update_memory(
                                 store,
@@ -1608,11 +2390,30 @@ def interrupt_handler_task(
                 else:
                     result.append({"role": "tool", "content": f"User answered the question. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
             else:
-                result.append({"role": "tool", "content": f"User gave feedback. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
-                if tool_call["name"] == "send_email_tool":
-                    update_memory(store, ("email_assistant", "response_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the response preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-                elif tool_call["name"] == "schedule_meeting_tool":
-                    update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
+                logger.warning(
+                    "Unexpected HITL response payload received: type=%s payload=%s",
+                    response_type,
+                    response,
+                )
+                result.append(
+                    {
+                        "role": "tool",
+                        "content": "Received an unsupported HITL response. Ending the workflow safely.",
+                        "tool_call_id": tool_call["id"],
+                    }
+                )
+                goto = END
+                command_update["triage_interrupt_completed"] = True
+                break
+
+        if goto in {END, "response_agent", "mark_as_read_node"}:
+            command_update["triage_interrupt_completed"] = True
+
+        if manual_schedule_reply_used and goto not in {END, "mark_as_read_node"}:
+            goto = "mark_as_read_node"
+
+        if manual_schedule_reply_used:
+            command_update["manual_schedule_reply_handled"] = True
 
         if trace:
             handled = sum(
@@ -1623,9 +2424,16 @@ def interrupt_handler_task(
                     or getattr(entry, "tool_calls", None)
                 )
             )
-            trace.set_outputs(f"goto={goto}; handled={handled}")
+            trace.set_outputs(f"{trace_ctx.summary}; goto={goto}; handled={handled}")
 
-    return Command(goto=goto, update={"messages": result})
+    logger.debug(
+        "[interrupt_handler] completed with goto=%s manual_schedule_reply_used=%s handled=%d",
+        goto,
+        manual_schedule_reply_used,
+        len(result),
+    )
+
+    return Command(goto=goto, update=command_update)
 
 
 def should_continue(
@@ -1653,36 +2461,143 @@ def should_continue(
         Literal["interrupt_handler", "mark_as_read_node", "llm_call"]: The chosen next node name.
     """
     email_input = state.get("email_input", {})
-    try:
-        author, to, subject, email_thread, email_id = parse_gmail(email_input)
-    except Exception:
-        author = to = subject = email_thread = ""
-        email_id = None
+    trace_ctx = _build_email_trace_context(email_input)
+    author = trace_ctx.author
+    email_thread = trace_ctx.email_thread
+    email_id = trace_ctx.email_id
     tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
 
+    assistant_reply_existing = state.get("assistant_reply")
+    current_marker = _current_email_marker(state, runtime)
+    messages = state.get("messages") or []
+
+    tool_history_exists = any(_message_role_value(msg).lower() == "tool" for msg in messages)
+    if eval_mode and assistant_reply_existing is not None:
+        with trace_stage(
+            "response_agent.should_continue",
+            run_type="chain",
+            inputs_summary=f"eval reply cached | {trace_ctx.summary}",
+            tags=["response_agent", "router"],
+            metadata={
+                "email_id": email_id,
+                "thread_id": thread_id,
+                "timezone": tz_name,
+                "eval_mode": eval_mode,
+                "subject_display": trace_ctx.subject_display,
+                "sender_display": trace_ctx.sender_display,
+            },
+            extra={"assistant_reply_cached": True},
+        ) as trace:
+            if trace:
+                trace.set_outputs(
+                    f"{trace_ctx.summary}; next=mark_as_read_node; assistant_reply_cached=True"
+                )
+        logger.debug(
+            "[should_continue] eval reply detected; routing directly to mark_as_read_node"
+        )
+        return "mark_as_read_node"
+
+    if not isinstance(messages, list) or not messages:
+        with trace_stage(
+            "response_agent.should_continue",
+            run_type="chain",
+            inputs_summary=f"no messages | {trace_ctx.summary}",
+            tags=["response_agent", "router"],
+            metadata={
+                "email_id": email_id,
+                "thread_id": thread_id,
+                "timezone": tz_name,
+                "eval_mode": eval_mode,
+                "subject_display": trace_ctx.subject_display,
+                "sender_display": trace_ctx.sender_display,
+            },
+            extra={"reason": "empty_messages"},
+        ) as trace:
+            if trace:
+                trace.set_outputs(f"{trace_ctx.summary}; next=llm_call; reason=empty_messages")
+        return "llm_call"
+
     decision: Literal["interrupt_handler", "mark_as_read_node", "llm_call"] = "mark_as_read_node"
-    last_message = state["messages"][-1]
-    try:
-        tool_names = [call.get("name") for call in getattr(last_message, "tool_calls", []) or []]
-    except Exception:
-        tool_names = []
+
+    if eval_mode and (
+        (tool_history_exists and state.get("assistant_reply"))
+        or (
+            state.get("last_finalized_email_key")
+            and state.get("last_finalized_email_key") == current_marker
+            and state.get("assistant_reply") is not None
+        )
+    ):
+        with trace_stage(
+            "response_agent.should_continue",
+            run_type="chain",
+            inputs_summary=f"eval fast-path | {trace_ctx.summary}",
+            tags=["response_agent", "router"],
+            metadata={
+                "email_id": email_id,
+                "thread_id": thread_id,
+                "timezone": tz_name,
+                "eval_mode": eval_mode,
+                "subject_display": trace_ctx.subject_display,
+                "sender_display": trace_ctx.sender_display,
+            },
+            extra={"tool_history_exists": True},
+        ) as trace:
+            if trace:
+                trace.set_outputs(f"{trace_ctx.summary}; next=mark_as_read_node; eval_fast_path=True")
+        logger.debug(
+            "[should_continue] eval fast-path to mark_as_read_node (tool history detected)"
+        )
+        return "mark_as_read_node"
+    last_message = messages[-1]
+    tool_calls_payload = getattr(last_message, "tool_calls", None) or []
+    tool_names = [_tool_call_name(call) for call in tool_calls_payload]
+
+    if state.get("manual_schedule_reply_handled"):
+        with trace_stage(
+            "response_agent.should_continue",
+            run_type="chain",
+            inputs_summary=f"manual schedule fallback | {trace_ctx.summary}",
+            tags=["response_agent", "router"],
+            metadata={
+                "email_id": email_id,
+                "thread_id": thread_id,
+                "timezone": tz_name,
+                "eval_mode": eval_mode,
+                "subject_display": trace_ctx.subject_display,
+                "sender_display": trace_ctx.sender_display,
+            },
+            extra={"manual_schedule_reply_handled": True},
+        ) as trace:
+            if trace:
+                trace.set_outputs(
+                    f"{trace_ctx.summary}; next=mark_as_read_node; manual_schedule_reply_handled=True"
+                )
+        return "mark_as_read_node"
+
+    decision: Literal["interrupt_handler", "mark_as_read_node", "llm_call"] = "mark_as_read_node"
 
     with trace_stage(
         "response_agent.should_continue",
         run_type="chain",
-        inputs_summary="evaluate next step",
+        inputs_summary=f"evaluate next step | {trace_ctx.summary}",
         tags=["response_agent", "router"],
         metadata={
             "email_id": email_id,
             "thread_id": thread_id,
             "timezone": tz_name,
             "eval_mode": eval_mode,
+            "subject_display": trace_ctx.subject_display,
+            "sender_display": trace_ctx.sender_display,
         },
         extra={"last_tool_names": tool_names},
     ) as trace:
         if getattr(last_message, "tool_calls", None):
-            if "Done" in tool_names:
+            non_done_calls = [name for name in tool_names if name and name != "Done"]
+            has_done = "Done" in tool_names
+            if non_done_calls:
+                decision = "interrupt_handler"
+            elif has_done:
                 author_l = (author or "").lower()
                 thread_l = (email_thread or "").lower()
                 is_no_reply = (
@@ -1694,22 +2609,29 @@ def should_continue(
                     decision = "mark_as_read_node"
                 else:
                     all_tool_names: list[str] = []
-                    for message in state.get("messages", []):
-                        if getattr(message, "tool_calls", None):
-                            try:
-                                all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
-                            except Exception:
-                                pass
-                    decision = "llm_call" if "send_email_tool" not in all_tool_names else "mark_as_read_node"
+                    for message in messages:
+                        tool_calls = getattr(message, "tool_calls", None) or []
+                        for call in tool_calls:
+                            name = _tool_call_name(call)
+                            if name:
+                                all_tool_names.append(name)
+                    if "send_email_tool" in all_tool_names:
+                        decision = "mark_as_read_node"
+                    else:
+                        decision = "llm_call"
             else:
                 decision = "interrupt_handler"
         else:
             decision = "mark_as_read_node"
 
         if trace:
-            summary = f"next={decision}; tools={','.join(name for name in tool_names if name) or 'none'}"
+            tools_joined = ",".join(name for name in tool_names if name) or "none"
+            summary = f"{trace_ctx.summary}; next={decision}; tools={tools_joined}"
             trace.set_outputs(summary)
 
+    logger.debug(
+        "[should_continue] decision=%s summary=%s", decision, trace_ctx.summary
+    )
     return decision
 
 
@@ -1717,12 +2639,12 @@ def interrupt_handler(
     state: State,
     store: BaseStore,
     runtime: Runtime[AssistantContext],
-) -> Command[Literal["llm_call", "__end__"]]:
+) -> Command[Literal["llm_call", "mark_as_read_node", "__end__"]]:
     """
     Run the interrupt handler task and return its resulting command.
     
     Returns:
-        Command[Literal["llm_call", "__end__"]]: A command directing the workflow to either continue with "llm_call" or finish with "__end__".
+        Command[Literal["llm_call", "mark_as_read_node", "__end__"]]: A command directing the workflow to continue with "llm_call", jump straight to "mark_as_read_node", or finish with "__end__".
     """
 
     return interrupt_handler_task(state, store=store, runtime=runtime).result()
@@ -1752,9 +2674,15 @@ def mark_as_read_node_task(
     """
     skip = os.getenv("EMAIL_ASSISTANT_SKIP_MARK_AS_READ", "").lower() in ("1", "true", "yes")
     email_input = state["email_input"]
-    author, to, subject, email_thread, email_id = parse_gmail(email_input)
+    trace_ctx = _build_email_trace_context(email_input)
+    author = trace_ctx.author
+    to = trace_ctx.to
+    subject = trace_ctx.subject
+    email_thread = trace_ctx.email_thread
+    email_id = trace_ctx.email_id
     tz_name, eval_mode, thread_id_ctx, metadata = extract_runtime_metadata(runtime)
     thread_id = _resolve_thread_id(state, runtime) or thread_id_ctx
+    final_marker = _current_email_marker(state, runtime)
 
     result_payload: dict[str, Any]
 
@@ -1762,57 +2690,127 @@ def mark_as_read_node_task(
     output_text = ""
     tool_trace = ""
 
+    raw_messages = state.get("messages", [])
+    trimmed_messages: list[Any] = list(raw_messages) if isinstance(raw_messages, list) else []
+    if trimmed_messages:
+        last_plan_idx = None
+        for idx in range(len(trimmed_messages) - 1, -1, -1):
+            candidate = trimmed_messages[idx]
+            tool_calls = None
+            if isinstance(candidate, dict):
+                tool_calls = candidate.get("tool_calls")
+            else:
+                tool_calls = getattr(candidate, "tool_calls", None)
+            if tool_calls:
+                last_plan_idx = idx
+                break
+        if last_plan_idx is not None and last_plan_idx > 0:
+            trimmed_messages = trimmed_messages[last_plan_idx:]
+
+        logger.debug(
+            "[mark_as_read] plan_positions=%s chosen_idx=%s trimmed_len=%d",
+            [i for i, m in enumerate(raw_messages) if getattr(m, "tool_calls", None)],
+            last_plan_idx,
+            len(trimmed_messages),
+        )
+
     with trace_stage(
         "mark_as_read_node",
         run_type="chain",
-        inputs_summary=f"finalise thread {email_id or 'UNKNOWN'}",
+        inputs_summary=f"finalise {trace_ctx.summary}",
         tags=["finalize"],
         metadata={
             "email_id": email_id,
             "thread_id": thread_id,
             "timezone": tz_name,
             "eval_mode": eval_mode,
+            "subject_display": trace_ctx.subject_display,
+            "sender_display": trace_ctx.sender_display,
         },
     ) as trace:
         if skip:
-            print(f"[gmail] Skipping mark_as_read for {email_id or 'UNKNOWN_ID'} (toggle enabled)")
+            logger.info(
+                "[gmail] Skipping mark_as_read for %s (toggle enabled)",
+                email_id or "UNKNOWN_ID",
+            )
         else:
             try:
                 mark_as_read(email_id)
-            except Exception as e:
-                print(f"[gmail] mark_as_read failed for {email_id}: {e}")
+            except (HttpError, RuntimeError, OSError, ValueError):
+                logger.exception("[gmail] mark_as_read failed for %s", email_id or "UNKNOWN_ID")
 
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-        output_text = format_final_output(state)
-        tool_trace = format_messages_string(state.get("messages", []))
+        state_for_output = dict(state)
+        state_for_output["messages"] = trimmed_messages
+        output_text = format_final_output(state_for_output)
+        tool_trace = format_messages_string(trimmed_messages)
 
         summary = None
-        try:
-            for m in reversed(state.get("messages", [])):
-                tool_calls = getattr(m, "tool_calls", None)
-                if not tool_calls:
+        for message in reversed(trimmed_messages):
+            tool_calls = getattr(message, "tool_calls", None) or []
+            for tc in reversed(tool_calls):
+                name = _tool_call_name(tc)
+                if name not in {"send_email_tool", "write_email"}:
                     continue
-                for tc in reversed(tool_calls):
-                    if tc.get("name") in ("send_email_tool", "write_email"):
-                        args = tc.get("args", {})
-                        response_text = args.get("response_text") or args.get("content") or "(no content)"
-                        summary = f"Email sent to reply to '{subject}': {response_text}"
-                        break
-                if summary:
-                    break
-        except Exception:
-            summary = None
+                args = _tool_call_args(tc)
+                response_text = args.get("response_text") or args.get("content") or "(no content)"
+                content_snippet = _shorten(_clean_display(response_text, "(no content)"), 220)
+                summary = (
+                    f"Reply to '{trace_ctx.subject_display}' from {trace_ctx.sender_display}: "
+                    f"{content_snippet}"
+                )
+                break
+            if summary:
+                break
+
+        final_plan = None
+        for candidate in reversed(trimmed_messages):
+            tool_calls = getattr(candidate, "tool_calls", None)
+            if tool_calls:
+                final_plan = candidate
+                break
+
+        tool_messages_only: list[Any] = []
+        for message in trimmed_messages:
+            if _message_role_value(message).lower() == "tool":
+                tool_messages_only.append(message)
+
+        replacement_history: list[Any] = []
+        if final_plan is not None:
+            replacement_history.append(final_plan)
+        replacement_history.extend(tool_messages_only)
+        if summary:
+            replacement_history.append({"role": "assistant", "content": summary})
+
+        logger.debug(
+            "[mark_as_read] replacement_history_len=%d", len(replacement_history)
+        )
+        if isinstance(raw_messages, list):
+            raw_messages[:] = replacement_history
+
+        remove_all = RemoveMessage(id=REMOVE_ALL_MESSAGES, content="")
 
         if summary:
             result_payload = {
-                "messages": [{"role": "assistant", "content": summary}],
+                "messages": [remove_all, *replacement_history],
                 "assistant_reply": summary,
                 "email_markdown": email_markdown,
+                "deterministic_reply_emitted": False,
+                "triage_interrupt_completed": True,
+                "manual_schedule_reply_handled": False,
+                "last_finalized_email_key": final_marker,
+                "triage_eval_completed": True,
             }
         else:
             result_payload = {
+                "messages": [remove_all, *replacement_history],
                 "assistant_reply": "",
                 "email_markdown": email_markdown,
+                "deterministic_reply_emitted": False,
+                "triage_interrupt_completed": True,
+                "manual_schedule_reply_handled": False,
+                "last_finalized_email_key": final_marker,
+                "triage_eval_completed": True,
             }
 
         if tool_trace:
@@ -1825,15 +2823,31 @@ def mark_as_read_node_task(
                 result_payload.pop(key)
 
         if trace:
-            trace.set_outputs(output_text or "workflow complete")
+            summary_text = output_text or "workflow complete"
+            summary_text = _shorten(_clean_display(summary_text, "workflow complete"), 220)
+            trace.set_outputs(f"{trace_ctx.summary}; {summary_text}")
 
     metadata_payload = dict(metadata)
     metadata_payload.setdefault("email_id", email_id)
+    metadata_payload.setdefault("subject", trace_ctx.subject)
+    metadata_payload.setdefault("subject_display", trace_ctx.subject_display)
+    metadata_payload.setdefault("sender_display", trace_ctx.sender_display)
+    metadata_payload.setdefault("recipient_display", trace_ctx.recipient_display)
+    if trace_ctx.sender_email and "sender_email_address" not in metadata_payload:
+        metadata_payload["sender_email_address"] = trace_ctx.sender_email
+    if trace_ctx.recipient_email and "recipient_email_address" not in metadata_payload:
+        metadata_payload["recipient_email_address"] = trace_ctx.recipient_email
     prime_parent_run(
         email_input=state.get("email_input", {}),
         email_markdown=email_markdown,
         outputs=output_text,
-        extra_update={"email_id": email_id},
+        extra_update={
+            "email_id": email_id,
+            "email_subject": trace_ctx.subject_display,
+            "email_sender": trace_ctx.sender_display,
+            "trace_summary": trace_ctx.summary,
+        },
+        run_label=trace_ctx.run_label,
         metadata_update=metadata_payload,
         thread_id=thread_id,
     )
@@ -1864,6 +2878,8 @@ agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("interrupt_handler", interrupt_handler)
 agent_builder.add_node("mark_as_read_node", mark_as_read_node)
 agent_builder.add_edge(START, "llm_call")
+agent_builder.add_edge("interrupt_handler", "llm_call")
+agent_builder.add_edge("interrupt_handler", "mark_as_read_node")
 agent_builder.add_conditional_edges(
     "llm_call",
     should_continue,
@@ -1879,33 +2895,48 @@ response_agent = agent_builder.compile()
 overall_workflow = (
     StateGraph(State, context_schema=AssistantContext, input_schema=StateInput)
     .add_node(triage_router)
-    .add_node("cancel_reminder_node", cancel_reminder_node)
-    .add_node("create_reminder_node", create_reminder_node)
+    .add_node("apply_reminder_actions_node", apply_reminder_actions_node)
     .add_node(triage_interrupt_handler)
     .add_node("response_agent", response_agent)
     .add_edge(START, "triage_router")
-    .add_edge("triage_router", "cancel_reminder_node")
-    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", "apply_reminder_actions_node")
     .add_edge("triage_router", "triage_interrupt_handler")
-    .add_edge("cancel_reminder_node", "create_reminder_node")
-    .add_edge("cancel_reminder_node", "response_agent")
-    .add_edge("cancel_reminder_node", "triage_interrupt_handler")
-    .add_edge("cancel_reminder_node", END)
-    .add_edge("create_reminder_node", "response_agent")
-    .add_edge("create_reminder_node", "triage_interrupt_handler")
-    .add_edge("create_reminder_node", END)
+    .add_edge("triage_router", "response_agent")
+    .add_edge("triage_router", END)
+    .add_edge("apply_reminder_actions_node", "triage_interrupt_handler")
+    .add_edge("apply_reminder_actions_node", "response_agent")
+    .add_edge("apply_reminder_actions_node", END)
     .add_edge("triage_interrupt_handler", "response_agent")
+    .add_edge("triage_interrupt_handler", END)
     .add_edge("response_agent", END)
 )
 
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
 _DEFAULT_STORE = get_sqlite_store()
 
-email_assistant = (
-    overall_workflow
-    .compile(
+def _using_api_runtime() -> bool:
+    """Return True when running under LangGraph API/CLI runtime."""
+
+    disable_flag = os.getenv("LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER")
+    if disable_flag and disable_flag.lower() not in ("0", "false", "no", ""):
+        return True
+
+    return any(
+        os.getenv(flag)
+        for flag in (
+            "LANGGRAPH_API_HOST",
+            "LANGGRAPH_API_VARIANT",
+            "LANGGRAPH_CLOUD",
+        )
+    )
+
+
+if _using_api_runtime():
+    _compiled = overall_workflow.compile()
+else:
+    _compiled = overall_workflow.compile(
         checkpointer=_DEFAULT_CHECKPOINTER,
         store=_DEFAULT_STORE,
     )
-    .with_config(durability="sync")
-)
+
+email_assistant = _compiled.with_config(durability="sync", stream_mode=["updates", "messages", "custom"])

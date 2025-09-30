@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Sequence
 
+from langgraph.func import task
+from langgraph.runtime import Runtime
+from langgraph.store.base import BaseStore
 from langgraph.types import Command
 
 from email_assistant.tools.reminders import ReminderStore, get_default_store
@@ -13,9 +16,8 @@ from email_assistant.tools.reminders import ReminderStore, get_default_store
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_THREAD_KEY = "__default__"
 _REMINDER_STORE: ReminderStore | None = None
-_PENDING_ACTIONS: Dict[str, List[Dict[str, Any]]] = {}
-_PENDING_NEXT: Dict[str, str] = {}
 
 
 def set_reminder_store(store: ReminderStore) -> None:
@@ -32,176 +34,179 @@ def _get_store() -> ReminderStore:
     return _REMINDER_STORE
 
 
-def register_reminder_actions(thread_id: str, actions: List[Dict[str, Any]], next_node: str) -> None:
+def _normalise_thread_id(thread_id: object) -> str:
     if not thread_id:
-        thread_id = "__default__"
-    if not actions:
-        return
-    existing = _PENDING_ACTIONS.get(thread_id, [])
-    _PENDING_ACTIONS[thread_id] = existing + actions
-    _PENDING_NEXT[thread_id] = next_node
+        return _DEFAULT_THREAD_KEY
+    return str(thread_id)
 
 
-def consume_reminder_actions(thread_id: str) -> List[Dict[str, Any]]:
-    if not thread_id:
-      thread_id = "__default__"
-    return _PENDING_ACTIONS.pop(thread_id, [])
+def resolve_thread_key(state: Dict[str, Any]) -> str:
+    """Derive a stable reminder key from the current state."""
+
+    email_input = state.get("email_input") or {}
+    candidates = [
+        email_input.get("thread_id"),
+        email_input.get("threadId"),
+        email_input.get("gmail_thread_id"),
+        email_input.get("gmailThreadId"),
+        state.get("reminder_thread_id"),
+        email_input.get("id"),
+        state.get("thread_id"),
+    ]
+    for candidate in candidates:
+        if candidate:
+            return str(candidate)
+    return _DEFAULT_THREAD_KEY
 
 
-def peek_reminder_actions(thread_id: str) -> List[Dict[str, Any]]:
-    if not thread_id:
-        thread_id = "__default__"
-    return list(_PENDING_ACTIONS.get(thread_id, []))
+def stage_reminder_actions(
+    thread_id: object,
+    actions: Sequence[Dict[str, Any]],
+    next_node: str,
+    *,
+    origin: str | None = None,
+) -> Dict[str, Any]:
+    """Normalise reminder actions prior to dispatch."""
 
-
-def _parse_due_at(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        dt = value
-    elif isinstance(value, str):
-        trimmed = value.strip()
-        if not trimmed:
-            return datetime.now(timezone.utc)
-        if trimmed.endswith("Z"):
-            trimmed = trimmed[:-1] + "+00:00"
-        try:
-            dt = datetime.fromisoformat(trimmed)
-        except ValueError:
-            logger.warning("Reminder node: invalid due_at string '%s'; using current time", value)
-            return datetime.now(timezone.utc)
-    else:
-        logger.warning("Reminder node: unsupported due_at type %s; using current time", type(value).__name__)
-        return datetime.now(timezone.utc)
-
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _partition_actions(state: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    thread_id = _thread_key(state)
-    actions = peek_reminder_actions(thread_id)
-    cancels: List[Dict[str, Any]] = []
-    creates: List[Dict[str, Any]] = []
+    canonical_thread = _normalise_thread_id(thread_id)
+    staged: List[Dict[str, Any]] = []
     for action in actions:
         if not isinstance(action, dict):
             continue
-        kind = str(action.get("action"))
-        if kind == "cancel":
-            cancels.append(action)
-        elif kind == "create":
-            creates.append(action)
-    return cancels, creates
-
-
-def cancel_reminder_node(
-    state: Dict[str, Any],
-    store: Any = None,
-    runtime: Any = None,
-) -> Command[Literal["create_reminder_node", "response_agent", "triage_interrupt_handler", "__end__"]]:
-    """Cancel active reminders requested in the state and route to the next node."""
-
-    cancels, creates = _partition_actions(state)
-    thread_id = _thread_key(state)
-    next_node = _PENDING_NEXT.get(thread_id, state.get("reminder_next_node") or "response_agent")
-    if not cancels:
-        if creates:
-            logger.info("Reminder node: routing %d create action(s) to create_reminder_node", len(creates))
-        goto: Literal["create_reminder_node", "response_agent", "triage_interrupt_handler", "__end__"]
-        goto = "create_reminder_node" if creates else next_node
-        update: Dict[str, Any] = {
-            "reminder_next_node": next_node,
-        }
-        return Command(goto=goto, update=update)
-
-    reminder_store = _get_store()
-    for action in cancels:
-        thread_id = action.get("thread_id")
-        if not thread_id:
-            logger.warning("Reminder node: cancel action missing thread_id: %s", action)
+        kind = str(action.get("action", "")).lower()
+        if kind not in {"cancel", "create"}:
             continue
-        try:
-            cancelled = reminder_store.cancel_reminder(thread_id)
-            if cancelled:
-                logger.info("Reminder node: cancelled %s reminder(s) for thread %s", cancelled, thread_id)
-            else:
-                logger.info("Reminder node: no active reminder to cancel for thread %s", thread_id)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Reminder node: failed to cancel reminder for %s: %s", thread_id, exc)
+        payload = dict(action)
+        payload["action"] = kind
+        payload["thread_id"] = _normalise_thread_id(payload.get("thread_id") or canonical_thread)
+        staged.append(payload)
 
-    remaining = [action for action in peek_reminder_actions(thread_id) if action.get("action") == "create"]
-    if remaining:
-        key = thread_id if thread_id else "__default__"
-        _PENDING_ACTIONS[key] = remaining
-        _PENDING_NEXT[key] = next_node
-    else:
-        key = thread_id if thread_id else "__default__"
-        _PENDING_ACTIONS.pop(key, None)
-        _PENDING_NEXT.pop(key, None)
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for payload in staged:
+        fingerprint = json.dumps(payload, sort_keys=True, default=str)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        deduped.append(payload)
 
-    goto = "create_reminder_node" if remaining else next_node
-    update = {
+    if staged and len(deduped) != len(staged):
+        logger.debug(
+            "Deduplicated %d reminder action(s) for thread %s", len(staged) - len(deduped), canonical_thread
+        )
+
+    return {
+        "reminder_actions": deduped,
+        "reminder_thread_id": canonical_thread,
         "reminder_next_node": next_node,
+        "reminder_dispatch_origin": (origin or "unknown").lower(),
     }
-    return Command(goto=goto, update=update)
 
 
-def create_reminder_node(
+def register_reminder_actions(
+    thread_id: object,
+    actions: Sequence[Dict[str, Any]],
+    next_node: str,
+    *,
+    origin: str | None = None,
+) -> Dict[str, Any]:
+    """Backward-compatible alias for staging reminder actions."""
+
+    return stage_reminder_actions(thread_id, actions, next_node, origin=origin)
+
+
+@task
+def apply_reminder_actions_node_task(
     state: Dict[str, Any],
-    store: Any = None,
-    runtime: Any = None,
+    store: BaseStore | None = None,
+    runtime: Runtime[Any] | None = None,
 ) -> Command[Literal["response_agent", "triage_interrupt_handler", "__end__"]]:
-    """Create reminders requested in the state and route to the next workflow node."""
+    """Apply pending reminder actions atomically and route to the next node."""
 
-    thread_id = _thread_key(state)
-    next_node = _PENDING_NEXT.pop(thread_id, state.get("reminder_next_node") or "response_agent")
-    actions = consume_reminder_actions(thread_id)
-    creates = [action for action in actions if action.get("action") == "create"]
-    if not creates:
-        logger.info("Reminder node: no create actions; forwarding to %s", next_node)
-        update = {
-            "reminder_next_node": None,
+    del runtime  # runtime not currently required but retained for interface parity
+
+    next_node = state.get("reminder_next_node")
+    actions = list(state.get("reminder_actions") or [])
+    thread_key = _normalise_thread_id(state.get("reminder_thread_id") or resolve_thread_key(state))
+    origin = (state.get("reminder_dispatch_origin") or "unknown").lower()
+    classification = (state.get("classification_decision") or "respond").lower()
+    triage_done = bool(state.get("triage_interrupt_completed"))
+
+    def _fallback_target() -> str:
+        if next_node and next_node != "apply_reminder_actions_node":
+            return next_node
+        if classification == "notify" and not triage_done:
+            return "triage_interrupt_handler"
+        if classification == "ignore":
+            return "__end__"
+        return "response_agent"
+
+    base_update = {
+        "reminder_actions": [],
+        "reminder_thread_id": None,
+        "reminder_next_node": None,
+        "reminder_dispatch_origin": None,
+    }
+
+    if not actions:
+        safe_next = _fallback_target()
+        return Command(goto=safe_next, update=base_update)
+
+    persistent_thread_key = thread_key if thread_key != _DEFAULT_THREAD_KEY else None
+
+    if persistent_thread_key is None:
+        logger.warning(
+            "Reminder dispatcher: skipping apply for fallback thread key; action(s)=%d", len(actions)
+        )
+        update = dict(base_update)
+        update["reminder_dispatch_outcome"] = {
+            "skipped": len(actions),
+            "reason": "missing_thread_id",
         }
-        return Command(goto=next_node, update=update)
+        return Command(goto=_fallback_target(), update=update)
 
     reminder_store = _get_store()
-    logger.info("Reminder node: processing %d create action(s)", len(creates))
-    for action in creates:
-        thread_id = action.get("thread_id")
-        if not thread_id:
-            logger.warning("Reminder node: create action missing thread_id: %s", action)
-            continue
-        subject = str(action.get("subject") or "(no subject)")
-        due_at = _parse_due_at(action.get("due_at"))
-        reason = str(action.get("reason") or "Reminder created via graph node")
+    try:
+        outcome = reminder_store.apply_actions(actions)
+        logger.info(
+            "Reminder dispatcher: applied %d action(s) for thread %s (cancelled=%s created=%s)",
+            len(actions),
+            persistent_thread_key,
+            outcome.get("cancelled") if isinstance(outcome, dict) else None,
+            outcome.get("created") if isinstance(outcome, dict) else None,
+        )
+    except Exception as exc:  # pragma: no cover - surfaced to caller
+        logger.exception("Reminder dispatcher: failed to apply actions for %s", persistent_thread_key)
+        raise exc
+
+    if store is not None:
         try:
-            reminder_id = reminder_store.add_reminder(
-                thread_id=thread_id,
-                subject=subject,
-                due_at=due_at,
-                reason=reason,
+            store.delete(("reminders", "pending_actions"), persistent_thread_key)
+        except Exception as exc:
+            logger.warning(
+                "Reminder dispatcher: failed clearing pending actions for %s: %s",
+                persistent_thread_key,
+                exc,
             )
-            logger.info(
-                "Reminder node: ensured reminder %s for thread %s due at %s",
-                reminder_id,
-                thread_id,
-                due_at.isoformat(),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Reminder node: failed to create reminder for %s: %s", thread_id, exc)
 
-    update = {
-        "reminder_next_node": None,
-    }
-    return Command(goto=next_node, update=update)
-
-
-def _thread_key(state: Dict[str, Any]) -> str:
-    email_input = state.get("email_input") or {}
-    thread_id = (
-        email_input.get("id")
-        or email_input.get("thread_id")
-        or email_input.get("gmail_id")
-        or state.get("thread_id")
+    target = _fallback_target()
+    has_create = any(
+        isinstance(action, dict) and str(action.get("action", "")).lower() == "create"
+        for action in actions
     )
-    return str(thread_id or "__default__")
+    if origin == "triage_hitl_response" and has_create:
+        target = "response_agent"
 
+    update = dict(base_update)
+    update["reminder_dispatch_outcome"] = outcome
+    return Command(goto=target, update=update)
+
+
+def apply_reminder_actions_node(
+    state: Dict[str, Any],
+    store: BaseStore | None = None,
+    runtime: Runtime[Any] | None = None,
+) -> Command[Literal["response_agent", "triage_interrupt_handler", "__end__"]]:
+    """Synchronous wrapper around the reminder dispatcher task."""
+
+    return apply_reminder_actions_node_task(state, store=store, runtime=runtime).result()

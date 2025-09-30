@@ -10,6 +10,13 @@ This file highlights recent project changes that affect the notebooks and how to
 - Captured the HITL resume payload cheatsheet and Gemini judge toggles inline so contributors do not need to hunt through code.
 
 
+## 2025-09-28 Reminder dispatcher notebook (@reminder-flow-hardening-ticket)
+
+- Added `reminder_flow.ipynb` to illustrate the atomic reminder dispatcher and pending HITL queue.
+- Notebook includes a Mermaid diagram of the updated triage → dispatcher → HITL loop plus an executable code cell that stages reminder actions and invokes `SqliteReminderStore.apply_actions()` in-memory.
+- Linked to the reminder hardening ticket so future updates keep the graph diagram and dispatcher walkthrough in sync with production code.
+
+
 ## Environment Flags
 
 - `HITL_AUTO_ACCEPT=1`: Auto-accept HITL tool interrupts in demos/tests.

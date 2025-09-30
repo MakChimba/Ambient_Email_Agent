@@ -3,7 +3,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pytest
 
@@ -88,8 +88,8 @@ class FakeGmailClient:
         email_id: str,
         response_text: str,
         email_address: str,
-        addn_receipients: Optional[List[str]] = None,
-    ) -> bool:
+        additional_recipients: Optional[List[str]] = None,
+    ) -> Tuple[bool, str]:
         new_id = f"fake-msg-{len(self.created_message_ids) + 1}"
         thread_id = (
             f"fake-thread-{len(self.created_thread_ids) + 1}"
@@ -99,8 +99,16 @@ class FakeGmailClient:
         self.created_message_ids.append(new_id)
         if thread_id not in self.created_thread_ids:
             self.created_thread_ids.append(thread_id)
-        self.actions.append(("send_email", email_id, new_id))
-        return True
+        action_record = (
+            "send_email",
+            email_id,
+            new_id,
+            response_text,
+            email_address,
+            additional_recipients,
+        )
+        self.actions.append(action_record)
+        return True, f"Email reply sent successfully to message ID: {email_id}"
 
     def teardown(self):
         # Nothing to clean up for fake client
@@ -144,8 +152,8 @@ class RealGmailClient:
         email_id: str,
         response_text: str,
         email_address: str,
-        addn_receipients: Optional[List[str]] = None,
-    ) -> bool:
+        additional_recipients: Optional[List[str]] = None,
+    ) -> Tuple[bool, str]:
         import base64
         from email.mime.text import MIMEText
 
@@ -170,8 +178,8 @@ class RealGmailClient:
         mime["to"] = to_addr
         mime["from"] = email_address
         mime["subject"] = subject
-        if addn_receipients:
-            mime["cc"] = ", ".join(addn_receipients)
+        if additional_recipients:
+            mime["cc"] = ", ".join(additional_recipients)
         raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
         body = {"raw": raw}
         if thread_id:
@@ -185,7 +193,7 @@ class RealGmailClient:
             self.created_message_ids.append(msg_id)
         if thr_id:
             self.created_thread_ids.append(thr_id)
-        return True
+        return True, f"Email reply sent successfully to message ID: {email_id}"
 
     def teardown(self):
         # Best-effort cleanup of created resources (permanently delete)

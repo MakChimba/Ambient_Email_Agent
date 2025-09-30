@@ -93,7 +93,8 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
             "Hello,\n\nYour September electricity invoice ($120.45) is due on 1 October at 6:00 PM. "
             "Avoid late fees by paying before the deadline."
         ),
-        "id": "thread-reminder-invoice",
+        "id": "msg-reminder-invoice-1",
+        "thread_id": "thread-reminder-invoice",
     }
 
     payload = {"email_input": first_email}
@@ -142,7 +143,7 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
         monkeypatch.setenv("REMINDER_JUDGE_FORCE_DECISION", "approve")
 
         followup_email = dict(first_email)
-        followup_email["id"] = "thread-reminder-invoice-approval"
+        followup_email["id"] = "msg-reminder-invoice-2"
         followup_payload = {"email_input": followup_email}
         followup_summary = summarize_email_for_grid(followup_email)
         _safe_log_inputs({"case": "reminder_create", "email": followup_email}, root_run_id)
@@ -168,7 +169,8 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
             "to": "Utility Billing <billing@example.com>",
             "subject": "Re: Bill due October 1",
             "body": "Payment processed today. Thanks for the reminder!",
-            "id": "thread-reminder-invoice-approval",
+            "id": "msg-reminder-invoice-3",
+            "thread_id": "thread-reminder-invoice",
         }
 
         reply_payload = {"email_input": reply_email}
@@ -201,12 +203,12 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
 
     followup_state = cast(Dict[str, Any], artifacts["followup_state"])  # type: ignore[arg-type]
     reminders_followup = cast(List[Any], artifacts["followup_reminders"])  # type: ignore[arg-type]
-    assert any(r.thread_id == "thread-reminder-invoice-approval" for r in reminders_followup)
+    assert any(r.thread_id == "thread-reminder-invoice" for r in reminders_followup)
     due_delta = reminders_followup[0].due_at - datetime.now(timezone.utc)
     assert timedelta(hours=23) <= due_delta <= timedelta(hours=25)
 
     followup_email = dict(first_email)
-    followup_email["id"] = "thread-reminder-invoice-approval"
+    followup_email["id"] = "msg-reminder-invoice-2"
     creation_snapshot = [
         {
             "thread_id": r.thread_id,
@@ -220,7 +222,7 @@ def test_live_reminder_create_and_cancel(agent_module_name, monkeypatch, gmail_s
 
     reply_state = cast(Dict[str, Any], artifacts["reply_state"])  # type: ignore[arg-type]
     reminders_after = cast(List[Any], artifacts["reminders_after"])  # type: ignore[arg-type]
-    assert not any(r.thread_id == "thread-reminder-invoice-approval" for r in reminders_after)
+    assert not any(r.thread_id == "thread-reminder-invoice" for r in reminders_after)
 
     # Secondary correctness judge for the approval run
     messages = followup_state.get("messages", [])

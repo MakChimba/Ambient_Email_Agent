@@ -45,6 +45,7 @@ This project demonstrates an evolving AI email assistant built with LangGraph an
 - LangGraph 1.0 upgrade: default graphs compile with SQLite-backed checkpoints/stores (`EMAIL_ASSISTANT_CHECKPOINT_PATH`, `EMAIL_ASSISTANT_STORE_PATH`) and apply sync durability via `.with_config(durability="sync")` so HITL interrupts survive process restarts.
 - Model helper defaults: `email_assistant.configuration.get_llm` now normalises provider/model pairs through `init_chat_model`, defaulting to `google_genai:gemini-2.5-pro`. Override routing with `EMAIL_ASSISTANT_MODEL`, `EMAIL_ASSISTANT_ROUTER_MODEL`, `EMAIL_ASSISTANT_TOOL_MODEL`, or `EMAIL_ASSISTANT_MODEL_PROVIDER` as needed.
 - Streaming instrumentation: agents, tests, and notebooks request `stream_mode=["updates","messages","custom"]`; the custom channel carries `stream_progress` tool events. Enable verbose logging with `EMAIL_ASSISTANT_TRACE_DEBUG=1` and add rollout metadata via `EMAIL_ASSISTANT_TRACE_STAGE` / `EMAIL_ASSISTANT_TRACE_TAGS`.
+- Unified logging: the package initialiser attaches a shared file handler so frontend and backend logs land in `logs/email_assistant.log` (override with `EMAIL_ASSISTANT_LOG_PATH`, adjust level with `EMAIL_ASSISTANT_LOG_LEVEL`). This file is safe to tail in automation so agents can inspect the latest activity even in offline eval mode.
 - HITL payloads now use the typed `HumanInterrupt` helper and the tool/LLM nodes are wrapped with `@task` to follow LangGraph’s durable execution guidance.
 - Gemini 2.5 compatibility: tool binding now uses `tool_choice="any"` for HITL agents (`email_assistant_hitl`, `email_assistant_hitl_memory`) to avoid the Gemini 400 error about `allowed_function_names`.
 - Robust triage routing: If the router’s structured output is missing/invalid, defaults to `respond` to prevent stalls. The HITL + memory agent also incorporates `response_preferences` into triage so preference rules (e.g., “don’t reply to direct action”) influence notify vs respond.
@@ -195,20 +196,44 @@ Sample output:
 ## S-Class: Reminders & Follow-ups
 
 ### Overview
-This feature automatically creates reminders for important emails that require a reply. A background worker checks for due reminders and sends notifications.
+Reminders promote important Gmail threads that still need attention. The LangGraph flow now batches reminder operations through a dedicated dispatcher so cancellations and recreations happen atomically.
+
+### Dispatcher Flow
+- `triage_router` gathers reminder intents whenever it classifies a thread as `respond` or `notify`.
+  - Cancel actions (e.g., when the user replies to their own reminder) are dispatched immediately.
+  - Create actions are dispatched right away only when the workflow continues straight to `response_agent`.
+  - Notify/HITL paths persist create actions in the reminder store's pending queue until the reviewer approves the reminder.
+- `apply_reminder_actions_node` executes the batch inside a single durable step and clears the queue. It logs results under `reminder_dispatch_outcome` for downstream debugging.
+- `triage_interrupt_handler` replays pending reminder actions after a human chooses to respond; ignore/accept decisions drop the queue without touching the store.
+- `ReminderStore.apply_actions()` guarantees cancel + create sequences execute in one SQLite transaction, preventing orphaned reminders when crashes occur between steps.
+
+Mermaid sketch of the updated loop:
+
+```mermaid
+flowchart TD
+    TRIAGE[triage_router] -->|cancel/create| DISPATCH[apply_reminder_actions_node]
+    TRIAGE -->|notify (pending)| HITL[triage_interrupt_handler]
+    DISPATCH --> RESPONSE[response_agent]
+    DISPATCH --> HITL
+    HITL -->|user respond| DISPATCH
+    HITL -->|ignore/accept| END[(End)]
+    RESPONSE --> END
+```
+
+The walkthrough in `notebooks/reminder_flow.ipynb` mirrors this diagram, stages example actions with `register_reminder_actions`, and demonstrates the in-memory dispatcher results via `SqliteReminderStore.apply_actions()`.
 
 ### Configuration
-The following environment variables control the reminder behavior:
-- `REMINDER_DEFAULT_HOURS`: Default time in hours to wait before a reminder is due.
+The following environment variables control reminder behaviour:
+- `REMINDER_DEFAULT_HOURS`: Default time in hours to wait before a reminder becomes due.
 - `REMINDER_POLL_INTERVAL_MIN`: How often the worker checks for due reminders.
-- `REMINDER_NOTIFY_EMAIL`: Email address to send notifications to.
+- `REMINDER_NOTIFY_EMAIL`: Email address that cancels reminders when it replies.
 - `REMINDER_DB_PATH`: Path to the SQLite database file.
 - `REMINDER_LABEL_PENDING`: Gmail label for a pending reminder.
 - `REMINDER_LABEL_DUE`: Gmail label for a due reminder.
 - `REMINDER_LABEL_DONE`: Gmail label for a completed/cancelled reminder.
 
 ### Worker Usage
-The reminder worker can be run from the command line:
+Run the reminder worker from the command line:
 
 `# Run once and exit`
 `python scripts/reminder_worker.py --once`
