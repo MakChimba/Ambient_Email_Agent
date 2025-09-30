@@ -1991,14 +1991,14 @@ def interrupt_handler_task(
     state: State,
     store: BaseStore,
     runtime: Runtime[AssistantContext],
-) -> Command[Literal["llm_call", "__end__"]]:
+) -> Command[Literal["llm_call", "mark_as_read_node", "__end__"]]:
     """
     Create human-review interrupts for assistant tool calls, apply user decisions (accept, edit, ignore, respond), invoke or simulate tools as needed, and record resulting tool observations and memory updates.
     
     Returns:
-        Command: A Command whose `goto` is either `'llm_call'` or `'__end__'` and whose `update` contains a `messages` list with tool observations, edited assistant messages, and user-feedback entries.
+        Command: A Command whose `goto` directs the next node (`'llm_call'`, `'mark_as_read_node'`, or `'__end__'`) and whose `update` contains a `messages` list with tool observations, edited assistant messages, and user-feedback entries.
     """
-    ai_message = state["messages"][-1]
+    messages_state = list(state.get("messages") or [])
     result: list[Any] = []
     goto = "llm_call"
     manual_schedule_reply: str | None = None
@@ -2007,8 +2007,25 @@ def interrupt_handler_task(
         "messages": result,
         "triage_interrupt_completed": state.get("triage_interrupt_completed", False),
     }
+
+    ai_message: Any | None = None
+    ai_tool_calls: list[dict[str, Any]] = []
+    for message in reversed(messages_state):
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if tool_calls:
+            ai_message = message
+            ai_tool_calls = list(tool_calls)
+            break
+
+    if ai_message is None:
+        logger.warning(
+            "[interrupt_handler] No assistant plan with tool_calls found; routing back to llm_call."
+        )
+        command_update["messages"] = []
+        return Command(goto="llm_call", update=command_update)
+
     try:
-        tool_names_summary = [tc.get("name") for tc in ai_message.tool_calls]
+        tool_names_summary = [tc.get("name") for tc in ai_tool_calls]
     except Exception:
         tool_names_summary = []
     email_input_cached = state.get("email_input", {})
@@ -2050,7 +2067,7 @@ def interrupt_handler_task(
         },
         extra={"tool_names": tool_names_summary},
     ) as trace:
-        for tool_call in ai_message.tool_calls:
+        for tool_call in ai_tool_calls:
             if tool_call["name"] not in ["send_email_tool", "schedule_meeting_tool", "Question", "mark_as_spam_tool"]:
                 observation = _safe_tool_invoke(tool_call["name"], tool_call["args"])
                 result.append({"role": "tool", "content": observation, "tool_call_id": tool_call["id"]})
@@ -2209,7 +2226,11 @@ def interrupt_handler_task(
             elif response["type"] == "edit":
                 edited_args = response["args"]["args"]
                 current_id = tool_call["id"]
-                updated_tool_calls = [tc for tc in ai_message.tool_calls if tc["id"] != current_id] + [{"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}]
+                updated_tool_calls = [
+                    tc for tc in ai_tool_calls if tc["id"] != current_id
+                ] + [
+                    {"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}
+                ]
                 result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
                 observation = _safe_tool_invoke(tool_call["name"], edited_args)
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
@@ -2535,12 +2556,12 @@ def interrupt_handler(
     state: State,
     store: BaseStore,
     runtime: Runtime[AssistantContext],
-) -> Command[Literal["llm_call", "__end__"]]:
+) -> Command[Literal["llm_call", "mark_as_read_node", "__end__"]]:
     """
     Run the interrupt handler task and return its resulting command.
     
     Returns:
-        Command[Literal["llm_call", "__end__"]]: A command directing the workflow to either continue with "llm_call" or finish with "__end__".
+        Command[Literal["llm_call", "mark_as_read_node", "__end__"]]: A command directing the workflow to continue with "llm_call", jump straight to "mark_as_read_node", or finish with "__end__".
     """
 
     return interrupt_handler_task(state, store=store, runtime=runtime).result()
@@ -2777,6 +2798,8 @@ agent_builder.add_node("llm_call", llm_call)
 agent_builder.add_node("interrupt_handler", interrupt_handler)
 agent_builder.add_node("mark_as_read_node", mark_as_read_node)
 agent_builder.add_edge(START, "llm_call")
+agent_builder.add_edge("interrupt_handler", "llm_call")
+agent_builder.add_edge("interrupt_handler", "mark_as_read_node")
 agent_builder.add_conditional_edges(
     "llm_call",
     should_continue,
