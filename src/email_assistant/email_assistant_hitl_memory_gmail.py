@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 
@@ -23,7 +24,7 @@ from langgraph.types import interrupt, Command
 
 from email_assistant.tools import get_tools, get_tools_by_name
 from email_assistant.tools.gmail.prompt_templates import GMAIL_TOOLS_PROMPT
-from email_assistant.tools.gmail.gmail_tools import mark_as_read, mark_as_spam
+from email_assistant.tools.gmail.gmail_tools import mark_as_read
 from email_assistant.prompts import (
     triage_system_prompt,
     triage_user_prompt,
@@ -75,7 +76,13 @@ from email_assistant.reminder_middleware import (
 from email_assistant.eval.reminder_judge import evaluate_reminder_risk
 from email_assistant.checkpointing import get_sqlite_checkpointer, get_sqlite_store
 from dotenv import load_dotenv
+from langchain_core.exceptions import LangChainException
 from langchain_core.messages import RemoveMessage
+
+try:  # pragma: no cover - optional Gmail dependency
+    from googleapiclient.errors import HttpError  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - fallback when Gmail libs absent
+    HttpError = RuntimeError
 
 load_dotenv(".env")
 init_project(AGENT_PROJECT)
@@ -172,6 +179,33 @@ def _build_email_trace_context(email_input: Mapping[str, Any] | None) -> _EmailT
     )
 
 
+def _parse_positive_int_env(var_name: str, default: int) -> int:
+    """Coerce an environment variable to a positive int or fall back with logging."""
+
+    raw_value = os.getenv(var_name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s value %r; expected positive integer. Using default %d.",
+            var_name,
+            raw_value,
+            default,
+        )
+        return default
+    if value <= 0:
+        logger.warning(
+            "Non-positive %s value %d detected; using default %d.",
+            var_name,
+            value,
+            default,
+        )
+        return default
+    return value
+
+
 def _eval_mode_enabled() -> bool:
     """Return True when EMAIL_ASSISTANT_EVAL_MODE requests deterministic mode."""
     return os.getenv("EMAIL_ASSISTANT_EVAL_MODE", "").lower() in ("1", "true", "yes")
@@ -195,13 +229,19 @@ def _maybe_interrupt(requests):
         for req in requests:
             cfg = (req or {}).get("config", {}) or {}
             action = ((req or {}).get("action_request", {}) or {}).get("action", "")
+            action_lower = str(action).lower()
             allow_accept = bool(cfg.get("allow_accept", False))
             allow_respond = bool(cfg.get("allow_respond", False))
             if allow_accept:
-                responses.append({"type": "accept", "args": {}})
+                if action_lower == "mark_as_spam_tool":
+                    logger.debug(
+                        "Auto-accept disabled for mark_as_spam_tool; returning ignore response instead."
+                    )
+                    responses.append({"type": "ignore", "args": {}})
+                else:
+                    responses.append({"type": "accept", "args": {}})
             elif allow_respond:
                 # Provide a deterministic, minimal response for Question-style prompts
-                action_lower = str(action).lower()
                 if action_lower == "question":
                     responses.append({"type": "response", "args": "No additional info — please proceed."})
                 elif "email assistant" in action_lower:
@@ -234,13 +274,14 @@ def _safe_tool_invoke(name: str, args):
         result = tool.invoke(args)
         log_tool_child_run(name=name, args=args, result=result)
         return result
-    except Exception as e:
-        error = f"Error executing {name}: {str(e)}"
+    except Exception as exc:  # noqa: BLE001
+        error = f"Error executing {name}: {str(exc)}"
+        logger.exception("Tool execution failed for %s", name)
         log_tool_child_run(
             name=name,
             args=args,
             result=error,
-            metadata_update={"error": True, "exception": e.__class__.__name__},
+            metadata_update={"error": True, "exception": exc.__class__.__name__},
         )
         return error
 
@@ -281,7 +322,7 @@ def _extract_requested_duration(text: str) -> tuple[int | None, str | None]:
     if hour_match:
         try:
             hours = float(hour_match.group(1))
-            minutes = int(round(hours * 60))
+            minutes = round(hours * 60)
             if minutes > 0:
                 return minutes, f"{minutes}-minute"
         except ValueError:
@@ -352,6 +393,46 @@ def _meeting_times_for_day(day: str, duration_minutes: int) -> tuple[str, str, s
         friendly_day,
         friendly_time,
     )
+
+
+def _append_sentences(base: str, additions: list[str]) -> str:
+    """Append well-formed sentences to the existing response text."""
+
+    normalized = [sentence.strip() for sentence in additions if sentence and sentence.strip()]
+    if not normalized:
+        return base
+    trimmed = (base or "").rstrip()
+    if trimmed and trimmed[-1] not in ".!?":
+        trimmed += "."
+    elif not trimmed:
+        trimmed = normalized.pop(0)
+        return _append_sentences(trimmed, normalized)
+    combined = " ".join([trimmed] + normalized)
+    return combined.strip()
+
+
+def _tool_call_name(tool_call: Any) -> str | None:
+    """Return the tool name from either dict-based or object-based tool call payloads."""
+
+    if isinstance(tool_call, Mapping):
+        return tool_call.get("name")
+    return getattr(tool_call, "name", None)
+
+
+def _tool_call_args(tool_call: Any) -> dict[str, Any]:
+    """Return tool-call arguments regardless of payload shape."""
+
+    if isinstance(tool_call, Mapping):
+        return dict(tool_call.get("args") or {})
+    return dict(getattr(tool_call, "args", {}) or {})
+
+
+def _tool_call_id(tool_call: Any) -> str | None:
+    """Return a stable tool call identifier if present."""
+
+    if isinstance(tool_call, Mapping):
+        return tool_call.get("id")
+    return getattr(tool_call, "id", None)
 
 
 def _build_manual_scheduling_reply(text: str) -> str:
@@ -582,14 +663,14 @@ def update_memory(store, namespace, messages):
             {"role": "system", "content": MEMORY_UPDATE_INSTRUCTIONS.format(current_profile=current_profile, namespace=namespace)}
         ] + messages)
         new_profile = getattr(result, "user_preferences", result.get("user_preferences") if isinstance(result, dict) else None)
-    except Exception as e:
-        logger.warning("[memory] LLM update failed: %s", e)
+    except (LangChainException, ValueError, RuntimeError, TypeError) as exc:
+        logger.warning("[memory] LLM update failed: %s", exc, exc_info=True)
     if not new_profile:
         new_profile = current_profile
     try:
         store.put(namespace, "user_preferences", new_profile)
-    except Exception as e:
-        logger.warning("[memory] Store update failed: %s", e)
+    except sqlite3.Error as exc:
+        logger.warning("[memory] Store update failed: %s", exc, exc_info=True)
 
 
 # Nodes
@@ -792,8 +873,8 @@ def triage_router_task(
                 )
                 log_llm_child_run(prompt=router_prompt, response=response_payload)
                 classification = getattr(result, "classification", "respond")
-            except Exception as exc:
-                logger.warning("[triage] Router failed, defaulting to respond: %s", exc)
+            except (LangChainException, ValueError, RuntimeError, TypeError) as exc:
+                logger.warning("[triage] Router failed, defaulting to respond: %s", exc, exc_info=True)
                 classification = "respond"
 
         # --- Reminder Logic: Part 2: Create on Triage Decision ---
@@ -857,7 +938,7 @@ def triage_router_task(
                         "[reminder] Skipping reminder creation for fallback thread id; no stable Gmail thread available."
                     )
                 else:
-                    default_hours = int(os.getenv("REMINDER_DEFAULT_HOURS", 48))
+                    default_hours = _parse_positive_int_env("REMINDER_DEFAULT_HOURS", 48)
                     due_at = datetime.now(timezone.utc) + timedelta(hours=default_hours)
                     reminder_actions.append(
                         {
@@ -948,11 +1029,12 @@ def triage_router_task(
             else:
                 try:
                     store.put(("reminders", "pending_actions"), reminder_thread_id, create_actions)
-                except Exception as exc:
+                except sqlite3.Error as exc:
                     logger.warning(
                         "[reminder] Failed to persist pending actions for %s: %s",
                         reminder_thread_id,
                         exc,
+                        exc_info=True,
                     )
             # Ensure the dispatcher knows to continue toward the HITL node even when no
             # immediate reminder actions are staged (e.g., notify/only-create scenarios).
@@ -1120,11 +1202,12 @@ def triage_interrupt_handler_task(
                 if pending_thread_id and pending_thread_id != "__default__":
                     try:
                         store.delete(("reminders", "pending_actions"), pending_thread_id)
-                    except Exception as exc:
+                    except sqlite3.Error as exc:
                         logger.warning(
                             "[reminder] Failed to clear pending actions for %s: %s",
                             pending_thread_id,
                             exc,
+                            exc_info=True,
                         )
         elif response["type"] == "ignore":
             messages.append({"role": "user", "content": "The user decided to ignore the email even though it was classified as notify. Update triage preferences to capture this."})
@@ -1134,11 +1217,12 @@ def triage_interrupt_handler_task(
             if pending_thread_id and pending_thread_id != "__default__":
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
-                except Exception as exc:
+                except sqlite3.Error as exc:
                     logger.warning(
                         "[reminder] Failed to clear pending actions after ignore for %s: %s",
                         pending_thread_id,
                         exc,
+                        exc_info=True,
                     )
         elif response["type"] == "accept":
             logger.info("User accepted notification. Ending workflow.")
@@ -1147,14 +1231,16 @@ def triage_interrupt_handler_task(
             if pending_thread_id and pending_thread_id != "__default__":
                 try:
                     store.delete(("reminders", "pending_actions"), pending_thread_id)
-                except Exception as exc:
+                except sqlite3.Error as exc:
                     logger.warning(
                         "[reminder] Failed to clear pending actions after accept for %s: %s",
                         pending_thread_id,
                         exc,
+                        exc_info=True,
                     )
         else:
-            raise ValueError(f"Invalid response: {response}")
+            logger.error("Unhandled triage interrupt response payload: %s", response)
+            raise ValueError
 
         if trace:
             trace.set_outputs(f"{trace_ctx.summary}; goto={goto}; response={response['type']}")
@@ -1280,20 +1366,21 @@ def llm_call_task(state: State, store: BaseStore):
     ]
     prior_tool_names = []
     for m in reversed(state.get("messages", [])):
-        if getattr(m, "tool_calls", None):
-            try:
-                prior_tool_names = [tc.get("name") for tc in m.tool_calls]
-            except Exception:
-                prior_tool_names = []
-            break
+        tool_calls = getattr(m, "tool_calls", None)
+        if not tool_calls:
+            continue
+        prior_tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls) if name]
+        break
     # Compute all tool names observed so far (across history)
     all_tool_names: list[str] = []
     for m in state.get("messages", []):
-        if getattr(m, "tool_calls", None):
-            try:
-                all_tool_names.extend([tc.get("name") for tc in m.tool_calls])
-            except Exception:
-                pass
+        tool_calls = getattr(m, "tool_calls", None)
+        if not tool_calls:
+            continue
+        for tc in tool_calls:
+            name = _tool_call_name(tc)
+            if name:
+                all_tool_names.append(name)
 
     def _contains_keyword(text: str, keyword: str) -> bool:
         if not keyword:
@@ -1433,7 +1520,8 @@ def llm_call_task(state: State, store: BaseStore):
     # Ensure the LLM sees the email context even if upstream routing didn't attach it
     try:
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
-    except Exception:
+    except (ValueError, TypeError) as exc:
+        logger.debug("Failed to format email markdown: %s", exc, exc_info=True)
         email_markdown = ""
     base_messages = state.get("messages", []) or []
     needs_injection = not base_messages
@@ -1452,18 +1540,17 @@ def llm_call_task(state: State, store: BaseStore):
     # it does not affect real-world behavior where a human would respond.
     try:
         if not (eval_mode or os.getenv("HITL_AUTO_ACCEPT", "").lower() in ("1", "true", "yes")):
-            raise RuntimeError("anti-loop fallback disabled in live mode")
+            raise RuntimeError
         from langchain_core.messages import AIMessage
         all_tool_names_loopcheck: list[str] = []
         done_count = 0
         for m in state.get("messages", []):
-            if getattr(m, "tool_calls", None):
-                try:
-                    names = [tc.get("name") for tc in m.tool_calls]
-                except Exception:
-                    names = []
-                all_tool_names_loopcheck.extend(names)
-                done_count += sum(1 for n in names if n == "Done")
+            tool_calls = getattr(m, "tool_calls", None)
+            if not tool_calls:
+                continue
+            names = [_tool_call_name(tc) for tc in tool_calls if _tool_call_name(tc)]
+            all_tool_names_loopcheck.extend(names)
+            done_count += sum(1 for n in names if n == "Done")
         is_scheduling_context = any(_contains_keyword(text_for_heuristic, k) for k in [
             "schedule", "scheduling", "meeting", "meet", "call", "availability", "let's schedule",
         ])
@@ -1520,9 +1607,10 @@ def llm_call_task(state: State, store: BaseStore):
                 {"name": "Done", "args": {"done": True}, "id": "done"},
             ]
             return _return([AIMessage(content="", tool_calls=tool_calls)], emitted=True)
-    except Exception:
-        # If any error occurs in the fallback logic, continue with normal flow
-        pass
+    except RuntimeError as exc:
+        logger.debug("Skipping anti-loop fallback: %s", exc)
+    except (ValueError, TypeError) as exc:
+        logger.debug("Anti-loop fallback failed; continuing with normal flow: %s", exc, exc_info=True)
 
     # High-confidence deterministic plans for tricky cases (only in eval mode)
     if eval_mode:
@@ -1697,7 +1785,8 @@ def llm_call_task(state: State, store: BaseStore):
                 else getattr(msg, "__dict__", msg)
             )
             log_llm_child_run(prompt=prompt, response=response_payload)
-        except Exception:
+        except (LangChainException, ValueError, RuntimeError, TypeError):
+            logger.exception("Primary tool-planning call failed")
             msg = None
 
         if not getattr(msg, "tool_calls", None):
@@ -1717,15 +1806,13 @@ def llm_call_task(state: State, store: BaseStore):
                 log_llm_child_run(prompt=retry, response=response_payload_retry)
                 if getattr(msg_retry, "tool_calls", None):
                     msg = msg_retry
-            except Exception:
+            except (LangChainException, ValueError, RuntimeError, TypeError):
+                logger.exception("Retry tool-planning call failed")
                 msg = None
 
         if trace:
-            tool_names: list[str] = []
-            try:
-                tool_names = [tc.get("name") for tc in getattr(msg, "tool_calls", []) or []]
-            except Exception:
-                tool_names = []
+            tool_calls_payload = getattr(msg, "tool_calls", []) or []
+            tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_payload) if name]
             summary = "tool_plan=" + (",".join(name for name in tool_names if name) if tool_names else "none")
             trace.set_outputs(f"{trace_ctx.summary}; {summary}")
     # Post-process LLM tool plan: enforce intent-specific plans and termination
@@ -1821,23 +1908,23 @@ def llm_call_task(state: State, store: BaseStore):
             ]
             msg = AIMessage(content="", tool_calls=tool_calls)
         else:
-            try:
-                tool_names = [tc.get("name") for tc in msg.tool_calls]
-            except Exception:
-                tool_names = []
+            tool_calls_list = getattr(msg, "tool_calls", []) or []
+            tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_list) if name]
             if ("schedule_meeting_tool" in tool_names) and ("check_calendar_tool" not in tool_names):
                 dates = ["20-05-2025", "22-05-2025"]
                 injected = [{"name": "check_calendar_tool", "args": {"dates": dates}, "id": "check_cal"}]
-                msg = msg.model_copy(update={"tool_calls": injected + msg.tool_calls})
-                tool_names = [tc.get("name") for tc in msg.tool_calls]
+                msg = msg.model_copy(update={"tool_calls": injected + tool_calls_list})
+                tool_calls_list = getattr(msg, "tool_calls", []) or []
+                tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_list) if name]
             if (any(_contains_keyword(text, k) for k in ["90-minute", "90 minutes", "90min", "1.5 hour", "1.5-hour"]) and any(_contains_keyword(text, k) for k in ["planning", "quarterly"])):
                 if ("send_email_tool" in tool_names) and ("check_calendar_tool" not in tool_names):
                     injected = [{"name": "check_calendar_tool", "args": {"dates": ["19-05-2025", "21-05-2025"]}, "id": "check_cal"}]
-                    msg = msg.model_copy(update={"tool_calls": injected + msg.tool_calls})
-                    tool_names = [tc.get("name") for tc in msg.tool_calls]
+                    msg = msg.model_copy(update={"tool_calls": injected + tool_calls_list})
+                    tool_calls_list = getattr(msg, "tool_calls", []) or []
+                    tool_names = [name for name in (_tool_call_name(tc) for tc in tool_calls_list) if name]
             if "send_email_tool" in tool_names and "Done" not in tool_names:
                 from langchain_core.messages import AIMessage
-                msg = msg.model_copy(update={"tool_calls": msg.tool_calls + [{"name": "Done", "args": {"done": True}, "id": "done"}]})
+                msg = msg.model_copy(update={"tool_calls": tool_calls_list + [{"name": "Done", "args": {"done": True}, "id": "done"}]})
     if not getattr(msg, "tool_calls", None):
         # Final offline fallback: synthesize tool_calls similar to eval_mode
         from langchain_core.messages import AIMessage
@@ -2024,10 +2111,7 @@ def interrupt_handler_task(
         command_update["messages"] = []
         return Command(goto="llm_call", update=command_update)
 
-    try:
-        tool_names_summary = [tc.get("name") for tc in ai_tool_calls]
-    except Exception:
-        tool_names_summary = []
+    tool_names_summary = [name for name in (_tool_call_name(tc) for tc in ai_tool_calls) if name]
     email_input_cached = state.get("email_input", {})
     trace_ctx = _build_email_trace_context(email_input_cached)
     tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
@@ -2100,48 +2184,38 @@ def interrupt_handler_task(
                     if not any(keyword in response_lower for keyword in ["friday", "deadline"]):
                         additions.append("Expect my feedback before Friday.")
                     if additions:
-                        trimmed = response_text.rstrip()
-                        if trimmed and trimmed[-1] not in ".!?":
-                            trimmed += "."
-                        response_text = (trimmed + " " + " ".join(additions)).strip()
+                        response_text = _append_sentences(response_text, additions)
                         args["response_text"] = response_text
                     response_lower = response_text.lower()
                 if any(keyword in email_body_lower for keyword in ["45-minute", "45 minute"]) and not any(
                     keyword in response_lower for keyword in ["45-minute", "45 minute"]
                 ):
-                    trimmed = response_text.rstrip()
-                    if trimmed and trimmed[-1] not in ".!?":
-                        trimmed += "."
-                    updated_text = (
-                        trimmed
-                        + " I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly."
-                    ).strip()
-                    args["response_text"] = updated_text
-                    response_text = updated_text
+                    response_text = _append_sentences(
+                        response_text,
+                        [
+                            "I've set aside 45 minutes for the discussion so we can cover your tax planning questions thoroughly.",
+                        ],
+                    )
+                    args["response_text"] = response_text
                     response_lower = response_text.lower()
                 requested_days = []
                 for day in ["tuesday", "thursday"]:
                     if day in email_body_lower and day not in response_lower:
                         requested_days.append(day.capitalize())
                 if requested_days:
-                    trimmed = response_text.rstrip()
-                    if trimmed and trimmed[-1] not in ".!?":
-                        trimmed += "."
                     if len(requested_days) == 2:
                         day_sentence = "Tuesday or Thursday afternoon both work for me."
                     else:
                         day_sentence = f"{requested_days[0]} afternoon works for me."
-                    updated_text = (trimmed + " " + day_sentence).strip()
-                    args["response_text"] = updated_text
-                    response_text = updated_text
+                    response_text = _append_sentences(response_text, [day_sentence])
+                    args["response_text"] = response_text
                     response_lower = response_text.lower()
                 if swim_context and not any(keyword in response_lower for keyword in ["reserve", "register"]):
-                    trimmed = response_text.rstrip()
-                    if trimmed and trimmed[-1] not in ".!?":
-                        trimmed += "."
-                    updated_text = (trimmed + " Please reserve a spot for my daughter in the intermediate class.").strip()
-                    args["response_text"] = updated_text
-                    response_text = updated_text
+                    response_text = _append_sentences(
+                        response_text,
+                        ["Please reserve a spot for my daughter in the intermediate class."],
+                    )
+                    args["response_text"] = response_text
                     response_lower = response_text.lower()
                 if manual_schedule_reply:
                     args["response_text"] = manual_schedule_reply
@@ -2195,7 +2269,8 @@ def interrupt_handler_task(
                     allow_accept=True,
                 )
             else:
-                raise ValueError(f"Invalid tool call: {tool_call['name']}")
+                logger.error("Unknown tool call encountered during HITL: %s", tool_call)
+                raise ValueError
 
             request: HumanInterrupt = HumanInterrupt(
                 action_request=ActionRequest(
@@ -2206,8 +2281,10 @@ def interrupt_handler_task(
                 description=description,
             )
             response = _maybe_interrupt([request])[0]
-    
-            if response["type"] == "accept":
+            response_type = response.get("type")
+            user_feedback = response.get("args")
+
+            if response_type == "accept":
                 invoke_args = dict(tool_call.get("args") or {})
                 if tool_call["name"] == "mark_as_spam_tool":
                     invoke_args["confirm"] = True
@@ -2223,15 +2300,15 @@ def interrupt_handler_task(
                     )
                 ):
                     manual_schedule_reply = _build_manual_scheduling_reply(email_text_context)
-            elif response["type"] == "edit":
+            elif response_type == "edit":
                 edited_args = response["args"]["args"]
-                current_id = tool_call["id"]
-                updated_tool_calls = [
-                    tc for tc in ai_tool_calls if tc["id"] != current_id
-                ] + [
-                    {"type": "tool_call", "name": tool_call["name"], "args": edited_args, "id": current_id}
+                current_id = _tool_call_id(tool_call)
+                call_name = _tool_call_name(tool_call)
+                filtered_calls = [
+                    tc for tc in ai_tool_calls if _tool_call_id(tc) != current_id
                 ]
-                result.append(ai_message.model_copy(update={"tool_calls": updated_tool_calls}))
+                filtered_calls.append({"name": call_name, "args": edited_args, "id": current_id})
+                result.append(ai_message.model_copy(update={"tool_calls": filtered_calls}))
                 observation = _safe_tool_invoke(tool_call["name"], edited_args)
                 result.append({"role": "tool", "content": observation, "tool_call_id": current_id})
                 if (
@@ -2248,12 +2325,11 @@ def interrupt_handler_task(
                     update_memory(store, ("email_assistant", "response_preferences"), [{"role": "user", "content": f"User edited the email response. Here is the initial email generated by the assistant: {tool_call['args']}. Here is the edited email: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
                 elif tool_call["name"] == "schedule_meeting_tool":
                     update_memory(store, ("email_assistant", "cal_preferences"), [{"role": "user", "content": f"User edited the calendar invitation. Here is the initial calendar invitation generated by the assistant: {tool_call['args']}. Here is the edited calendar invitation: {edited_args}. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-            elif response["type"] == "ignore":
+            elif response_type == "ignore":
                 result.append({"role": "tool", "content": f"User ignored this {tool_call['name']} draft. Ignore this email and end the workflow.", "tool_call_id": tool_call["id"]})
                 goto = END
                 update_memory(store, ("email_assistant", "triage_preferences"), state["messages"] + result + [{"role": "user", "content": f"The user ignored the draft. Update triage preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-            elif response["type"] == "response":
-                user_feedback = response["args"]
+            elif response_type == "response":
                 if tool_call["name"] == "Question":
                     if any(k in str(user_feedback).lower() for k in ["spam", "phish", "junk"]):
                         email_id = trace_ctx.email_id
@@ -2314,11 +2390,21 @@ def interrupt_handler_task(
                 else:
                     result.append({"role": "tool", "content": f"User answered the question. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
             else:
-                result.append({"role": "tool", "content": f"User gave feedback. Feedback: {user_feedback}", "tool_call_id": tool_call["id"]})
-                if tool_call["name"] == "send_email_tool":
-                    update_memory(store, ("email_assistant", "response_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the response preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
-                elif tool_call["name"] == "schedule_meeting_tool":
-                    update_memory(store, ("email_assistant", "cal_preferences"), state["messages"] + result + [{"role": "user", "content": f"User gave feedback, which we can use to update the calendar preferences. Follow all instructions above, and remember: {MEMORY_UPDATE_INSTRUCTIONS_REINFORCEMENT}."}])
+                logger.warning(
+                    "Unexpected HITL response payload received: type=%s payload=%s",
+                    response_type,
+                    response,
+                )
+                result.append(
+                    {
+                        "role": "tool",
+                        "content": "Received an unsupported HITL response. Ending the workflow safely.",
+                        "tool_call_id": tool_call["id"],
+                    }
+                )
+                goto = END
+                command_update["triage_interrupt_completed"] = True
+                break
 
         if goto in {END, "response_agent", "mark_as_read_node"}:
             command_update["triage_interrupt_completed"] = True
@@ -2377,7 +2463,6 @@ def should_continue(
     email_input = state.get("email_input", {})
     trace_ctx = _build_email_trace_context(email_input)
     author = trace_ctx.author
-    subject = trace_ctx.subject
     email_thread = trace_ctx.email_thread
     email_id = trace_ctx.email_id
     tz_name, eval_mode, thread_id_ctx, _ = extract_runtime_metadata(runtime)
@@ -2465,10 +2550,8 @@ def should_continue(
         )
         return "mark_as_read_node"
     last_message = messages[-1]
-    try:
-        tool_names = [call.get("name") for call in getattr(last_message, "tool_calls", []) or []]
-    except Exception:
-        tool_names = []
+    tool_calls_payload = getattr(last_message, "tool_calls", None) or []
+    tool_names = [_tool_call_name(call) for call in tool_calls_payload]
 
     if state.get("manual_schedule_reply_handled"):
         with trace_stage(
@@ -2527,11 +2610,11 @@ def should_continue(
                 else:
                     all_tool_names: list[str] = []
                     for message in messages:
-                        if getattr(message, "tool_calls", None):
-                            try:
-                                all_tool_names.extend([tc.get("name") for tc in message.tool_calls])
-                            except Exception:
-                                pass
+                        tool_calls = getattr(message, "tool_calls", None) or []
+                        for call in tool_calls:
+                            name = _tool_call_name(call)
+                            if name:
+                                all_tool_names.append(name)
                     if "send_email_tool" in all_tool_names:
                         decision = "mark_as_read_node"
                     else:
@@ -2653,8 +2736,8 @@ def mark_as_read_node_task(
         else:
             try:
                 mark_as_read(email_id)
-            except Exception as e:
-                logger.warning("[gmail] mark_as_read failed for %s: %s", email_id, e)
+            except (HttpError, RuntimeError, OSError, ValueError):
+                logger.exception("[gmail] mark_as_read failed for %s", email_id or "UNKNOWN_ID")
 
         email_markdown = format_gmail_markdown(subject, author, to, email_thread, email_id)
         state_for_output = dict(state)
@@ -2663,25 +2746,22 @@ def mark_as_read_node_task(
         tool_trace = format_messages_string(trimmed_messages)
 
         summary = None
-        try:
-            for m in reversed(trimmed_messages):
-                tool_calls = getattr(m, "tool_calls", None)
-                if not tool_calls:
+        for message in reversed(trimmed_messages):
+            tool_calls = getattr(message, "tool_calls", None) or []
+            for tc in reversed(tool_calls):
+                name = _tool_call_name(tc)
+                if name not in {"send_email_tool", "write_email"}:
                     continue
-                for tc in reversed(tool_calls):
-                    if tc.get("name") in ("send_email_tool", "write_email"):
-                        args = tc.get("args", {})
-                        response_text = args.get("response_text") or args.get("content") or "(no content)"
-                        content_snippet = _shorten(_clean_display(response_text, "(no content)"), 220)
-                        summary = (
-                            f"Reply to '{trace_ctx.subject_display}' from {trace_ctx.sender_display}: "
-                            f"{content_snippet}"
-                        )
-                        break
-                if summary:
-                    break
-        except Exception:
-            summary = None
+                args = _tool_call_args(tc)
+                response_text = args.get("response_text") or args.get("content") or "(no content)"
+                content_snippet = _shorten(_clean_display(response_text, "(no content)"), 220)
+                summary = (
+                    f"Reply to '{trace_ctx.subject_display}' from {trace_ctx.sender_display}: "
+                    f"{content_snippet}"
+                )
+                break
+            if summary:
+                break
 
         final_plan = None
         for candidate in reversed(trimmed_messages):
@@ -2834,11 +2914,29 @@ overall_workflow = (
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
 _DEFAULT_STORE = get_sqlite_store()
 
-email_assistant = (
-    overall_workflow
-    .compile(
+def _using_api_runtime() -> bool:
+    """Return True when running under LangGraph API/CLI runtime."""
+
+    disable_flag = os.getenv("LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER")
+    if disable_flag and disable_flag.lower() not in ("0", "false", "no", ""):
+        return True
+
+    return any(
+        os.getenv(flag)
+        for flag in (
+            "LANGGRAPH_API_HOST",
+            "LANGGRAPH_API_VARIANT",
+            "LANGGRAPH_CLOUD",
+        )
+    )
+
+
+if _using_api_runtime():
+    _compiled = overall_workflow.compile()
+else:
+    _compiled = overall_workflow.compile(
         checkpointer=_DEFAULT_CHECKPOINTER,
         store=_DEFAULT_STORE,
     )
-    .with_config(durability="sync", stream_mode=["updates", "messages", "custom"])
-)
+
+email_assistant = _compiled.with_config(durability="sync", stream_mode=["updates", "messages", "custom"])

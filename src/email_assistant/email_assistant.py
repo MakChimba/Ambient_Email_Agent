@@ -519,11 +519,29 @@ overall_workflow = (
 
 _DEFAULT_CHECKPOINTER = get_sqlite_checkpointer()
 
-email_assistant = (
-    overall_workflow
-    .compile(checkpointer=_DEFAULT_CHECKPOINTER)
-    .with_config(durability="sync")
-)
+
+def _using_api_runtime() -> bool:
+    """Return True when running under the LangGraph API runtime/CLI."""
+
+    disable_flag = os.getenv("LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER")
+    if disable_flag and disable_flag.lower() not in ("0", "false", "no", ""):
+        return True
+
+    return any(
+        os.getenv(flag)
+        for flag in (
+            "LANGGRAPH_API_HOST",
+            "LANGGRAPH_API_VARIANT",
+            "LANGGRAPH_CLOUD",
+        )
+    )
+
+if _using_api_runtime():
+    _compiled = overall_workflow.compile()
+else:
+    _compiled = overall_workflow.compile(checkpointer=_DEFAULT_CHECKPOINTER)
+
+email_assistant = _compiled.with_config(durability="sync")
 
 def get_agent_executor():
     """

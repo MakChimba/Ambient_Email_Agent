@@ -14,6 +14,17 @@ This document contains recipes and notes for running the Email Assistant compone
 
 Upgrade context and open follow-ups are tracked in `dev_tickets/LangChain-LangGraph-v1-implementation-ticket.md`; log checklist updates there whenever you touch the notebooks, docs, or test flows referenced below.
 
+## LangGraph Developer Server & Agent Inbox
+
+- The `langgraph dev` CLI now mirrors the hosted runtime and refuses custom checkpoint stores. Before launching the local Agent Inbox, export `LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER=1` so the email assistant graphs skip attaching their SQLite checkpointer/store and rely on the platform-managed persistence.
+- Example session:
+  ```bash
+  source .venv/bin/activate
+  LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER=1 langgraph dev
+  ```
+- The CLI prints a Studio/Agent Inbox URL (e.g. `http://127.0.0.1:2024/devtools/inbox/...`). Open it in a browser to approve HITL cards manually. Leave `HITL_AUTO_ACCEPT` unset so interrupts pause for input.
+- When running pytest, notebooks, or other SDK-style scripts, the SQLite checkpointer remains enabled by default (no extra env required). Unset `LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER` when you return to those flows so deterministic eval mode retains local durability.
+
 ## Streaming Instrumentation
 
 - Tests, scripts, and notebooks request `stream_mode=["updates","messages","custom"]`; the `custom` channel carries progress payloads emitted by the `stream_progress` tool in `email_assistant.tools.default.progress_tools`.

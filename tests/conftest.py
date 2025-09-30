@@ -99,16 +99,15 @@ class FakeGmailClient:
         self.created_message_ids.append(new_id)
         if thread_id not in self.created_thread_ids:
             self.created_thread_ids.append(thread_id)
-        self.actions.append(
-            (
-                "send_email",
-                email_id,
-                new_id,
-                response_text,
-                email_address,
-                list(additional_recipients or []),
-            )
+        action_record = (
+            "send_email",
+            email_id,
+            new_id,
+            response_text,
+            email_address,
+            additional_recipients,
         )
+        self.actions.append(action_record)
         return True, f"Email reply sent successfully to message ID: {email_id}"
 
     def teardown(self):

@@ -106,7 +106,9 @@ def get_sqlite_store(path: Optional[str] = None) -> SqliteStore:
     conn.execute("PRAGMA busy_timeout = %d" % int(timeout_seconds * 1000))
     atexit.register(conn.close)
     store = SqliteStore(conn)
-    store.setup()
+    disable_flag = os.getenv("LANGGRAPH_DISABLE_CUSTOM_CHECKPOINTER")
+    if not (disable_flag and disable_flag.lower() not in ("0", "false", "no", "")):
+        store.setup()
     return store
 
 
